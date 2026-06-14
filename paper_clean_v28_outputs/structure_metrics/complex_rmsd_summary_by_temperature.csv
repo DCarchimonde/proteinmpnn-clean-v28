@@ -1,0 +1,6 @@
+temperature,n_rows,n_ok,n_missing_or_failed,mean_peptide_ca_rmsd_after_receptor_fit,median_peptide_ca_rmsd_after_receptor_fit,mean_peptide_backbone_rmsd_after_receptor_fit,median_peptide_backbone_rmsd_after_receptor_fit,success_rate_ca_rmsd_lt_2,success_rate_ca_rmsd_lt_5,mean_highfold_plddt,mean_peptide_receptor_iptm,mean_peptide_receptor_inter_pae
+0.01,17,15,2,31.9573,43.5074,31.8793,43.5036,0.0000,0.0000,70.7084,0.4590,18.1365
+0.1,17,15,2,34.3262,43.3219,34.2728,43.3188,0.0000,0.0667,70.8916,0.4737,17.7260
+0.2,17,17,0,29.5415,41.5948,29.4472,41.6235,0.0000,0.0588,72.6668,0.4925,17.6055
+0.3,17,17,0,30.1251,40.0638,30.0239,39.9596,0.0000,0.0000,,,
+0.5,17,17,0,25.9926,27.4252,25.8698,27.3228,0.0000,0.0588,,,
