@@ -3,12 +3,16 @@
 """
 08_extract_highfold_scores.py
 
-Purpose
--------
-Extract HighFold/AlphaFold-like confidence scores from predicted complex PDB files,
-then audit whether those PDB files can be matched back to clean V28 generated designs.
+从 HighFold 预测复合物 PDB 里提取置信度分数，并和 clean V28 的 all_designs/af3_manifest 做匹配审计。
 
-This script is intentionally CPU-only and does NOT require torch.
-It is safe to run locally on Windows.
+特点：
+- 只用 Python 标准库，不需要 torch。
+- 可以在 Windows + PowerShell + conda 环境下直接运行。
+- 原始大文件放在 raw_external/，不进入 GitHub。
+- 输出结果统一放到 paper_clean_v28_outputs/structure_metrics/。
+"""
 
-Default expected external data layout
+import argparse
+import csv
+import re
+from collections
