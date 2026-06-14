@@ -1,18 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+"""Extract HighFold PDB scores and audit matching to clean V28 designs.
+CPU only. Put raw PDB folders under raw_external/; outputs go to paper_clean_v28_outputs/structure_metrics/.
 """
-08_extract_highfold_scores.py
+import argparse, csv, re
+from pathlib import Path
+from collections import defaultdict, Counter
+from statistics import mean
 
-从 HighFold 预测复合物 PDB 里提取置信度分数，并和 clean V28 的 all_designs/af3_manifest 做匹配审计。
+TEMP_MAP = {"pdb_highfold4_t001":0.01,"pdb_highfold4_t01":0.1,"pdb_highfold4_t02":0.2,"pdb_highfold4_t03":0.3,"pdb_highfold4_t05":0.5}
 
-特点：
-- 只用 Python 标准库，不需要 torch。
-- 可以在 Windows + PowerShell + conda 环境下直接运行。
-- 原始大文件放在 raw_external/，不进入 GitHub。
-- 输出结果统一放到 paper_clean_v28_outputs/structure_metrics/。
-"""
-
-import argparse
-import csv
-import re
-from collections
+def ntemp(x):
+    if x in (None, ""): return ""
+    return
