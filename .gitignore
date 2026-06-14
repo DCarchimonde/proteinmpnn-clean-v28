@@ -3,3 +3,7 @@ __pycache__/
 .ipynb_checkpoints/
 .DS_Store
 *.log
+
+raw_external/
+paper_clean_v28_outputs/structure_metrics/*.tmp
+paper_clean_v28_outputs/structure_metrics/*.log
