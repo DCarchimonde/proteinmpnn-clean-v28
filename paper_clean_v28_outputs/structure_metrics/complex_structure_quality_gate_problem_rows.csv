@@ -1,4 +1,4 @@
 level,type,detail
-WARNING,missing_highfold_score,highfold_plddt: missing 47/81 among OK rows
-WARNING,missing_highfold_score,peptide_receptor_iptm_mean: missing 47/81 among OK rows
-WARNING,missing_highfold_score,peptide_receptor_inter_pae_mean: missing 47/81 among OK rows
+WARNING,missing_highfold_score,highfold_plddt: missing 48/85 among OK rows
+WARNING,missing_highfold_score,peptide_receptor_iptm_mean: missing 48/85 among OK rows
+WARNING,missing_highfold_score,peptide_receptor_inter_pae_mean: missing 48/85 among OK rows

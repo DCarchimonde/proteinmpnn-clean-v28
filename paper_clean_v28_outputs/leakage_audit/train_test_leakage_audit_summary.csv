@@ -1,0 +1,23 @@
+check_name,status,count,note
+train_jsonl_exists,PASS,1,nmethyl_data\train_set\train.jsonl
+test_jsonl_exists,PASS,1,nmethyl_data\test_set\test.jsonl
+complex_jsonl_exists,PASS,1,17_complexes_native.jsonl
+n_train_jsonl_rows,INFO,600,JSONL rows in train file
+n_test_jsonl_rows,INFO,151,JSONL rows in test file
+n_complex_jsonl_rows,INFO,17,JSONL rows in complex native file
+train_duplicate_names,PASS,0,Duplicate names inside train set
+test_duplicate_names,PASS,0,Duplicate names inside test set
+train_test_name_overlap,PASS,0,Exact record-name overlap between train and test
+train_duplicate_chain_sequences,PASS,0,Duplicate chain naturalized sequences inside train set
+train_duplicate_concat_all_chains_sequences,PASS,0,Duplicate concat_all_chains naturalized sequences inside train set
+train_duplicate_short_chain_sequences,PASS,0,Duplicate short_chain naturalized sequences inside train set
+test_duplicate_chain_sequences,PASS,0,Duplicate chain naturalized sequences inside test set
+test_duplicate_concat_all_chains_sequences,PASS,0,Duplicate concat_all_chains naturalized sequences inside test set
+test_duplicate_short_chain_sequences,PASS,0,Duplicate short_chain naturalized sequences inside test set
+train_test_chain_sequence_overlap,PASS,0,Exact naturalized overlap for train_test_chain_sequence_overlap
+train_test_concat_sequence_overlap,PASS,0,Exact naturalized overlap for train_test_concat_sequence_overlap
+train_test_short_chain_sequence_overlap,PASS,0,Exact naturalized overlap for train_test_short_chain_sequence_overlap
+train_vs_complex_native_all_chains,PASS,0,Exact naturalized overlap for train_vs_complex_native_all_chains
+train_vs_complex_native_short_peptides,PASS,0,Exact naturalized overlap for train_vs_complex_native_short_peptides
+test_vs_complex_native_all_chains,PASS,0,Exact naturalized overlap for test_vs_complex_native_all_chains
+test_vs_complex_native_short_peptides,PASS,0,Exact naturalized overlap for test_vs_complex_native_short_peptides
