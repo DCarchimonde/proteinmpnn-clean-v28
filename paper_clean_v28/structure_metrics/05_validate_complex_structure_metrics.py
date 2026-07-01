@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 """
@@ -12,11 +12,15 @@
 2. 关键输入/输出文件是否存在；
 3. chain mapping 是否符合预期；
 4. RMSD 输出表是否 85 行；
-5. RMSD OK 是否为 81，缺失是否为 4；
-6. 必要 RMSD 列是否存在；
+5. 当前完整 best85 口径下，chain mapping 和 RMSD 应为 85/85 OK；
+6. 必要 RMSD / HighFold 列是否存在；
 7. receptor fit RMSD 是否在合理范围；
 8. peptide self-superposed RMSD 是否不大于 receptor-fit peptide RMSD；
 9. HighFold 分数缺失情况按温度汇总，作为 WARN。
+
+历史说明：
+补充 PDB 回来之前，本项目曾有 81 OK / 4 missing 的阶段性结果。
+补充 PDB 合并后，当前主质量闸门应要求 85 OK / 0 missing_or_failed。
 """
 
 import math
@@ -36,6 +40,10 @@ SUMMARY_TARGET_PATH = OUT_DIR / "complex_rmsd_summary_by_target.csv"
 
 REPORT_PATH = OUT_DIR / "complex_structure_quality_gate_report.txt"
 PROBLEM_PATH = OUT_DIR / "complex_structure_quality_gate_problem_rows.csv"
+
+EXPECTED_ROWS = 85
+EXPECTED_OK = 85
+EXPECTED_NOT_OK = 0
 
 
 def rmsd(P, Q):
@@ -57,6 +65,7 @@ def kabsch_fit(P, Q):
     H = P0.T @ Q0
     U, S, Vt = np.linalg.svd(H)
 
+    # Row-vector convention: Q ~= P @ R + t
     R = U @ Vt
 
     if np.linalg.det(R) < 0:
@@ -96,6 +105,9 @@ def main():
     warnings = []
 
     add(lines, "===== COMPLEX STRUCTURE QUALITY GATE =====")
+    add(lines, f"Expected best85 rows = {EXPECTED_ROWS}")
+    add(lines, f"Expected OK rows     = {EXPECTED_OK}")
+    add(lines, f"Expected non-OK rows = {EXPECTED_NOT_OK}")
 
     # 1. Kabsch self-test
     err = kabsch_self_test()
@@ -137,16 +149,16 @@ def main():
     add(lines, f"rmsd_metrics shape = {rmsd_df.shape}")
     add(lines, f"summary_by_temperature shape = {summary_temp.shape}")
 
-    if len(audit) != 85:
+    if len(audit) != EXPECTED_ROWS:
         problems.append({
             "problem_type": "unexpected_chain_mapping_rows",
-            "detail": f"expected 85, got {len(audit)}",
+            "detail": f"expected {EXPECTED_ROWS}, got {len(audit)}",
         })
 
-    if len(rmsd_df) != 85:
+    if len(rmsd_df) != EXPECTED_ROWS:
         problems.append({
             "problem_type": "unexpected_rmsd_rows",
-            "detail": f"expected 85, got {len(rmsd_df)}",
+            "detail": f"expected {EXPECTED_ROWS}, got {len(rmsd_df)}",
         })
 
     # 3. Chain mapping status
@@ -160,10 +172,13 @@ def main():
         n_ok_mapping = int((audit["chain_mapping_status"] == "ok").sum())
         n_not_ok_mapping = len(audit) - n_ok_mapping
 
-        if n_ok_mapping != 81 or n_not_ok_mapping != 4:
+        if n_ok_mapping != EXPECTED_OK or n_not_ok_mapping != EXPECTED_NOT_OK:
             problems.append({
                 "problem_type": "unexpected_chain_mapping_counts",
-                "detail": f"ok={n_ok_mapping}, not_ok={n_not_ok_mapping}, expected 81/4",
+                "detail": (
+                    f"ok={n_ok_mapping}, not_ok={n_not_ok_mapping}, "
+                    f"expected {EXPECTED_OK}/{EXPECTED_NOT_OK}"
+                ),
             })
     else:
         problems.append({
@@ -187,10 +202,13 @@ def main():
         n_ok = int((rmsd_df["rmsd_status"] == "ok").sum())
         n_skip = len(rmsd_df) - n_ok
 
-        if n_ok != 81 or n_skip != 4:
+        if n_ok != EXPECTED_OK or n_skip != EXPECTED_NOT_OK:
             problems.append({
                 "problem_type": "unexpected_rmsd_status_counts",
-                "detail": f"ok={n_ok}, skip/fail={n_skip}, expected 81/4",
+                "detail": (
+                    f"ok={n_ok}, skip/fail={n_skip}, "
+                    f"expected {EXPECTED_OK}/{EXPECTED_NOT_OK}"
+                ),
             })
 
     # 5. Required metric columns
@@ -377,7 +395,11 @@ def write_outputs(lines, problems, warnings):
             "detail": w.get("detail", ""),
         })
 
-    pd.DataFrame(rows).to_csv(PROBLEM_PATH, index=False, encoding="utf-8")
+    pd.DataFrame(rows, columns=["level", "type", "detail"]).to_csv(
+        PROBLEM_PATH,
+        index=False,
+        encoding="utf-8",
+    )
 
     print("")
     print("quality report:", REPORT_PATH)
