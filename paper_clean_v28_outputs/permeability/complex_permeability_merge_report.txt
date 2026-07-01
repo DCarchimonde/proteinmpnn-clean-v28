@@ -1,0 +1,135 @@
+===== COMPLEX PERMEABILITY MERGE =====
+permeability_dir: raw_external\pdb_permeability_v20260624\permeability_complex
+permeability_dir_exists: True
+permeability_rows: 4102
+permeability_files: 5
+permeability_rows_by_temperature:
+temperature
+0.01      73
+0.10     374
+0.20     905
+0.30    1168
+0.50    1582
+permeability_zero_values: 215
+permeability_positive_values: 3887
+permeability_fasta_mismatch_id_natural_seq: 0
+
+===== MERGE STATUS WITH SEQUENCE FALLBACK =====
+all_designs: rows=4115, matched=4107, strict=4058, sequence_fallback=49, missing=8
+best85: rows=85, matched=84, strict=81, sequence_fallback=3, missing=1
+structure_rmsd: rows=85, matched=84, strict=81, sequence_fallback=3, missing=1
+unique_strict_permeability_design_keys: 3958
+unique_target_design_fallback_keys: 3383
+raw_permeability_rows: 4102
+
+===== SEQUENCE FALLBACK ROWS =====
+         table target_name  temperature  record_index design_seq design_natural_seq  permeability_pred                                                      permeability_id permeability_temperatures_available  permeability_match_count merge_key_target_design
+   all_designs        3WNE         0.01           0.0     GrKKRG             GRKKRG       1.389113e-03       3wne_26_GrKKRG_model;3wne_23_GrKKRG_model;3wne_75_GrKKRG_model                      0.20;0.30;0.50                       3.0             3WNE|GrKKRG
+   all_designs        3WNE         0.01           1.0     GrKKRR             GRKKRR       3.446157e-07        3wne_4_GrKKRR_model;3wne_32_GrKKRR_model;3wne_15_GrKKRR_model                      0.20;0.30;0.50                       3.0             3WNE|GrKKRR
+   all_designs        3ZGC         0.01           1.0    rGGGQCr            RGGGQCR       2.989998e-06                                                3zgc_11_rGGGQCr_model                                0.20                       1.0            3ZGC|rGGGQCr
+   all_designs        3ZGC         0.01           2.0    rGGGQCR            RGGGQCR       1.534214e-05     3zgc_1_rGGGQCR_model;3zgc_13_rGGGQCR_model;3zgc_16_rGGGQCR_model                      0.20;0.30;0.50                       3.0            3ZGC|rGGGQCR
+   all_designs        3ZGC         0.01           5.0    rGGGGCR            RGGGGCR       9.802725e-04     3zgc_5_rGGGGCR_model;3zgc_15_rGGGGCR_model;3zgc_46_rGGGGCR_model                      0.20;0.30;0.50                       3.0            3ZGC|rGGGGCR
+   all_designs        3ZGC         0.01           6.0    rGGGGCr            RGGGGCR       3.432373e-04                                                 3zgc_4_rGGGGCr_model                                0.20                       1.0            3ZGC|rGGGGCr
+   all_designs        3WNE         0.10           0.0     GQGKRR             GQGKRR       1.029241e-04                            3wne_24_GQGKRR_model;3wne_36_GQGKRR_model                           0.20;0.30                       2.0             3WNE|GQGKRR
+   all_designs        3WNE         0.10           1.0     GrGKRR             GRGKRR       2.933990e-06       3wne_28_GrGKRR_model;3wne_42_GrGKRR_model;3wne_47_GrGKRR_model                      0.20;0.30;0.50                       3.0             3WNE|GrGKRR
+   all_designs        3WNE         0.10           2.0     GrKKRG             GRKKRG       1.389113e-03       3wne_26_GrKKRG_model;3wne_23_GrKKRG_model;3wne_75_GrKKRG_model                      0.20;0.30;0.50                       3.0             3WNE|GrKKRG
+   all_designs        3WNE         0.10           3.0     GNGKRR             GNGKRR       1.188923e-04                            3wne_30_GNGKRR_model;3wne_58_GNGKRR_model                           0.20;0.30                       2.0             3WNE|GNGKRR
+   all_designs        3WNE         0.10           4.0     GNGKRG             GNGKRG       2.068902e-02       3wne_20_GNGKRG_model;3wne_44_GNGKRG_model;3wne_17_GNGKRG_model                      0.20;0.30;0.50                       3.0             3WNE|GNGKRG
+   all_designs        3WNE         0.10           5.0     GNKKRR             GNKKRR       3.174507e-05         3wne_5_GNKKRR_model;3wne_9_GNKKRR_model;3wne_64_GNKKRR_model                      0.20;0.30;0.50                       3.0             3WNE|GNKKRR
+   all_designs        3WNE         0.10           6.0     GQKKRR             GQKKRR       2.579299e-05       3wne_15_GQKKRR_model;3wne_46_GQKKRR_model;3wne_45_GQKKRR_model                      0.20;0.30;0.50                       3.0             3WNE|GQKKRR
+   all_designs        3WNE         0.10           7.0     GrGKRG             GRGKRG       3.017009e-03                             3wne_29_GrGKRG_model;3wne_7_GrGKRG_model                      0.20;0.30;0.50                       3.0             3WNE|GrGKRG
+   all_designs        3WNE         0.10           8.0     GNKKRG             GNKKRG       1.699822e-02        3wne_7_GNKKRG_model;3wne_47_GNKKRG_model;3wne_33_GNKKRG_model                      0.20;0.30;0.50                       3.0             3WNE|GNKKRG
+   all_designs        3WNE         0.10           9.0     GrKKRR             GRKKRR       3.446157e-07        3wne_4_GrKKRR_model;3wne_32_GrKKRR_model;3wne_15_GrKKRR_model                      0.20;0.30;0.50                       3.0             3WNE|GrKKRR
+   all_designs        3WNE         0.10          10.0     GrGKRC             GRGKRC       6.272004e-03                                                 3wne_14_GrGKRC_model                                0.20                       1.0             3WNE|GrGKRC
+   all_designs        3ZGC         0.10           0.0    rGGGGGR            RGGGGGR       4.961076e-04     3zgc_17_rGGGGGR_model;3zgc_33_rGGGGGR_model;3zgc_4_rGGGGGR_model                      0.20;0.30;0.50                       3.0            3ZGC|rGGGGGR
+   all_designs        3ZGC         0.10           1.0    cGGGGCr            CGGGGCR       5.185027e-02                                                3zgc_16_cGGGGCr_model                                0.20                       1.0            3ZGC|cGGGGCr
+   all_designs        3ZGC         0.10           2.0    rrGGGCR            RRGGGCR       4.504531e-07                          3zgc_27_rrGGGCR_model;3zgc_50_rrGGGCR_model                           0.30;0.50                       2.0            3ZGC|rrGGGCR
+   all_designs        3ZGC         0.10           3.0    rGGGGDR            RGGGGDR       1.089714e-04    3zgc_21_rGGGGDR_model;3zgc_16_rGGGGDR_model;3zgc_56_rGGGGDR_model                      0.20;0.30;0.50                       3.0            3ZGC|rGGGGDR
+   all_designs        3ZGC         0.10           4.0    rGGGGCr            RGGGGCR       3.432373e-04                                                 3zgc_4_rGGGGCr_model                                0.20                       1.0            3ZGC|rGGGGCr
+   all_designs        3ZGC         0.10           5.0    rGGGQNR            RGGGQNR       4.532446e-07                                                3zgc_17_rGGGQNR_model                                0.30                       1.0            3ZGC|rGGGQNR
+   all_designs        3ZGC         0.10           6.0    rGGGGCR            RGGGGCR       9.802725e-04     3zgc_5_rGGGGCR_model;3zgc_15_rGGGGCR_model;3zgc_46_rGGGGCR_model                      0.20;0.30;0.50                       3.0            3ZGC|rGGGGCR
+   all_designs        3ZGC         0.10           7.0    cGGGGCR            CGGGGCR       9.990366e-01                          3zgc_12_cGGGGCR_model;3zgc_34_cGGGGCR_model                      0.20;0.30;0.50                       3.0            3ZGC|cGGGGCR
+   all_designs        3ZGC         0.10           8.0    rGGGGGr            RGGGGGR       2.185577e-04                                                 3zgc_6_rGGGGGr_model                                0.20                       1.0            3ZGC|rGGGGGr
+   all_designs        3AVG         0.20          43.0   RCQGKRRG           RCQGKRRG       2.477245e-10                                               3avg_17_RCQGKRRG_model                                0.10                       1.0           3AVG|RCQGKRRG
+   all_designs        3AVI         0.20          22.0   RCQGKRCG           RCQGKRCG       1.000000e+00                        3avi_12_RCQGKRCG_model;3avi_41_RCQGKRCG_model                           0.10;0.30                       2.0           3AVI|RCQGKRCG
+   all_designs        3AVI         0.20          25.0   RCKGKRCG           RCKGKRCG       1.000000e+00                                               3avi_28_RCKGKRCG_model                                0.30                       1.0           3AVI|RCKGKRCG
+   all_designs        3AVI         0.20          26.0   RCQGKRQG           RCQGKRQG       3.581839e-09 3avi_14_RCQGKRQG_model;3avi_30_RCQGKRQG_model;3avi_51_RCQGKRQG_model                      0.10;0.30;0.50                       3.0           3AVI|RCQGKRQG
+   all_designs        3AVI         0.20          29.0   RCQGKRGG           RCQGKRGG       2.581508e-07  3avi_0_RCQGKRGG_model;3avi_58_RCQGKRGG_model;3avi_42_RCQGKRGG_model                      0.10;0.30;0.50                       3.0           3AVI|RCQGKRGG
+   all_designs        3AVI         0.20          40.0   RCQGWRCG           RCQGWRCG       1.387916e-01                                                3avi_9_RCQGWRCG_model                                0.30                       1.0           3AVI|RCQGWRCG
+   all_designs        3AVJ         0.20          13.0   RCQGKRCG           RCQGKRCG       1.000000e+00 3avj_10_RCQGKRCG_model;3avj_37_RCQGKRCG_model;3avj_34_RCQGKRCG_model                      0.10;0.30;0.50                       3.0           3AVJ|RCQGKRCG
+   all_designs        3AVJ         0.20          20.0   RCKGKRCG           RCKGKRCG       1.000000e+00                                               3avj_22_RCKGKRCG_model                                0.30                       1.0           3AVJ|RCKGKRCG
+   all_designs        3AVJ         0.20          21.0   RCQGKRQG           RCQGKRQG       3.581839e-09 3avj_24_RCQGKRQG_model;3avj_28_RCQGKRQG_model;3avj_48_RCQGKRQG_model                      0.10;0.30;0.50                       3.0           3AVJ|RCQGKRQG
+   all_designs        3AVK         0.20          12.0   RCQGKRCG           RCQGKRCG       1.000000e+00  3avk_8_RCQGKRCG_model;3avk_33_RCQGKRCG_model;3avk_37_RCQGKRCG_model                      0.10;0.30;0.50                       3.0           3AVK|RCQGKRCG
+   all_designs        3AVK         0.20          23.0   RCQGKRQG           RCQGKRQG       3.581839e-09 3avk_20_RCQGKRQG_model;3avk_23_RCQGKRQG_model;3avk_46_RCQGKRQG_model                      0.10;0.30;0.50                       3.0           3AVK|RCQGKRQG
+   all_designs        3AVM         0.20          55.0   RCQGKRRG           RCQGKRRG       2.477245e-10                        3avm_23_RCQGKRRG_model;3avm_81_RCQGKRRG_model                           0.10;0.30                       2.0           3AVM|RCQGKRRG
+   all_designs        3AVN         0.20          21.0   RCQKKRRG           RCQKKRRG       2.756015e-12                        3avn_48_RCQKKRRG_model;3avn_42_RCQKKRRG_model                           0.30;0.50                       2.0           3AVN|RCQKKRRG
+   all_designs        3AV9         0.30          38.0   GICGRRRG           GICGRRRG       3.423270e-08                                                3av9_6_GICGRRRG_model                                0.50                       1.0           3AV9|GICGRRRG
+   all_designs        3AV9         0.30          42.0   QICGRRRG           QICGRRRG       1.979970e-09                          3av9_3_QICGRRRG_model;3av9_4_QICGRRRG_model                           0.20;0.50                       3.0           3AV9|QICGRRRG
+   all_designs        3AV9         0.30          48.0   QICGRRRQ           QICGRRRQ       1.980215e-10                                               3av9_63_QICGRRRQ_model                                0.50                       1.0           3AV9|QICGRRRQ
+   all_designs        3AV9         0.30          50.0   QLCGRRRG           QLCGRRRG       2.643325e-09 3av9_11_QLCGRRRG_model;3av9_12_QLCGRRRG_model;3av9_68_QLCGRRRG_model                           0.20;0.50                       3.0           3AV9|QLCGRRRG
+   all_designs        3AVA         0.30          23.0   NLCGRRRG           NLCGRRRG       2.242193e-09                        3ava_26_NLCGRRRG_model;3ava_50_NLCGRRRG_model                           0.20;0.50                       2.0           3AVA|NLCGRRRG
+   all_designs        3AVA         0.30          48.0   QLCGRRRG           QLCGRRRG       2.643325e-09  3ava_10_QLCGRRRG_model;3ava_9_QLCGRRRG_model;3ava_64_QLCGRRRG_model                           0.20;0.50                       3.0           3AVA|QLCGRRRG
+   all_designs        3AVA         0.30          50.0   QQCGRRRG           QQCGRRRG       5.714923e-10                        3ava_18_QQCGRRRG_model;3ava_67_QQCGRRRG_model                           0.20;0.50                       2.0           3AVA|QQCGRRRG
+   all_designs        3AVF         0.30          44.0   QLCGRRRG           QLCGRRRG       2.643325e-09                                                3avf_9_QLCGRRRG_model                                0.20                       1.0           3AVF|QLCGRRRG
+   all_designs        3AVG         0.30          18.0   RCQGQRRG           RCQGQRRG       1.121654e-09                                                3avg_9_RCQGQRRG_model                                0.20                       1.0           3AVG|RCQGQRRG
+   all_designs        3AVG         0.30          76.0   RCQGKRRG           RCQGKRRG       2.477245e-10                                               3avg_17_RCQGKRRG_model                                0.10                       1.0           3AVG|RCQGKRRG
+        best85        3WNE         0.01           0.0     GrKKRG             GRKKRG       1.389113e-03       3wne_26_GrKKRG_model;3wne_23_GrKKRG_model;3wne_75_GrKKRG_model                      0.20;0.30;0.50                       3.0             3WNE|GrKKRG
+        best85        3WNE         0.10           2.0     GrKKRG             GRKKRG       1.389113e-03       3wne_26_GrKKRG_model;3wne_23_GrKKRG_model;3wne_75_GrKKRG_model                      0.20;0.30;0.50                       3.0             3WNE|GrKKRG
+        best85        3ZGC         0.10           0.0    rGGGGGR            RGGGGGR       4.961076e-04     3zgc_17_rGGGGGR_model;3zgc_33_rGGGGGR_model;3zgc_4_rGGGGGR_model                      0.20;0.30;0.50                       3.0            3ZGC|rGGGGGR
+structure_rmsd        3WNE         0.01           NaN     GrKKRG                NaN       1.389113e-03       3wne_26_GrKKRG_model;3wne_23_GrKKRG_model;3wne_75_GrKKRG_model                      0.20;0.30;0.50                       3.0             3WNE|GrKKRG
+structure_rmsd        3WNE         0.10           NaN     GrKKRG                NaN       1.389113e-03       3wne_26_GrKKRG_model;3wne_23_GrKKRG_model;3wne_75_GrKKRG_model                      0.20;0.30;0.50                       3.0             3WNE|GrKKRG
+structure_rmsd        3ZGC         0.10           NaN    rGGGGGR                NaN       4.961076e-04     3zgc_17_rGGGGGR_model;3zgc_33_rGGGGGR_model;3zgc_4_rGGGGGR_model                      0.20;0.30;0.50                       3.0            3ZGC|rGGGGGR
+
+===== REMAINING UNMATCHED SUMMARY AFTER SEQUENCE FALLBACK =====
+unmatched_by_table:
+table
+all_designs       8
+best85            1
+structure_rmsd    1
+
+unmatched_by_table_temperature:
+table           temperature
+all_designs     0.01           3
+                0.20           2
+                0.30           3
+best85          0.01           1
+structure_rmsd  0.01           1
+
+unmatched_by_table_target:
+table           target_name
+all_designs     3AV9           1
+                3AVF           1
+                3AVM           1
+                3AVN           2
+                3ZGC           3
+best85          3ZGC           1
+structure_rmsd  3ZGC           1
+
+remaining_unmatched_rows:
+         table target_name  temperature  record_index design_seq design_natural_seq   merge_key_design merge_key_target_design merge_key_design_natural merge_key_target_design_natural rmsd_status
+   all_designs        3ZGC         0.01           0.0    rGGGQcr            RGGGQCR  3ZGC|0.01|rGGGQcr            3ZGC|rGGGQcr        3ZGC|0.01|RGGGQCR                    3ZGC|RGGGQCR         NaN
+   all_designs        3ZGC         0.01           3.0    rGGGGcR            RGGGGCR  3ZGC|0.01|rGGGGcR            3ZGC|rGGGGcR        3ZGC|0.01|RGGGGCR                    3ZGC|RGGGGCR         NaN
+   all_designs        3ZGC         0.01           4.0    rGGGGcr            RGGGGCR  3ZGC|0.01|rGGGGcr            3ZGC|rGGGGcr        3ZGC|0.01|RGGGGCR                    3ZGC|RGGGGCR         NaN
+   all_designs        3AVM         0.20          20.0   RCQKKRRG           RCQKKRRG 3AVM|0.20|RCQKKRRG           3AVM|RCQKKRRG       3AVM|0.20|RCQKKRRG                   3AVM|RCQKKRRG         NaN
+   all_designs        3AVN         0.20          61.0   RCQGKRRG           RCQGKRRG 3AVN|0.20|RCQGKRRG           3AVN|RCQGKRRG       3AVN|0.20|RCQGKRRG                   3AVN|RCQGKRRG         NaN
+   all_designs        3AV9         0.30          30.0   QQCGRCRG           QQCGRCRG 3AV9|0.30|QQCGRCRG           3AV9|QQCGRCRG       3AV9|0.30|QQCGRCRG                   3AV9|QQCGRCRG         NaN
+   all_designs        3AVF         0.30          37.0   QICGRGRG           QICGRGRG 3AVF|0.30|QICGRGRG           3AVF|QICGRGRG       3AVF|0.30|QICGRGRG                   3AVF|QICGRGRG         NaN
+   all_designs        3AVN         0.30          70.0   RCQGKRRG           RCQGKRRG 3AVN|0.30|RCQGKRRG           3AVN|RCQGKRRG       3AVN|0.30|RCQGKRRG                   3AVN|RCQGKRRG         NaN
+        best85        3ZGC         0.01           0.0    rGGGQcr            RGGGQCR  3ZGC|0.01|rGGGQcr            3ZGC|rGGGQcr        3ZGC|0.01|RGGGQCR                    3ZGC|RGGGQCR         NaN
+structure_rmsd        3ZGC         0.01           NaN    rGGGQcr                NaN  3ZGC|0.01|rGGGQcr            3ZGC|rGGGQcr        3ZGC|0.01|RGGGQCR                    3ZGC|RGGGQCR          ok
+
+===== BEST85 PERMEABILITY SUMMARY BY TEMPERATURE =====
+ temperature  n_rows  n_with_permeability  n_strict_temperature_match  n_sequence_fallback_match  n_missing_permeability  n_zero_permeability  mean_permeability_pred  median_permeability_pred  max_permeability_pred  mean_permeability_log10_positive_only  median_permeability_log10_positive_only  mean_permeability_log10_floor300  median_permeability_log10_floor300  mean_natural_aa_recovery  best_natural_aa_recovery
+        0.01      17                   16                          15                          1                       1                    0                0.125087              1.848642e-09                    1.0                             -12.742616                                -8.888660                        -12.742616                           -8.888660                  0.028711                  0.166667
+        0.10      17                   17                          15                          2                       0                    0                0.117759              2.428948e-09                    1.0                             -10.209478                                -8.614582                        -10.209478                           -8.614582                  0.105392                  0.166667
+        0.20      17                   17                          17                          0                       0                    0                0.118848              1.838330e-08                    1.0                              -8.250512                                -7.735576                         -8.250512                           -7.735576                  0.125350                  0.166667
+        0.30      17                   17                          17                          0                       0                    0                0.140332              2.460151e-07                    1.0                              -7.465105                                -6.609038                         -7.465105                           -6.609038                  0.158263                  0.333333
+        0.50      17                   17                          17                          0                       0                    0                0.128820              5.161170e-06                    1.0                              -7.659387                                -5.287252                         -7.659387                           -5.287252                  0.177171                  0.333333
+
+===== NOTES =====
+Strict match is target + temperature + exact methylated design_seq.
+Fallback match is target + exact methylated design_seq across temperatures. It is labeled as sequence_fallback_across_temperature.
+Permeability is sequence-based; generation temperature is metadata, so exact-sequence fallback is acceptable if disclosed.
+permeability_log10_positive_only is computed only for positive predictions; zero predictions remain NaN there.
+permeability_log10_floor300 maps zeros to 1e-300 before log10 for plotting if a finite lower bound is needed.
+This script does not calculate energy-based Success/Stability.
