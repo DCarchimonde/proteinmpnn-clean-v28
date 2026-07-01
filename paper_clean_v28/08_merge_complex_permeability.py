@@ -13,25 +13,14 @@ Expected permeability CSV columns:
     id, fasta, methy_index, permeability_pred
 with optional leading index columns such as Unnamed: 0.
 
-Important merge rule:
-    The external permeability id contains a numeric index, for example
-        1sfi_10_RcGrGQcrQcrQMC_model
-    but this index is not reliable as the original all_designs record_index after
-    sorting / duplicate handling. Therefore the main merge key is:
-        target_name + temperature + exact design_seq
-    not target_name + temperature + record_index + design_seq.
+Main merge rule:
+    target_name + temperature + exact design_seq
 
-Outputs:
-    paper_clean_v28_outputs/permeability/complex_permeability_raw_merged.csv
-    paper_clean_v28_outputs/permeability/complex_permeability_all_designs.csv
-    paper_clean_v28_outputs/permeability/complex_permeability_best85.csv
-    paper_clean_v28_outputs/permeability/complex_structure_permeability_merged.csv
-    paper_clean_v28_outputs/permeability/complex_permeability_summary_by_temperature.csv
-    paper_clean_v28_outputs/permeability/complex_permeability_summary_by_target.csv
-    paper_clean_v28_outputs/permeability/complex_structure_permeability_summary_by_temperature.csv
-    paper_clean_v28_outputs/permeability/complex_structure_permeability_summary_by_target.csv
-    paper_clean_v28_outputs/permeability/complex_permeability_merge_report.txt
-    paper_clean_v28_outputs/permeability/complex_permeability_unmatched_rows.csv
+Do not use the numeric part of the external permeability id as the original
+all_designs record_index. The external id number is retained for audit only.
+
+Outputs are written under:
+    paper_clean_v28_outputs/permeability/
 """
 
 import argparse
@@ -100,7 +89,6 @@ def parse_temp_from_filename(path):
 
 
 def parse_permeability_id(pid):
-    """Parse target, external numeric id, design sequence from permeability id."""
     s = str(pid).strip()
     s = re.sub(r"\.pdb$", "", s, flags=re.IGNORECASE)
     s = re.sub(r"_model$", "", s, flags=re.IGNORECASE)
@@ -110,14 +98,32 @@ def parse_permeability_id(pid):
     return m.group("target"), int(m.group("external_index")), m.group("design_seq")
 
 
+def compute_log10_positive_only(pred):
+    pred = pd.to_numeric(pred, errors="coerce")
+    out = pd.Series(np.nan, index=pred.index, dtype="float64")
+    mask = pred.gt(0)
+    out.loc[mask] = np.log10(pred.loc[mask])
+    return out
+
+
+def compute_log10_floor300(pred):
+    pred = pd.to_numeric(pred, errors="coerce")
+    safe = pred.copy()
+    safe = safe.where(safe.gt(LOG10_FLOOR), LOG10_FLOOR)
+    safe = safe.where(pred.notna(), np.nan)
+    return np.log10(safe)
+
+
 def add_log_columns(df):
     out = df.copy()
     pred = pd.to_numeric(out["permeability_pred"], errors="coerce")
     out["permeability_pred"] = pred
     out["permeability_is_zero"] = pred.eq(0)
     out["permeability_is_positive"] = pred.gt(0)
-    out["permeability_log10"] = np.where(pred.gt(0), np.log10(pred), np.nan)
-    out["permeability_log10_floor300"] = np.log10(pred.clip(lower=LOG10_FLOOR))
+    out["permeability_log10_positive_only"] = compute_log10_positive_only(pred)
+    out["permeability_log10_floor300"] = compute_log10_floor300(pred)
+    # Backward-compatible alias: positive-only log10. Zero predictions remain NaN.
+    out["permeability_log10"] = out["permeability_log10_positive_only"]
     return out
 
 
@@ -171,20 +177,19 @@ def read_permeability_folder(perm_dir):
     return out
 
 
+def count_true(s):
+    return int(pd.Series(s).astype("boolean").fillna(False).sum())
+
+
 def aggregate_permeability_by_design(perm):
-    """
-    Aggregate permeability rows by target + temperature + exact design_seq.
-    If multiple predictions exist for the same design, keep max/median/mean and count.
-    The max is used as the main permeability_pred representative.
-    """
     g = perm.groupby("merge_key_design", dropna=False)
     agg = g.agg(
         permeability_pred=("permeability_pred", "max"),
         permeability_pred_mean=("permeability_pred", "mean"),
         permeability_pred_median=("permeability_pred", "median"),
         permeability_match_count=("permeability_id", "count"),
-        permeability_zero_count=("permeability_is_zero", lambda s: int(pd.Series(s).sum())),
-        permeability_positive_count=("permeability_is_positive", lambda s: int(pd.Series(s).sum())),
+        permeability_zero_count=("permeability_is_zero", count_true),
+        permeability_positive_count=("permeability_is_positive", count_true),
         permeability_id=("permeability_id", lambda s: ";".join(map(str, s.head(10)))),
         permeability_source_file=("permeability_source_file", lambda s: ";".join(sorted(set(map(str, s)))[:10])),
         permeability_external_index=("permeability_external_index", lambda s: ";".join(map(str, s.head(10)))),
@@ -201,8 +206,10 @@ def aggregate_permeability_by_design(perm):
 def summarize_by(df, group_col):
     d = df.copy()
     d["permeability_pred"] = pd.to_numeric(d["permeability_pred"], errors="coerce")
-    d["permeability_log10"] = pd.to_numeric(d["permeability_log10"], errors="coerce")
-    d["permeability_log10_floor300"] = pd.to_numeric(d["permeability_log10_floor300"], errors="coerce")
+    d["permeability_log10_positive_only"] = pd.to_numeric(d.get("permeability_log10_positive_only"), errors="coerce")
+    d["permeability_log10_floor300"] = pd.to_numeric(d.get("permeability_log10_floor300"), errors="coerce")
+    if "permeability_is_zero" not in d.columns:
+        d["permeability_is_zero"] = False
     if "natural_aa_recovery" in d.columns:
         d["natural_aa_recovery"] = pd.to_numeric(d["natural_aa_recovery"], errors="coerce")
     if "peptide_ca_rmsd_after_receptor_fit" in d.columns:
@@ -211,12 +218,12 @@ def summarize_by(df, group_col):
     agg = {
         "n_rows": ("permeability_pred", "size"),
         "n_with_permeability": ("permeability_pred", lambda s: int(s.notna().sum())),
-        "n_zero_permeability": ("permeability_is_zero", lambda s: int(pd.Series(s).fillna(False).sum()) if "permeability_is_zero" in d.columns else 0),
+        "n_zero_permeability": ("permeability_is_zero", count_true),
         "mean_permeability_pred": ("permeability_pred", "mean"),
         "median_permeability_pred": ("permeability_pred", "median"),
         "max_permeability_pred": ("permeability_pred", "max"),
-        "mean_permeability_log10_positive_only": ("permeability_log10", "mean"),
-        "median_permeability_log10_positive_only": ("permeability_log10", "median"),
+        "mean_permeability_log10_positive_only": ("permeability_log10_positive_only", "mean"),
+        "median_permeability_log10_positive_only": ("permeability_log10_positive_only", "median"),
         "mean_permeability_log10_floor300": ("permeability_log10_floor300", "mean"),
         "median_permeability_log10_floor300": ("permeability_log10_floor300", "median"),
     }
@@ -245,6 +252,22 @@ def unmatched_rows(label, df):
 def write_report(path, lines):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def append_unmatched_summary(report, unmatched_df):
+    report.append("")
+    report.append("===== UNMATCHED SUMMARY =====")
+    if unmatched_df.empty:
+        report.append("No unmatched rows.")
+        return
+    report.append("unmatched_by_table:")
+    report.append(unmatched_df["table"].value_counts(dropna=False).to_string())
+    if "temperature" in unmatched_df.columns:
+        report.append("\nunmatched_by_table_temperature:")
+        report.append(unmatched_df.groupby(["table", "temperature"]).size().to_string())
+    if "target_name" in unmatched_df.columns:
+        report.append("\nunmatched_by_table_target:")
+        report.append(unmatched_df.groupby(["table", "target_name"]).size().to_string())
 
 
 def main():
@@ -292,13 +315,13 @@ def main():
     best_merged.to_csv(out_dir / "complex_permeability_best85.csv", index=False, encoding="utf-8")
     struct_merged.to_csv(out_dir / "complex_structure_permeability_merged.csv", index=False, encoding="utf-8")
 
-    unmatched = [
+    unmatched_parts = [
         unmatched_rows("all_designs", all_merged),
         unmatched_rows("best85", best_merged),
         unmatched_rows("structure_rmsd", struct_merged),
     ]
-    unmatched = [x for x in unmatched if not x.empty]
-    unmatched_df = pd.concat(unmatched, ignore_index=True) if unmatched else pd.DataFrame(columns=["table"])
+    unmatched_parts = [x for x in unmatched_parts if not x.empty]
+    unmatched_df = pd.concat(unmatched_parts, ignore_index=True) if unmatched_parts else pd.DataFrame(columns=["table"])
     unmatched_df.to_csv(out_dir / "complex_permeability_unmatched_rows.csv", index=False, encoding="utf-8")
 
     summary_temp = summarize_by(best_merged, "temperature")
@@ -326,7 +349,9 @@ def main():
         report.append(f"{label}: rows={n}, matched={n_match}, missing={n_missing}")
     report.append(f"unique_permeability_design_keys: {perm_by_design['merge_key_design'].nunique()}")
     report.append(f"raw_permeability_rows: {len(perm)}")
-    report.append("Expected note: if supplemental PDBs have no permeability rows, best85/structure may be 81/85 matched rather than 85/85.")
+    report.append("Expected note: supplemental PDBs can make structure 85/85 while permeability remains 81/85 if supplemental permeability was not supplied.")
+
+    append_unmatched_summary(report, unmatched_df)
 
     report.append("")
     report.append("===== BEST85 PERMEABILITY SUMMARY BY TEMPERATURE =====")
@@ -335,7 +360,8 @@ def main():
     report.append("")
     report.append("===== NOTES =====")
     report.append("Main merge key is target + temperature + exact design_seq; external numeric id is retained only for audit.")
-    report.append("permeability_log10 is computed only for positive predictions; zeros are kept as NaN in permeability_log10 and represented by permeability_log10_floor300 for plotting if needed.")
+    report.append("permeability_log10_positive_only is computed only for positive predictions; zero predictions remain NaN there.")
+    report.append("permeability_log10_floor300 maps zeros to 1e-300 before log10 for plotting if a finite lower bound is needed.")
     report.append("This script does not calculate energy-based Success/Stability.")
 
     write_report(out_dir / "complex_permeability_merge_report.txt", report)
