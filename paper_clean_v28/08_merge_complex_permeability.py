@@ -13,12 +13,13 @@ Expected permeability CSV columns:
     id, fasta, methy_index, permeability_pred
 with optional leading index columns such as Unnamed: 0.
 
-The id is expected to look like:
-    1sfi_0_RcGrGqcrQcrQGC_model
-where:
-    target_name = 1sfi
-    record_index = 0
-    design_seq = RcGrGqcrQcrQGC
+Important merge rule:
+    The external permeability id contains a numeric index, for example
+        1sfi_10_RcGrGQcrQcrQMC_model
+    but this index is not reliable as the original all_designs record_index after
+    sorting / duplicate handling. Therefore the main merge key is:
+        target_name + temperature + exact design_seq
+    not target_name + temperature + record_index + design_seq.
 
 Outputs:
     paper_clean_v28_outputs/permeability/complex_permeability_raw_merged.csv
@@ -27,12 +28,13 @@ Outputs:
     paper_clean_v28_outputs/permeability/complex_structure_permeability_merged.csv
     paper_clean_v28_outputs/permeability/complex_permeability_summary_by_temperature.csv
     paper_clean_v28_outputs/permeability/complex_permeability_summary_by_target.csv
+    paper_clean_v28_outputs/permeability/complex_structure_permeability_summary_by_temperature.csv
+    paper_clean_v28_outputs/permeability/complex_structure_permeability_summary_by_target.csv
     paper_clean_v28_outputs/permeability/complex_permeability_merge_report.txt
     paper_clean_v28_outputs/permeability/complex_permeability_unmatched_rows.csv
 """
 
 import argparse
-import csv
 import math
 import re
 from pathlib import Path
@@ -56,6 +58,7 @@ TEMP_FROM_FILE = {
 }
 
 NATURAL_AA = set("ACDEFGHIKLMNPQRSTVWYX")
+LOG10_FLOOR = 1e-300
 
 
 def naturalize(seq):
@@ -71,6 +74,10 @@ def norm_design_seq(seq):
     return str(seq).strip()
 
 
+def target_key(x):
+    return str(x).strip().upper()
+
+
 def temp_key(x):
     try:
         return f"{float(x):.2f}"
@@ -81,16 +88,11 @@ def temp_key(x):
         return s
 
 
-def target_key(x):
-    return str(x).strip().upper()
-
-
 def parse_temp_from_filename(path):
     name = Path(path).stem.lower()
     for token, temp in TEMP_FROM_FILE.items():
         if re.search(rf"(?:^|_){re.escape(token)}(?:$|_)", name):
             return temp
-    # fallback: last token after underscore
     last = name.split("_")[-1]
     if last in TEMP_FROM_FILE:
         return TEMP_FROM_FILE[last]
@@ -98,14 +100,39 @@ def parse_temp_from_filename(path):
 
 
 def parse_permeability_id(pid):
-    """Parse target, record index, design sequence from external permeability id."""
+    """Parse target, external numeric id, design sequence from permeability id."""
     s = str(pid).strip()
     s = re.sub(r"\.pdb$", "", s, flags=re.IGNORECASE)
     s = re.sub(r"_model$", "", s, flags=re.IGNORECASE)
-    m = re.match(r"^(?P<target>[^_]+)_(?P<record_index>\d+)_(?P<design_seq>.+)$", s)
+    m = re.match(r"^(?P<target>[^_]+)_(?P<external_index>\d+)_(?P<design_seq>.+)$", s)
     if not m:
         return None, None, None
-    return m.group("target"), int(m.group("record_index")), m.group("design_seq")
+    return m.group("target"), int(m.group("external_index")), m.group("design_seq")
+
+
+def add_log_columns(df):
+    out = df.copy()
+    pred = pd.to_numeric(out["permeability_pred"], errors="coerce")
+    out["permeability_pred"] = pred
+    out["permeability_is_zero"] = pred.eq(0)
+    out["permeability_is_positive"] = pred.gt(0)
+    out["permeability_log10"] = np.where(pred.gt(0), np.log10(pred), np.nan)
+    out["permeability_log10_floor300"] = np.log10(pred.clip(lower=LOG10_FLOOR))
+    return out
+
+
+def add_common_keys(df, design_col="design_seq", natural_col=None):
+    out = df.copy()
+    out["target_key"] = out["target_name"].map(target_key)
+    out["temperature_key"] = out["temperature"].map(temp_key)
+    out["design_seq_key"] = out[design_col].map(norm_design_seq)
+    if natural_col is not None and natural_col in out.columns:
+        out["design_natural_key"] = out[natural_col].map(naturalize)
+    else:
+        out["design_natural_key"] = out[design_col].map(naturalize)
+    out["merge_key_design"] = out["target_key"] + "|" + out["temperature_key"] + "|" + out["design_seq_key"]
+    out["merge_key_design_natural"] = out["target_key"] + "|" + out["temperature_key"] + "|" + out["design_natural_key"]
+    return out
 
 
 def read_permeability_folder(perm_dir):
@@ -114,7 +141,6 @@ def read_permeability_folder(perm_dir):
     for path in files:
         temp = parse_temp_from_filename(path)
         df = pd.read_csv(path)
-        # Drop anonymous index columns if present.
         drop_cols = [c for c in df.columns if str(c).startswith("Unnamed:")]
         if drop_cols:
             df = df.drop(columns=drop_cols)
@@ -123,119 +149,52 @@ def read_permeability_folder(perm_dir):
         if missing:
             raise ValueError(f"{path} missing columns: {sorted(missing)}")
         for _, r in df.iterrows():
-            target, record_index, design_seq = parse_permeability_id(r["id"])
+            target, external_index, design_seq = parse_permeability_id(r["id"])
             rows.append({
                 "permeability_source_file": str(path),
                 "permeability_id": str(r["id"]),
                 "target_name": str(target).upper() if target is not None else "",
                 "temperature": float(temp),
-                "record_index": record_index,
+                "permeability_external_index": external_index,
                 "design_seq_from_id": norm_design_seq(design_seq),
                 "design_natural_seq_from_id": naturalize(design_seq),
                 "permeability_fasta": naturalize(r["fasta"]),
                 "permeability_methy_index": str(r["methy_index"]),
-                "permeability_pred": pd.to_numeric(r["permeability_pred"], errors="coerce"),
+                "permeability_pred": r["permeability_pred"],
             })
     out = pd.DataFrame(rows)
-    if not out.empty:
-        out["target_key"] = out["target_name"].map(target_key)
-        out["temperature_key"] = out["temperature"].map(temp_key)
-        out["record_index_key"] = out["record_index"].astype("Int64").astype(str)
-        out["design_seq_key"] = out["design_seq_from_id"].map(norm_design_seq)
-        out["design_natural_key"] = out["design_natural_seq_from_id"].map(naturalize)
-        out["merge_key_full"] = (
-            out["target_key"] + "|" + out["temperature_key"] + "|" +
-            out["record_index_key"] + "|" + out["design_seq_key"]
-        )
-        out["merge_key_design"] = (
-            out["target_key"] + "|" + out["temperature_key"] + "|" + out["design_seq_key"]
-        )
-        out["merge_key_design_natural"] = (
-            out["target_key"] + "|" + out["temperature_key"] + "|" + out["design_natural_key"]
-        )
-        out["permeability_log10"] = np.log10(pd.to_numeric(out["permeability_pred"], errors="coerce"))
+    if out.empty:
+        return out
+    out = add_log_columns(out)
+    out = add_common_keys(out, design_col="design_seq_from_id", natural_col="design_natural_seq_from_id")
+    out["permeability_fasta_matches_id_natural_seq"] = out["permeability_fasta"].map(naturalize).eq(out["design_natural_key"])
     return out
 
 
-def add_design_keys(df):
-    out = df.copy()
-    out["target_key"] = out["target_name"].map(target_key)
-    out["temperature_key"] = out["temperature"].map(temp_key)
-    if "record_index" in out.columns:
-        out["record_index_key"] = pd.to_numeric(out["record_index"], errors="coerce").astype("Int64").astype(str)
-    else:
-        out["record_index_key"] = ""
-    out["design_seq_key"] = out["design_seq"].map(norm_design_seq)
-    if "design_natural_seq" in out.columns:
-        out["design_natural_key"] = out["design_natural_seq"].map(naturalize)
-    else:
-        out["design_natural_key"] = out["design_seq"].map(naturalize)
-    out["merge_key_full"] = (
-        out["target_key"] + "|" + out["temperature_key"] + "|" +
-        out["record_index_key"] + "|" + out["design_seq_key"]
-    )
-    out["merge_key_design"] = out["target_key"] + "|" + out["temperature_key"] + "|" + out["design_seq_key"]
-    out["merge_key_design_natural"] = out["target_key"] + "|" + out["temperature_key"] + "|" + out["design_natural_key"]
-    return out
-
-
-def add_structure_keys(df):
-    out = df.copy()
-    out["target_key"] = out["target_name"].map(target_key)
-    out["temperature_key"] = out["temperature"].map(temp_key)
-    out["design_seq_key"] = out["design_seq"].map(norm_design_seq)
-    out["design_natural_key"] = out["design_seq"].map(naturalize)
-    out["merge_key_design"] = out["target_key"] + "|" + out["temperature_key"] + "|" + out["design_seq_key"]
-    out["merge_key_design_natural"] = out["target_key"] + "|" + out["temperature_key"] + "|" + out["design_natural_key"]
-    return out
-
-
-def prepare_perm_for_design_merge(perm):
-    cols = [
-        "merge_key_full",
-        "permeability_id",
-        "permeability_source_file",
-        "permeability_fasta",
-        "permeability_methy_index",
-        "permeability_pred",
-        "permeability_log10",
-        "design_seq_from_id",
-        "design_natural_seq_from_id",
-    ]
-    dup = perm[perm.duplicated("merge_key_full", keep=False)].copy()
-    if not dup.empty:
-        # Full key should be unique; keep first but report duplicates later.
-        perm = perm.sort_values("permeability_pred", ascending=False).drop_duplicates("merge_key_full", keep="first")
-    return perm[cols], dup
-
-
-def prepare_perm_for_design_seq_merge(perm):
-    cols = [
-        "merge_key_design",
-        "permeability_id",
-        "permeability_source_file",
-        "permeability_fasta",
-        "permeability_methy_index",
-        "permeability_pred",
-        "permeability_log10",
-        "design_seq_from_id",
-        "design_natural_seq_from_id",
-    ]
-    tmp = perm.copy()
-    # For structure/best85, one target/temp/design_seq may have multiple PDB predictions.
-    # Use the maximum permeability_pred as conservative high-permeability representative,
-    # and keep counts for transparency.
-    agg = tmp.groupby("merge_key_design", dropna=False).agg(
+def aggregate_permeability_by_design(perm):
+    """
+    Aggregate permeability rows by target + temperature + exact design_seq.
+    If multiple predictions exist for the same design, keep max/median/mean and count.
+    The max is used as the main permeability_pred representative.
+    """
+    g = perm.groupby("merge_key_design", dropna=False)
+    agg = g.agg(
         permeability_pred=("permeability_pred", "max"),
-        permeability_log10=("permeability_log10", "max"),
+        permeability_pred_mean=("permeability_pred", "mean"),
+        permeability_pred_median=("permeability_pred", "median"),
         permeability_match_count=("permeability_id", "count"),
+        permeability_zero_count=("permeability_is_zero", lambda s: int(pd.Series(s).sum())),
+        permeability_positive_count=("permeability_is_positive", lambda s: int(pd.Series(s).sum())),
         permeability_id=("permeability_id", lambda s: ";".join(map(str, s.head(10)))),
         permeability_source_file=("permeability_source_file", lambda s: ";".join(sorted(set(map(str, s)))[:10])),
+        permeability_external_index=("permeability_external_index", lambda s: ";".join(map(str, s.head(10)))),
         permeability_fasta=("permeability_fasta", "first"),
         permeability_methy_index=("permeability_methy_index", "first"),
         design_seq_from_id=("design_seq_from_id", "first"),
         design_natural_seq_from_id=("design_natural_seq_from_id", "first"),
+        permeability_fasta_matches_id_natural_seq=("permeability_fasta_matches_id_natural_seq", "all"),
     ).reset_index()
+    agg = add_log_columns(agg)
     return agg
 
 
@@ -243,6 +202,7 @@ def summarize_by(df, group_col):
     d = df.copy()
     d["permeability_pred"] = pd.to_numeric(d["permeability_pred"], errors="coerce")
     d["permeability_log10"] = pd.to_numeric(d["permeability_log10"], errors="coerce")
+    d["permeability_log10_floor300"] = pd.to_numeric(d["permeability_log10_floor300"], errors="coerce")
     if "natural_aa_recovery" in d.columns:
         d["natural_aa_recovery"] = pd.to_numeric(d["natural_aa_recovery"], errors="coerce")
     if "peptide_ca_rmsd_after_receptor_fit" in d.columns:
@@ -251,11 +211,14 @@ def summarize_by(df, group_col):
     agg = {
         "n_rows": ("permeability_pred", "size"),
         "n_with_permeability": ("permeability_pred", lambda s: int(s.notna().sum())),
+        "n_zero_permeability": ("permeability_is_zero", lambda s: int(pd.Series(s).fillna(False).sum()) if "permeability_is_zero" in d.columns else 0),
         "mean_permeability_pred": ("permeability_pred", "mean"),
         "median_permeability_pred": ("permeability_pred", "median"),
         "max_permeability_pred": ("permeability_pred", "max"),
-        "mean_permeability_log10": ("permeability_log10", "mean"),
-        "median_permeability_log10": ("permeability_log10", "median"),
+        "mean_permeability_log10_positive_only": ("permeability_log10", "mean"),
+        "median_permeability_log10_positive_only": ("permeability_log10", "median"),
+        "mean_permeability_log10_floor300": ("permeability_log10_floor300", "mean"),
+        "median_permeability_log10_floor300": ("permeability_log10_floor300", "median"),
     }
     if "natural_aa_recovery" in d.columns:
         agg["mean_natural_aa_recovery"] = ("natural_aa_recovery", "mean")
@@ -263,7 +226,19 @@ def summarize_by(df, group_col):
     if "peptide_ca_rmsd_after_receptor_fit" in d.columns:
         agg["mean_peptide_ca_rmsd_after_receptor_fit"] = ("peptide_ca_rmsd_after_receptor_fit", "mean")
         agg["median_peptide_ca_rmsd_after_receptor_fit"] = ("peptide_ca_rmsd_after_receptor_fit", "median")
-    out = d.groupby(group_col, dropna=False).agg(**agg).reset_index()
+    return d.groupby(group_col, dropna=False).agg(**agg).reset_index()
+
+
+def unmatched_rows(label, df):
+    miss = df[df["permeability_pred"].isna()].copy()
+    if miss.empty:
+        return pd.DataFrame()
+    keep = [c for c in [
+        "target_name", "temperature", "record_index", "design_seq", "design_natural_seq",
+        "merge_key_design", "merge_key_design_natural", "rmsd_status"
+    ] if c in miss.columns]
+    out = miss[keep].copy()
+    out.insert(0, "table", label)
     return out
 
 
@@ -289,7 +264,6 @@ def main():
     report.append("===== COMPLEX PERMEABILITY MERGE =====")
     report.append(f"permeability_dir: {perm_dir}")
     report.append(f"permeability_dir_exists: {perm_dir.exists()}")
-
     if not perm_dir.exists():
         raise FileNotFoundError(f"Missing permeability directory: {perm_dir}")
 
@@ -298,38 +272,32 @@ def main():
     report.append(f"permeability_files: {len(list(perm_dir.glob('*.csv')))}")
     report.append("permeability_rows_by_temperature:")
     report.append(perm["temperature"].value_counts().sort_index().to_string())
+    report.append(f"permeability_zero_values: {int(perm['permeability_is_zero'].sum())}")
+    report.append(f"permeability_positive_values: {int(perm['permeability_is_positive'].sum())}")
+    report.append(f"permeability_fasta_mismatch_id_natural_seq: {int((~perm['permeability_fasta_matches_id_natural_seq']).sum())}")
 
     perm.to_csv(out_dir / "complex_permeability_raw_merged.csv", index=False, encoding="utf-8")
+    perm_by_design = aggregate_permeability_by_design(perm)
+    perm_by_design.to_csv(out_dir / "complex_permeability_by_design.csv", index=False, encoding="utf-8")
 
-    all_designs = add_design_keys(pd.read_csv(args.all_designs_csv))
-    best85 = add_design_keys(pd.read_csv(args.best85_csv))
-    rmsd = add_structure_keys(pd.read_csv(args.rmsd_csv))
+    all_designs = add_common_keys(pd.read_csv(args.all_designs_csv), design_col="design_seq", natural_col="design_natural_seq")
+    best85 = add_common_keys(pd.read_csv(args.best85_csv), design_col="design_seq", natural_col="design_natural_seq")
+    rmsd = add_common_keys(pd.read_csv(args.rmsd_csv), design_col="design_seq", natural_col=None)
 
-    perm_full, dup_full = prepare_perm_for_design_merge(perm)
-    perm_design = prepare_perm_for_design_seq_merge(perm)
+    all_merged = all_designs.merge(perm_by_design, on="merge_key_design", how="left", validate="m:1")
+    best_merged = best85.merge(perm_by_design, on="merge_key_design", how="left", validate="m:1")
+    struct_merged = rmsd.merge(perm_by_design, on="merge_key_design", how="left", validate="m:1")
 
-    all_merged = all_designs.merge(perm_full, on="merge_key_full", how="left", validate="m:1")
-    best_merged = best85.merge(perm_full, on="merge_key_full", how="left", validate="m:1")
-    struct_merged = rmsd.merge(perm_design, on="merge_key_design", how="left", validate="m:1")
-
-    # Clean helper key columns are retained for auditability but placed near the end by pandas default.
     all_merged.to_csv(out_dir / "complex_permeability_all_designs.csv", index=False, encoding="utf-8")
     best_merged.to_csv(out_dir / "complex_permeability_best85.csv", index=False, encoding="utf-8")
     struct_merged.to_csv(out_dir / "complex_structure_permeability_merged.csv", index=False, encoding="utf-8")
 
-    # Unmatched rows for audit.
-    unmatched = []
-    for label, df in [
-        ("all_designs", all_merged),
-        ("best85", best_merged),
-        ("structure_rmsd", struct_merged),
-    ]:
-        miss = df[df["permeability_pred"].isna()].copy()
-        if not miss.empty:
-            keep = [c for c in ["target_name", "temperature", "record_index", "design_seq", "design_natural_seq", "merge_key_full", "merge_key_design"] if c in miss.columns]
-            tmp = miss[keep].copy()
-            tmp.insert(0, "table", label)
-            unmatched.append(tmp)
+    unmatched = [
+        unmatched_rows("all_designs", all_merged),
+        unmatched_rows("best85", best_merged),
+        unmatched_rows("structure_rmsd", struct_merged),
+    ]
+    unmatched = [x for x in unmatched if not x.empty]
     unmatched_df = pd.concat(unmatched, ignore_index=True) if unmatched else pd.DataFrame(columns=["table"])
     unmatched_df.to_csv(out_dir / "complex_permeability_unmatched_rows.csv", index=False, encoding="utf-8")
 
@@ -338,7 +306,6 @@ def main():
     summary_temp.to_csv(out_dir / "complex_permeability_summary_by_temperature.csv", index=False, encoding="utf-8")
     summary_target.to_csv(out_dir / "complex_permeability_summary_by_target.csv", index=False, encoding="utf-8")
 
-    # Optional joint structure/permeability summaries.
     summarize_by(struct_merged, "temperature").to_csv(
         out_dir / "complex_structure_permeability_summary_by_temperature.csv",
         index=False,
@@ -357,7 +324,9 @@ def main():
         n_match = int(df["permeability_pred"].notna().sum())
         n_missing = n - n_match
         report.append(f"{label}: rows={n}, matched={n_match}, missing={n_missing}")
-    report.append(f"duplicate_full_permeability_keys: {len(dup_full)}")
+    report.append(f"unique_permeability_design_keys: {perm_by_design['merge_key_design'].nunique()}")
+    report.append(f"raw_permeability_rows: {len(perm)}")
+    report.append("Expected note: if supplemental PDBs have no permeability rows, best85/structure may be 81/85 matched rather than 85/85.")
 
     report.append("")
     report.append("===== BEST85 PERMEABILITY SUMMARY BY TEMPERATURE =====")
@@ -365,8 +334,8 @@ def main():
 
     report.append("")
     report.append("===== NOTES =====")
-    report.append("permeability_pred values are extremely small; use permeability_log10 for plots and correlations.")
-    report.append("structure_rmsd merge uses target + temperature + exact design_seq. If a design has multiple PDB/permeability records, the maximum permeability_pred is used and permeability_match_count is recorded.")
+    report.append("Main merge key is target + temperature + exact design_seq; external numeric id is retained only for audit.")
+    report.append("permeability_log10 is computed only for positive predictions; zeros are kept as NaN in permeability_log10 and represented by permeability_log10_floor300 for plotting if needed.")
     report.append("This script does not calculate energy-based Success/Stability.")
 
     write_report(out_dir / "complex_permeability_merge_report.txt", report)
