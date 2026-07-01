@@ -1,0 +1,25 @@
+===== AVAILABLE-DATA LEAKAGE AUDIT =====
+This is not a full Rosetta train/test leakage audit because no train-set file is present in the current repository.
+
+candidate_train_or_split_files_present: INCOMPLETE | count=0 | No train/valid/split file found in repository; full train/test leakage audit cannot be completed.
+test_jsonl_exists: PASS | count=1 | nmethyl_data\test_set\test.jsonl
+complex_jsonl_exists: PASS | count=1 | 17_complexes_native.jsonl
+n_monomer_test_records: INFO | count=151 | JSONL rows in nmethyl_data/test_set/test.jsonl
+n_complex_native_records: INFO | count=17 | JSONL rows in 17_complexes_native.jsonl
+n_sequence_records_extracted: INFO | count=4843 | All extracted chain/design sequence records
+monomer_test_duplicate_names: PASS | count=0 | No duplicate test names detected.
+monomer_test_duplicate_chain_sequences: PASS | count=0 | No exact duplicate chain sequences detected inside monomer test set.
+monomer_test_vs_complex_native_all_chains: PASS | count=0 | Exact naturalized sequence overlaps between monomer test and complex native all/chain sequences.
+monomer_test_vs_complex_native_short_peptides: PASS | count=0 | Exact naturalized sequence overlaps between monomer test and complex native short peptides.
+monomer_test_vs_generated_all_designs: PASS | count=0 | Exact naturalized sequence overlaps between monomer test and generated_all_designs peptide sequences.
+monomer_test_vs_generated_best_designs: PASS | count=0 | Exact naturalized sequence overlaps between monomer test and generated_best_designs peptide sequences.
+monomer_test_vs_af3_manifest: PASS | count=0 | Exact naturalized sequence overlaps between monomer test and af3_manifest peptide sequences.
+generated_best_vs_af3_manifest_sequence_overlap: INFO | count=68 | Exact naturalized sequence overlap count between best_designs and af3_manifest; expected to be nonzero/high because af3_manifest is derived from best85.
+
+===== LIMITATION =====
+Full Rosetta train/test leakage audit cannot be completed from this repository alone because no training set file is present.
+To complete the full audit, provide the train/valid JSONL or a training data manifest used to train frankenstein_v28.pt.
+
+===== OUTPUTS =====
+paper_clean_v28_outputs\leakage_audit\available_data_leakage_audit_summary.csv
+paper_clean_v28_outputs\leakage_audit\available_data_leakage_overlap_rows.csv
