@@ -1,0 +1,45 @@
+===== NATURALIZED PYROSETTA ENERGY REPORT =====
+Run mode: FULL BEST85
+Platform: Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39
+PyRosetta version: PyRosetta-4 2026 [Rosetta PyRosetta4.Release.python311.ubuntu 2026.03+releasequarterly.5e498f1409c68ade56c8ce5842bf79e1b02e8db4 2026-01-13T13:24:11] retrieved from: http://www.pyrosetta.org
+Initialization options: -mute all -ignore_unrecognized_res -ignore_waters -load_PDB_components false -ex1 -ex2
+Score function: ref2015 with rama_prepro=0, omega=0, p_aa_pp=0
+Original disabled weights: {'rama_prepro': 0.45, 'omega': 0.4, 'p_aa_pp': 0.6}
+Interface method: intact-pose residue-subset decomposition
+Expected rows for this run: 85
+Observed rows: 85
+Energy OK: 85
+Energy failed: 0
+Naturalized peptide sequence match: 85/85
+Peptide length match: 85/85
+
+===== GLOBAL ENERGY RESULTS =====
+Mean complex score per residue: 2.074738
+Median complex score per residue: 1.799496
+Mean cross-interface energy: 259.968136
+Median cross-interface energy: 110.072729
+Mean cross-interface energy per peptide residue: 32.391518
+Median cross-interface energy per peptide residue: 13.759091
+Cross-interface energy < 0: 6/85
+
+===== SUMMARY BY TEMPERATURE =====
+ temperature  n_rows  n_ok  n_failed  n_sequence_match  mean_complex_score_per_residue  median_complex_score_per_residue  mean_peptide_subset_score_per_residue  median_peptide_subset_score_per_residue  mean_cross_interface_energy_fixed_pose  median_cross_interface_energy_fixed_pose  mean_cross_interface_energy_per_peptide_residue  median_cross_interface_energy_per_peptide_residue  n_cross_interface_energy_lt_0  fraction_cross_interface_energy_lt_0
+        0.01      17    17         0                17                        2.275671                          1.946194                             106.581272                               116.281679                              329.319601                                165.322466                                        41.136170                                          20.665308                              0                              0.000000
+        0.10      17    17         0                17                        2.481993                          1.600285                             113.625043                               113.311184                              245.674734                                 79.829591                                        31.042796                                           6.767627                              2                              0.117647
+        0.20      17    17         0                17                        2.670114                          2.281293                             125.669783                               130.583637                              289.747618                                129.957153                                        36.424458                                          16.244644                              1                              0.058824
+        0.30      17    17         0                17                        1.783807                          1.336904                              93.266497                                91.126059                              236.933952                                 55.258565                                        30.299832                                           6.527090                              1                              0.058824
+        0.50      17    17         0                17                        1.162106                          1.153762                              77.117126                                75.145733                              198.164773                                141.857472                                        23.054333                                          17.732184                              2                              0.117647
+
+===== INTERPRETATION NOTES =====
+- Peptide residue records were naturalized position-by-position to design_seq.upper() in temporary files.
+- Original PDB files were not modified.
+- Extra peptide atoms outside the canonical natural-amino-acid atom set were removed from temporary files.
+- These scores therefore do not explicitly model N-methyl chemistry.
+- Energies are Rosetta Energy Units (REU), not kcal/mol.
+- Cross-interface energy is derived from residue subsets of the intact fixed pose; no chain deletion was used.
+- No FastRelax, minimization, or repacking was applied.
+- cross_interface_energy_lt_0 is descriptive and is not a validated experimental success/stability label.
+- Failed evaluations remain missing/NaN and are never replaced with zero.
+
+QUALITY GATE: PASS
+PROBLEMS: 0
