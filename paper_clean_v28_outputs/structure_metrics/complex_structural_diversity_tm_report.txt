@@ -1,0 +1,62 @@
+===== STRUCTURAL DIVERSITY 1-TM-SCORE REPORT =====
+tmtools version: 0.3.0
+Expected best85 designs: 85
+Observed designs: 85
+Expected targets: 17
+Observed targets: 17
+Parsed peptide chains: 85/85
+Expected within-target pairs: 170
+Observed pairs: 170
+TM-align OK pairs: 170
+TM-align failed pairs: 0
+
+===== GLOBAL PAIRWISE RESULTS =====
+Mean symmetric TM-score: 0.340287
+Median symmetric TM-score: 0.309351
+Mean diversity (1-TM): 0.659713
+Median diversity (1-TM): 0.690649
+Mean TM-align RMSD: 1.247732
+Median TM-align RMSD: 1.263364
+
+===== BY TARGET =====
+target_name  n_pairs  mean_tm_score  median_tm_score  min_tm_score  max_tm_score  mean_diversity_1_minus_tm  median_diversity_1_minus_tm  min_diversity_1_minus_tm  max_diversity_1_minus_tm  mean_tmalign_rmsd  median_tmalign_rmsd
+       1SFI       10       0.191365         0.192297      0.126409      0.260888                   0.808635                     0.807703                  0.739112                  0.873591           2.131142             2.117763
+       3AV9       10       0.397848         0.387184      0.300598      0.475639                   0.602152                     0.612816                  0.524361                  0.699402           0.964207             0.905179
+       3AVA       10       0.324588         0.310036      0.238924      0.467405                   0.675412                     0.689964                  0.532595                  0.761076           1.163135             1.214587
+       3AVB       10       0.319736         0.289933      0.221554      0.473894                   0.680264                     0.710067                  0.526106                  0.778446           1.272290             1.284232
+       3AVF       10       0.364230         0.323575      0.200479      0.621030                   0.635770                     0.676425                  0.378970                  0.799521           1.151295             1.209482
+       3AVG       10       0.372234         0.330358      0.269583      0.580049                   0.627766                     0.669642                  0.419951                  0.730417           1.204762             1.215614
+       3AVH       10       0.364245         0.357015      0.186648      0.511161                   0.635755                     0.642985                  0.488839                  0.813352           1.212949             1.217027
+       3AVI       10       0.301847         0.265249      0.186938      0.472824                   0.698153                     0.734751                  0.527176                  0.813062           0.969098             0.717542
+       3AVJ       10       0.393674         0.343587      0.268632      0.855651                   0.606326                     0.656413                  0.144349                  0.731368           1.227292             1.312114
+       3AVK       10       0.320002         0.310637      0.253939      0.400674                   0.679998                     0.689363                  0.599326                  0.746061           1.047461             0.979242
+       3AVM       10       0.367543         0.399590      0.227437      0.482253                   0.632457                     0.600410                  0.517747                  0.772563           1.163653             1.276022
+       3AVN       10       0.338008         0.337236      0.233085      0.453148                   0.661992                     0.662764                  0.546852                  0.766915           1.072386             1.153498
+       3P8F       10       0.251051         0.256937      0.186781      0.315218                   0.748949                     0.743063                  0.684782                  0.813219           1.838638             1.877553
+       3WNE       10       0.652779         0.589074      0.497160      1.000000                   0.347221                     0.410926                  0.000000                  0.502840           0.354998             0.339832
+       3ZGC       10       0.402550         0.408394      0.288148      0.491965                   0.597450                     0.591606                  0.508035                  0.711852           0.900336             0.740760
+       4K1E       10       0.212494         0.204631      0.153247      0.296140                   0.787506                     0.795369                  0.703860                  0.846753           1.618310             1.697524
+       4KEL       10       0.210679         0.206397      0.156073      0.295914                   0.789321                     0.793603                  0.704086                  0.843927           1.919488             1.885840
+
+===== BY TEMPERATURE PAIR =====
+temperature_pair  n_targets  n_pairs  mean_tm_score  median_tm_score  mean_diversity_1_minus_tm  median_diversity_1_minus_tm  mean_tmalign_rmsd  median_tmalign_rmsd
+       0.01__0.1         17       17       0.404907         0.370196                   0.595093                     0.629804           1.240770             1.261707
+       0.01__0.2         17       17       0.311471         0.313435                   0.688529                     0.686565           1.251487             1.241313
+       0.01__0.3         17       17       0.322196         0.289287                   0.677804                     0.710713           1.489829             1.635643
+       0.01__0.5         17       17       0.318473         0.284324                   0.681527                     0.715676           1.340899             1.462751
+        0.1__0.2         17       17       0.320396         0.296140                   0.679604                     0.703860           1.183529             1.217629
+        0.1__0.3         17       17       0.348811         0.361314                   0.651189                     0.638686           1.254168             1.210075
+        0.1__0.5         17       17       0.339139         0.288148                   0.660861                     0.711852           1.196453             1.303950
+        0.2__0.3         17       17       0.332593         0.290792                   0.667407                     0.709208           1.274541             1.456109
+        0.2__0.5         17       17       0.327222         0.300762                   0.672778                     0.699238           1.169229             1.222879
+        0.3__0.5         17       17       0.377657         0.325592                   0.622343                     0.674408           1.076414             1.209030
+
+===== INTERPRETATION NOTES =====
+- Primary diversity metric is 1 - mean(TM-score normalized by chain 1, TM-score normalized by chain 2).
+- TM-align removes rigid-body placement; this evaluates internal peptide-shape diversity, not receptor-frame pose diversity.
+- Lowercase methylation markers are naturalized to uppercase for TM-align sequence input.
+- Short-peptide TM-scores are length sensitive; within-target comparisons are the primary interpretation.
+- These 85 structures are best85 selections, so this is diversity of the selected panel, not all 4115 raw designs.
+
+QUALITY GATE: PASS
+PROBLEMS: 0

@@ -1,0 +1,33 @@
+===== METHYLATION-SITE RMSD QUALITY REPORT =====
+Expected best85 rows: 85
+Observed design rows: 85
+Status OK: 85
+Status failed: 0
+Designs with >=1 lowercase methylation position: 47/85
+Total methylation-marked positions: 159
+Total non-methylated positions: 626
+Length-mismatch rows: 0
+
+===== POOLED POSITION-LEVEL RESULTS =====
+Methyl-position CA RMSD after receptor fit: 20.425469
+Non-methyl-position CA RMSD after receptor fit: 34.180748
+Methyl-position CA RMSD after peptide self-fit: 3.280769
+Non-methyl-position CA RMSD after peptide self-fit: 2.926839
+
+===== SUMMARY BY TEMPERATURE =====
+temperature  n_designs  n_designs_ok  n_methyl_positions  n_nonmethyl_positions  n_methyl_ca_pairs  n_nonmethyl_ca_pairs  pooled_methyl_ca_rmsd_after_receptor_fit  pooled_nonmethyl_ca_rmsd_after_receptor_fit  pooled_methyl_backbone_rmsd_after_receptor_fit  pooled_nonmethyl_backbone_rmsd_after_receptor_fit  pooled_methyl_ca_rmsd_after_peptide_self_fit  pooled_nonmethyl_ca_rmsd_after_peptide_self_fit  mean_design_methyl_ca_rmsd_after_receptor_fit  median_design_methyl_ca_rmsd_after_receptor_fit  mean_design_nonmethyl_ca_rmsd_after_receptor_fit  median_design_nonmethyl_ca_rmsd_after_receptor_fit
+       0.01         17            17                  42                    115                 42                   115                                 24.500304                                    35.088673                                       24.479778                                          35.056088                                      2.536927                                         2.413653                                      29.613654                                        40.369744                                         30.831119                                           42.279392
+        0.1         17            17                  33                    124                 33                   124                                 21.751871                                    37.030284                                       21.864731                                          36.976803                                      3.560454                                         2.764336                                      26.297699                                        40.369744                                         33.228822                                           43.089530
+        0.2         17            17                  35                    122                 35                   122                                 21.420580                                    33.866886                                       21.363961                                          33.827770                                      3.677184                                         3.350208                                      22.248983                                        12.066109                                         29.527015                                           41.808536
+        0.3         17            17                  28                    129                 28                   129                                 16.685352                                    34.693010                                       16.744052                                          34.633741                                      3.347975                                         2.957506                                      21.027423                                        10.442480                                         30.201606                                           40.063820
+        0.5         17            17                  21                    136                 21                   136                                  8.878070                                    30.262567                                        8.621555                                          30.214043                                      3.349708                                         3.028526                                       7.786850                                         8.261265                                         26.131736                                           27.425232
+
+===== INTERPRETATION NOTES =====
+- Lowercase design tokens define methylation-marked positions.
+- These are position-stratified CA/backbone deviations, not explicit N-methyl-atom RMSD.
+- Receptor-fit metrics measure peptide placement in the binding frame.
+- Peptide-self-fit metrics measure peptide internal shape after removing rigid-body placement.
+- Methylated and non-methylated positions are not randomized groups; comparisons are descriptive.
+
+QUALITY GATE: PASS
+PROBLEMS: 0
