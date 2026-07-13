@@ -1,26 +1,26 @@
 ===== COMPLEX PERMEABILITY MERGE =====
 permeability_dir: raw_external\pdb_permeability_v20260624\permeability_complex
 permeability_dir_exists: True
-permeability_rows: 4102
-permeability_files: 5
+permeability_rows: 4103
+permeability_files: 6
 permeability_rows_by_temperature:
 temperature
-0.01      73
+0.01      74
 0.10     374
 0.20     905
 0.30    1168
 0.50    1582
 permeability_zero_values: 215
-permeability_positive_values: 3887
+permeability_positive_values: 3888
 permeability_fasta_mismatch_id_natural_seq: 0
 
 ===== MERGE STATUS WITH SEQUENCE FALLBACK =====
-all_designs: rows=4115, matched=4107, strict=4058, sequence_fallback=49, missing=8
-best85: rows=85, matched=84, strict=81, sequence_fallback=3, missing=1
-structure_rmsd: rows=85, matched=84, strict=81, sequence_fallback=3, missing=1
-unique_strict_permeability_design_keys: 3958
-unique_target_design_fallback_keys: 3383
-raw_permeability_rows: 4102
+all_designs: rows=4115, matched=4108, strict=4059, sequence_fallback=49, missing=7
+best85: rows=85, matched=85, strict=82, sequence_fallback=3, missing=0
+structure_rmsd: rows=85, matched=85, strict=82, sequence_fallback=3, missing=0
+unique_strict_permeability_design_keys: 3959
+unique_target_design_fallback_keys: 3384
+raw_permeability_rows: 4103
 
 ===== SEQUENCE FALLBACK ROWS =====
          table target_name  temperature  record_index design_seq design_natural_seq  permeability_pred                                                      permeability_id permeability_temperatures_available  permeability_match_count merge_key_target_design
@@ -83,44 +83,35 @@ structure_rmsd        3ZGC         0.10           NaN    rGGGGGR                
 ===== REMAINING UNMATCHED SUMMARY AFTER SEQUENCE FALLBACK =====
 unmatched_by_table:
 table
-all_designs       8
-best85            1
-structure_rmsd    1
+all_designs    7
 
 unmatched_by_table_temperature:
-table           temperature
-all_designs     0.01           3
-                0.20           2
-                0.30           3
-best85          0.01           1
-structure_rmsd  0.01           1
+table        temperature
+all_designs  0.01           2
+             0.20           2
+             0.30           3
 
 unmatched_by_table_target:
-table           target_name
-all_designs     3AV9           1
-                3AVF           1
-                3AVM           1
-                3AVN           2
-                3ZGC           3
-best85          3ZGC           1
-structure_rmsd  3ZGC           1
+table        target_name
+all_designs  3AV9           1
+             3AVF           1
+             3AVM           1
+             3AVN           2
+             3ZGC           2
 
 remaining_unmatched_rows:
-         table target_name  temperature  record_index design_seq design_natural_seq   merge_key_design merge_key_target_design merge_key_design_natural merge_key_target_design_natural rmsd_status
-   all_designs        3ZGC         0.01           0.0    rGGGQcr            RGGGQCR  3ZGC|0.01|rGGGQcr            3ZGC|rGGGQcr        3ZGC|0.01|RGGGQCR                    3ZGC|RGGGQCR         NaN
-   all_designs        3ZGC         0.01           3.0    rGGGGcR            RGGGGCR  3ZGC|0.01|rGGGGcR            3ZGC|rGGGGcR        3ZGC|0.01|RGGGGCR                    3ZGC|RGGGGCR         NaN
-   all_designs        3ZGC         0.01           4.0    rGGGGcr            RGGGGCR  3ZGC|0.01|rGGGGcr            3ZGC|rGGGGcr        3ZGC|0.01|RGGGGCR                    3ZGC|RGGGGCR         NaN
-   all_designs        3AVM         0.20          20.0   RCQKKRRG           RCQKKRRG 3AVM|0.20|RCQKKRRG           3AVM|RCQKKRRG       3AVM|0.20|RCQKKRRG                   3AVM|RCQKKRRG         NaN
-   all_designs        3AVN         0.20          61.0   RCQGKRRG           RCQGKRRG 3AVN|0.20|RCQGKRRG           3AVN|RCQGKRRG       3AVN|0.20|RCQGKRRG                   3AVN|RCQGKRRG         NaN
-   all_designs        3AV9         0.30          30.0   QQCGRCRG           QQCGRCRG 3AV9|0.30|QQCGRCRG           3AV9|QQCGRCRG       3AV9|0.30|QQCGRCRG                   3AV9|QQCGRCRG         NaN
-   all_designs        3AVF         0.30          37.0   QICGRGRG           QICGRGRG 3AVF|0.30|QICGRGRG           3AVF|QICGRGRG       3AVF|0.30|QICGRGRG                   3AVF|QICGRGRG         NaN
-   all_designs        3AVN         0.30          70.0   RCQGKRRG           RCQGKRRG 3AVN|0.30|RCQGKRRG           3AVN|RCQGKRRG       3AVN|0.30|RCQGKRRG                   3AVN|RCQGKRRG         NaN
-        best85        3ZGC         0.01           0.0    rGGGQcr            RGGGQCR  3ZGC|0.01|rGGGQcr            3ZGC|rGGGQcr        3ZGC|0.01|RGGGQCR                    3ZGC|RGGGQCR         NaN
-structure_rmsd        3ZGC         0.01           NaN    rGGGQcr                NaN  3ZGC|0.01|rGGGQcr            3ZGC|rGGGQcr        3ZGC|0.01|RGGGQCR                    3ZGC|RGGGQCR          ok
+      table target_name  temperature  record_index design_seq design_natural_seq   merge_key_design merge_key_target_design merge_key_design_natural merge_key_target_design_natural
+all_designs        3ZGC         0.01             3    rGGGGcR            RGGGGCR  3ZGC|0.01|rGGGGcR            3ZGC|rGGGGcR        3ZGC|0.01|RGGGGCR                    3ZGC|RGGGGCR
+all_designs        3ZGC         0.01             4    rGGGGcr            RGGGGCR  3ZGC|0.01|rGGGGcr            3ZGC|rGGGGcr        3ZGC|0.01|RGGGGCR                    3ZGC|RGGGGCR
+all_designs        3AVM         0.20            20   RCQKKRRG           RCQKKRRG 3AVM|0.20|RCQKKRRG           3AVM|RCQKKRRG       3AVM|0.20|RCQKKRRG                   3AVM|RCQKKRRG
+all_designs        3AVN         0.20            61   RCQGKRRG           RCQGKRRG 3AVN|0.20|RCQGKRRG           3AVN|RCQGKRRG       3AVN|0.20|RCQGKRRG                   3AVN|RCQGKRRG
+all_designs        3AV9         0.30            30   QQCGRCRG           QQCGRCRG 3AV9|0.30|QQCGRCRG           3AV9|QQCGRCRG       3AV9|0.30|QQCGRCRG                   3AV9|QQCGRCRG
+all_designs        3AVF         0.30            37   QICGRGRG           QICGRGRG 3AVF|0.30|QICGRGRG           3AVF|QICGRGRG       3AVF|0.30|QICGRGRG                   3AVF|QICGRGRG
+all_designs        3AVN         0.30            70   RCQGKRRG           RCQGKRRG 3AVN|0.30|RCQGKRRG           3AVN|RCQGKRRG       3AVN|0.30|RCQGKRRG                   3AVN|RCQGKRRG
 
 ===== BEST85 PERMEABILITY SUMMARY BY TEMPERATURE =====
  temperature  n_rows  n_with_permeability  n_strict_temperature_match  n_sequence_fallback_match  n_missing_permeability  n_zero_permeability  mean_permeability_pred  median_permeability_pred  max_permeability_pred  mean_permeability_log10_positive_only  median_permeability_log10_positive_only  mean_permeability_log10_floor300  median_permeability_log10_floor300  mean_natural_aa_recovery  best_natural_aa_recovery
-        0.01      17                   16                          15                          1                       1                    0                0.125087              1.848642e-09                    1.0                             -12.742616                                -8.888660                        -12.742616                           -8.888660                  0.028711                  0.166667
+        0.01      17                   17                          16                          1                       0                    0                0.117729              3.170617e-09                    1.0                             -12.344263                                -8.498856                        -12.344263                           -8.498856                  0.028711                  0.166667
         0.10      17                   17                          15                          2                       0                    0                0.117759              2.428948e-09                    1.0                             -10.209478                                -8.614582                        -10.209478                           -8.614582                  0.105392                  0.166667
         0.20      17                   17                          17                          0                       0                    0                0.118848              1.838330e-08                    1.0                              -8.250512                                -7.735576                         -8.250512                           -7.735576                  0.125350                  0.166667
         0.30      17                   17                          17                          0                       0                    0                0.140332              2.460151e-07                    1.0                              -7.465105                                -6.609038                         -7.465105                           -6.609038                  0.158263                  0.333333

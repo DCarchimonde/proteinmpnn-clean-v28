@@ -10,8 +10,8 @@ exists paper_clean_v28_outputs\structure_metrics\complex_rmsd_summary_by_target.
 
 ===== BASIC SHAPE CHECK =====
 chain_mapping_audit shape = (85, 22)
-rmsd_metrics shape = (85, 37)
-summary_by_temperature shape = (5, 13)
+rmsd_metrics shape = (85, 40)
+summary_by_temperature shape = (5, 16)
 
 ===== CHAIN MAPPING STATUS =====
 chain_mapping_status
@@ -33,6 +33,8 @@ peptide_ca_rmsd_after_receptor_fit: True
 peptide_backbone_rmsd_after_receptor_fit: True
 peptide_ca_rmsd_self_superposed: True
 highfold_plddt: True
+highfold_plddt_comment: True
+highfold_ca_bfactor_mean: True
 peptide_receptor_iptm_mean: True
 peptide_receptor_inter_pae_mean: True
 
@@ -51,19 +53,28 @@ receptor_ca_fit_rmsd median = 2.5857
 receptor_ca_fit_rmsd max    = 11.4864
 
 ===== HIGHFOLD SCORE COMPLETENESS =====
-highfold_plddt: missing among OK rows = 48/85
+COMMENT global pLDDT: missing among OK rows = 48/85
+mean CA B-factor / pLDDT proxy: missing among OK rows = 0/85
 peptide_receptor_iptm_mean: missing among OK rows = 48/85
 peptide_receptor_inter_pae_mean: missing among OK rows = 48/85
 
 HighFold score missing by temperature:
 
-highfold_plddt
+COMMENT global pLDDT
 temperature
 0.01     0
 0.10     1
 0.20    13
 0.30    17
 0.50    17
+
+mean CA B-factor / pLDDT proxy
+temperature
+0.01    0
+0.10    0
+0.20    0
+0.30    0
+0.50    0
 
 peptide_receptor_iptm_mean
 temperature
@@ -82,12 +93,12 @@ temperature
 0.50    17
 
 ===== SUMMARY BY TEMPERATURE =====
- temperature  n_rows  n_ok  n_missing_or_failed  mean_peptide_ca_rmsd_after_receptor_fit  median_peptide_ca_rmsd_after_receptor_fit  mean_peptide_backbone_rmsd_after_receptor_fit  median_peptide_backbone_rmsd_after_receptor_fit  success_rate_ca_rmsd_lt_2  success_rate_ca_rmsd_lt_5  mean_highfold_plddt  mean_peptide_receptor_iptm  mean_peptide_receptor_inter_pae
-        0.01      17    17                    0                                  30.9129                                    42.4658                                        30.8239                                          42.4462                        0.0                     0.0000              70.7979                      0.4485                          18.3752
-        0.10      17    17                    0                                  33.0765                                    43.0895                                        33.0084                                          43.0497                        0.0                     0.0588              70.9495                      0.4666                          17.8239
-        0.20      17    17                    0                                  29.5415                                    41.5948                                        29.4472                                          41.6235                        0.0                     0.0588              72.6668                      0.4925                          17.6055
-        0.30      17    17                    0                                  30.1251                                    40.0638                                        30.0239                                          39.9596                        0.0                     0.0000                  NaN                         NaN                              NaN
-        0.50      17    17                    0                                  25.9926                                    27.4252                                        25.8698                                          27.3228                        0.0                     0.0588                  NaN                         NaN                              NaN
+ temperature  n_rows  n_ok  n_missing_or_failed  mean_peptide_ca_rmsd_after_receptor_fit  median_peptide_ca_rmsd_after_receptor_fit  mean_peptide_backbone_rmsd_after_receptor_fit  median_peptide_backbone_rmsd_after_receptor_fit  success_rate_ca_rmsd_lt_2  success_rate_ca_rmsd_lt_5  mean_highfold_plddt_comment  n_highfold_plddt_comment  mean_highfold_ca_bfactor_mean  n_highfold_ca_bfactor_mean  mean_peptide_receptor_iptm  mean_peptide_receptor_inter_pae
+        0.01      17    17                    0                                30.912853                                    42.4658                                      30.823894                                          42.4462                        0.0                   0.000000                    70.797887                        17                      87.231936                          17                    0.448529                        18.375247
+        0.10      17    17                    0                                33.076500                                    43.0895                                      33.008447                                          43.0497                        0.0                   0.058824                    70.949467                        16                      87.657982                          17                    0.466562                        17.823856
+        0.20      17    17                    0                                29.541506                                    41.5948                                      29.447218                                          41.6235                        0.0                   0.058824                    72.666796                         4                      87.439709                          17                    0.492500                        17.605475
+        0.30      17    17                    0                                30.125112                                    40.0638                                      30.023918                                          39.9596                        0.0                   0.000000                          NaN                         0                      87.717229                          17                         NaN                              NaN
+        0.50      17    17                    0                                25.992612                                    27.4252                                      25.869782                                          27.3228                        0.0                   0.058824                          NaN                         0                      87.705903                          17                         NaN                              NaN
 
 QUALITY GATE: PASS
-WARNINGS: 3
+WARNINGS: 2

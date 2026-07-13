@@ -1,6 +1,6 @@
-temperature,n_rows,n_ok,n_missing_or_failed,mean_peptide_ca_rmsd_after_receptor_fit,median_peptide_ca_rmsd_after_receptor_fit,mean_peptide_backbone_rmsd_after_receptor_fit,median_peptide_backbone_rmsd_after_receptor_fit,success_rate_ca_rmsd_lt_2,success_rate_ca_rmsd_lt_5,mean_highfold_plddt,mean_peptide_receptor_iptm,mean_peptide_receptor_inter_pae
-0.01,17,17,0,30.9129,42.4658,30.8239,42.4462,0.0000,0.0000,70.7979,0.4485,18.3752
-0.1,17,17,0,33.0765,43.0895,33.0084,43.0497,0.0000,0.0588,70.9495,0.4666,17.8239
-0.2,17,17,0,29.5415,41.5948,29.4472,41.6235,0.0000,0.0588,72.6668,0.4925,17.6055
-0.3,17,17,0,30.1251,40.0638,30.0239,39.9596,0.0000,0.0000,,,
-0.5,17,17,0,25.9926,27.4252,25.8698,27.3228,0.0000,0.0588,,,
+temperature,n_rows,n_ok,n_missing_or_failed,mean_peptide_ca_rmsd_after_receptor_fit,median_peptide_ca_rmsd_after_receptor_fit,mean_peptide_backbone_rmsd_after_receptor_fit,median_peptide_backbone_rmsd_after_receptor_fit,success_rate_ca_rmsd_lt_2,success_rate_ca_rmsd_lt_5,mean_highfold_plddt_comment,n_highfold_plddt_comment,mean_highfold_ca_bfactor_mean,n_highfold_ca_bfactor_mean,mean_peptide_receptor_iptm,mean_peptide_receptor_inter_pae
+0.01,17,17,0,30.91285294117647,42.4658,30.82389411764706,42.4462,0.0,0.0,70.79788652941177,17,87.2319356896497,17,0.44852941176470584,18.375247058823533
+0.1,17,17,0,33.0765,43.0895,33.00844705882353,43.0497,0.0,0.058823529411764705,70.9494671875,16,87.65798172783138,17,0.4665625,17.82385625
+0.2,17,17,0,29.541505882352936,41.5948,29.447217647058824,41.6235,0.0,0.058823529411764705,72.666796,4,87.4397088575113,17,0.49249999999999994,17.605475
+0.3,17,17,0,30.12511176470588,40.0638,30.023917647058823,39.9596,0.0,0.0,,0,87.7172286840066,17,,
+0.5,17,17,0,25.992611764705885,27.4252,25.869782352941176,27.3228,0.0,0.058823529411764705,,0,87.70590334920087,17,,

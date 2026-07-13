@@ -1,0 +1,19 @@
+===== HIGHFOLD PLDDT / CA B-FACTOR AUDIT =====
+OK rows: 85
+COMMENT global pLDDT available: 37/85
+Mean CA B-factor available: 85/85
+Mean CA B-factor missing: 0/85
+
+Mean CA B-factor by temperature:
+             n_rows  n_ca_bfactor  mean_ca_bfactor  n_comment_plddt  mean_comment_plddt
+temperature                                                                            
+0.01             17            17        87.231936               17           70.797887
+0.10             17            17        87.657982               16           70.949467
+0.20             17            17        87.439709                4           72.666796
+0.30             17            17        87.717229                0                 NaN
+0.50             17            17        87.705903                0                 NaN
+
+Notes:
+- COMMENT global pLDDT and mean CA B-factor are reported separately and are not mixed.
+- Mean CA B-factor may be used as a per-residue pLDDT proxy only with an explicit label or after confirming the HighFold output convention.
+- ipTM and inter-PAE are not reconstructed from coordinates.
