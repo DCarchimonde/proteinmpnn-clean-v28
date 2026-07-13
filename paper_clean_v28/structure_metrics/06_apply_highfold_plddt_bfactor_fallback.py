@@ -3,14 +3,16 @@
 """
 06_apply_highfold_plddt_bfactor_fallback.py
 
-Patch complex structure metric outputs so that global pLDDT can use the mean CA
-B-factor as a fallback when the PDB COMMENT global pLDDT field is missing.
+Audit and attach the mean CA B-factor from each HighFold PDB as a complete
+per-structure confidence proxy.
 
-Why this is needed:
-- Some HighFold/AlphaFold-style PDBs store residue-level pLDDT in the B-factor
-  column but do not include a global COMMENT plddt header.
-- ipTM and inter-PAE cannot be recovered from ordinary ATOM coordinates, so this
-  script only fixes pLDDT availability.
+Scientific handling:
+- COMMENT global pLDDT and mean CA B-factor are kept as separate metrics.
+- They are not mixed into a single column because their numerical definitions can
+  differ substantially for complexes.
+- The mean CA B-factor is labelled as a pLDDT proxy unless the generating pipeline
+  is independently confirmed to encode pLDDT in the PDB B-factor field.
+- ipTM and inter-PAE cannot be recovered from ordinary ATOM coordinates.
 
 Inputs:
     paper_clean_v28_outputs/structure_metrics/complex_rmsd_metrics.csv
@@ -24,11 +26,8 @@ Outputs overwritten/created:
 
 New columns:
     highfold_plddt_comment
-    highfold_plddt_bfactor_fallback
-    highfold_plddt_source
-    highfold_plddt_effective
-
-For backward compatibility, highfold_plddt is replaced with highfold_plddt_effective.
+    highfold_ca_bfactor_mean
+    highfold_ca_bfactor_available
 """
 
 from pathlib import Path
@@ -62,23 +61,17 @@ def make_key(df, target_col, temp_col, seq_col):
 
 def mean_numeric(s):
     x = pd.to_numeric(s, errors="coerce").dropna()
-    if len(x) == 0:
-        return ""
-    return float(x.mean())
+    return "" if len(x) == 0 else float(x.mean())
 
 
 def median_numeric(s):
     x = pd.to_numeric(s, errors="coerce").dropna()
-    if len(x) == 0:
-        return ""
-    return float(x.median())
+    return "" if len(x) == 0 else float(x.median())
 
 
 def success_rate_lt(s, threshold):
     x = pd.to_numeric(s, errors="coerce").dropna()
-    if len(x) == 0:
-        return ""
-    return float((x < threshold).mean())
+    return "" if len(x) == 0 else float((x < threshold).mean())
 
 
 def summarize(df, group_col):
@@ -97,11 +90,10 @@ def summarize(df, group_col):
             "median_peptide_backbone_rmsd_after_receptor_fit": median_numeric(gok["peptide_backbone_rmsd_after_receptor_fit"]),
             "success_rate_ca_rmsd_lt_2": success_rate_lt(gok["peptide_ca_rmsd_after_receptor_fit"], 2.0),
             "success_rate_ca_rmsd_lt_5": success_rate_lt(gok["peptide_ca_rmsd_after_receptor_fit"], 5.0),
-            "mean_highfold_plddt": mean_numeric(gok["highfold_plddt"]),
-            "mean_highfold_plddt_comment_only": mean_numeric(gok["highfold_plddt_comment"]),
-            "mean_highfold_plddt_bfactor_fallback": mean_numeric(gok["highfold_plddt_bfactor_fallback"]),
+            "mean_highfold_plddt_comment": mean_numeric(gok["highfold_plddt_comment"]),
             "n_highfold_plddt_comment": int(pd.to_numeric(gok["highfold_plddt_comment"], errors="coerce").notna().sum()),
-            "n_highfold_plddt_bfactor_fallback": int((gok["highfold_plddt_source"] == "ca_bfactor_mean_fallback").sum()),
+            "mean_highfold_ca_bfactor_mean": mean_numeric(gok["highfold_ca_bfactor_mean"]),
+            "n_highfold_ca_bfactor_mean": int(pd.to_numeric(gok["highfold_ca_bfactor_mean"], errors="coerce").notna().sum()),
             "mean_peptide_receptor_iptm": mean_numeric(gok["peptide_receptor_iptm_mean"]),
             "mean_peptide_receptor_inter_pae": mean_numeric(gok["peptide_receptor_inter_pae_mean"]),
         })
@@ -117,27 +109,27 @@ def main():
     rmsd = pd.read_csv(RMSD_PATH)
     rep = pd.read_csv(REP_PATH)
 
-    rmsd["_merge_key"] = make_key(rmsd, "target_name", "temperature", "design_seq")
-    rep["_merge_key"] = make_key(rep, "target_name", "temperature", "design_peptide_seq")
+    rmsd_key = make_key(rmsd, "target_name", "temperature", "design_seq")
+    rep_key = make_key(rep, "target_name", "temperature", "design_peptide_seq")
 
-    rep_cols = rep[["_merge_key", "highfold_pdb_ca_bfactor_mean"]].copy()
-    rep_cols = rep_cols.drop_duplicates("_merge_key", keep="first")
-    rmsd = rmsd.merge(rep_cols, on="_merge_key", how="left", suffixes=("", "_from_rep"), validate="m:1")
+    rep_bfactor = pd.to_numeric(rep["highfold_pdb_ca_bfactor_mean"], errors="coerce")
+    bfactor_map = pd.Series(rep_bfactor.values, index=rep_key).groupby(level=0).first()
 
-    comment = pd.to_numeric(rmsd.get("highfold_plddt"), errors="coerce")
-    bfac = pd.to_numeric(rmsd.get("highfold_pdb_ca_bfactor_mean_from_rep"), errors="coerce")
+    if "highfold_plddt_comment" in rmsd.columns:
+        comment = pd.to_numeric(rmsd["highfold_plddt_comment"], errors="coerce")
+    else:
+        comment = pd.to_numeric(rmsd["highfold_plddt"], errors="coerce")
+
+    bfac = pd.to_numeric(rmsd_key.map(bfactor_map), errors="coerce")
 
     rmsd["highfold_plddt_comment"] = comment
-    rmsd["highfold_plddt_bfactor_fallback"] = bfac
-    rmsd["highfold_plddt_effective"] = comment.where(comment.notna(), bfac)
-    rmsd["highfold_plddt_source"] = "missing"
-    rmsd.loc[comment.notna(), "highfold_plddt_source"] = "comment_global_plddt"
-    rmsd.loc[comment.isna() & bfac.notna(), "highfold_plddt_source"] = "ca_bfactor_mean_fallback"
+    rmsd["highfold_ca_bfactor_mean"] = bfac
+    rmsd["highfold_ca_bfactor_available"] = bfac.notna().astype(int)
 
-    # Backward compatible field used by existing validation/report scripts.
-    rmsd["highfold_plddt"] = rmsd["highfold_plddt_effective"]
+    # Keep the historical highfold_plddt column as COMMENT global pLDDT only.
+    # Do not overwrite it with a different quantity.
+    rmsd["highfold_plddt"] = comment
 
-    rmsd = rmsd.drop(columns=[c for c in ["_merge_key", "highfold_pdb_ca_bfactor_mean_from_rep"] if c in rmsd.columns])
     rmsd.to_csv(RMSD_PATH, index=False, encoding="utf-8")
 
     summary_temp = summarize(rmsd, "temperature")
@@ -148,42 +140,37 @@ def main():
     ok = rmsd[rmsd["rmsd_status"] == "ok"].copy()
     n_ok = len(ok)
     n_comment = int(pd.to_numeric(ok["highfold_plddt_comment"], errors="coerce").notna().sum())
-    n_fallback = int((ok["highfold_plddt_source"] == "ca_bfactor_mean_fallback").sum())
-    n_effective = int(pd.to_numeric(ok["highfold_plddt_effective"], errors="coerce").notna().sum())
-    n_missing = n_ok - n_effective
+    n_bfactor = int(pd.to_numeric(ok["highfold_ca_bfactor_mean"], errors="coerce").notna().sum())
 
     lines = []
-    lines.append("===== HIGHFOLD PLDDT B-FACTOR FALLBACK REPORT =====")
+    lines.append("===== HIGHFOLD PLDDT / CA B-FACTOR AUDIT =====")
     lines.append(f"OK rows: {n_ok}")
     lines.append(f"COMMENT global pLDDT available: {n_comment}/{n_ok}")
-    lines.append(f"CA B-factor fallback used: {n_fallback}/{n_ok}")
-    lines.append(f"Effective pLDDT available: {n_effective}/{n_ok}")
-    lines.append(f"Effective pLDDT missing: {n_missing}/{n_ok}")
+    lines.append(f"Mean CA B-factor available: {n_bfactor}/{n_ok}")
+    lines.append(f"Mean CA B-factor missing: {n_ok - n_bfactor}/{n_ok}")
     lines.append("")
-    lines.append("pLDDT source counts:")
-    lines.append(ok["highfold_plddt_source"].value_counts(dropna=False).to_string())
-    lines.append("")
-    lines.append("Effective pLDDT by temperature:")
+    lines.append("Mean CA B-factor by temperature:")
     lines.append(
         ok.groupby("temperature").agg(
-            n_rows=("highfold_plddt_effective", "size"),
-            n_effective_plddt=("highfold_plddt_effective", lambda s: int(pd.to_numeric(s, errors="coerce").notna().sum())),
-            n_comment=("highfold_plddt_source", lambda s: int((s == "comment_global_plddt").sum())),
-            n_bfactor_fallback=("highfold_plddt_source", lambda s: int((s == "ca_bfactor_mean_fallback").sum())),
-            mean_highfold_plddt=("highfold_plddt_effective", lambda s: pd.to_numeric(s, errors="coerce").mean()),
+            n_rows=("highfold_ca_bfactor_mean", "size"),
+            n_ca_bfactor=("highfold_ca_bfactor_mean", lambda s: int(pd.to_numeric(s, errors="coerce").notna().sum())),
+            mean_ca_bfactor=("highfold_ca_bfactor_mean", lambda s: pd.to_numeric(s, errors="coerce").mean()),
+            n_comment_plddt=("highfold_plddt_comment", lambda s: int(pd.to_numeric(s, errors="coerce").notna().sum())),
+            mean_comment_plddt=("highfold_plddt_comment", lambda s: pd.to_numeric(s, errors="coerce").mean()),
         ).to_string()
     )
     lines.append("")
     lines.append("Notes:")
-    lines.append("- highfold_plddt now means effective pLDDT: COMMENT global pLDDT if present, otherwise mean CA B-factor.")
-    lines.append("- ipTM and inter-PAE are not patched because they cannot be recovered from ordinary ATOM coordinates.")
+    lines.append("- COMMENT global pLDDT and mean CA B-factor are reported separately and are not mixed.")
+    lines.append("- Mean CA B-factor may be used as a per-residue pLDDT proxy only with an explicit label or after confirming the HighFold output convention.")
+    lines.append("- ipTM and inter-PAE are not reconstructed from coordinates.")
 
     REPORT_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    print("完成：HighFold pLDDT fallback patch")
+    print("完成：HighFold pLDDT / CA B-factor audit")
     print("report:", REPORT_PATH)
-    print(f"effective pLDDT: {n_effective}/{n_ok}")
-    print(f"comment: {n_comment}/{n_ok}, bfactor fallback: {n_fallback}/{n_ok}, missing: {n_missing}/{n_ok}")
+    print(f"COMMENT global pLDDT: {n_comment}/{n_ok}")
+    print(f"mean CA B-factor: {n_bfactor}/{n_ok}")
 
 
 if __name__ == "__main__":
