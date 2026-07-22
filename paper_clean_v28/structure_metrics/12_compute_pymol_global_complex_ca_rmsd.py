@@ -1037,9 +1037,8 @@ def parser_with_defaults(repo_root: Path) -> argparse.ArgumentParser:
 
 def main() -> None:
     # ``suspend_undo`` is an Incentive-only setting.  Calling it in Open-Source
-    # PyMOL emits a Setting-Warning and can make ``-y`` terminate the batch
-    # before any structures are processed, so do not set it here.  Objects are
-    # explicitly deleted after each comparison instead.
+    # PyMOL emits a misleading Setting-Warning and has no effect, so do not set
+    # it here.  Objects are explicitly deleted after each comparison instead.
 
     # PyMOL's ``run`` command executes a Python file inside PyMOL's global
     # namespace.  In that mode ``__file__`` points to pymol/__init__.py, while
@@ -1054,6 +1053,7 @@ def main() -> None:
         # PyMOL's global ``run`` namespace may omit __file__ in some builds.
         # The documented launch command starts in the repository root.
         repo_root = Path.cwd().resolve()
+    print("resolved repository root:", repo_root, flush=True)
     parser = parser_with_defaults(repo_root)
     # PyMOL itself may leave flags in sys.argv. Only this script's known flags matter.
     args, _unknown = parser.parse_known_args(sys.argv[1:])
