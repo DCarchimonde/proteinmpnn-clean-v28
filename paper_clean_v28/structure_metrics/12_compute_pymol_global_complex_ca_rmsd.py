@@ -69,6 +69,7 @@ PYMOL_OBJECTS = ("batch_pred", "batch_native", "batch_global_ca_alignment")
 
 CHECKPOINT = {
     "pdb_file": "4kel_13_rcrrrGNrQGQCGR_model.pdb",
+    "temperature": "0.3",
     "global_complex_ca_rmsd": 1.8244132995605469,
     "n_global_aligned_ca_pairs": 228,
     "n_matched_receptor_ca_pairs": 223,
@@ -941,7 +942,12 @@ def write_checkpoint_report(
     rows: Sequence[dict],
     tolerance: float,
 ) -> bool:
-    matches = [row for row in rows if row.get("pdb_file") == CHECKPOINT["pdb_file"]]
+    matches = [
+        row
+        for row in rows
+        if row.get("pdb_file") == CHECKPOINT["pdb_file"]
+        and norm_temp(row.get("temperature")) == CHECKPOINT["temperature"]
+    ]
     lines = ["===== PYMOL MANUAL 4KEL CHECKPOINT =====", ""]
     if len(matches) != 1:
         lines.extend(
