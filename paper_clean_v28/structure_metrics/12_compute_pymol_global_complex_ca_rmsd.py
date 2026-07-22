@@ -1040,8 +1040,14 @@ def main() -> None:
     # transforms many structures; otherwise the undo history can retain a large
     # amount of coordinate data during this 4,108-PDB run.
     cmd.set("suspend_undo", 1)
-    script_path = Path(__file__).resolve()
-    repo_root = script_path.parents[2]
+    script_value = globals().get("__file__")
+    if script_value:
+        script_path = Path(str(script_value)).resolve()
+        repo_root = script_path.parents[2]
+    else:
+        # PyMOL's global ``run`` namespace may omit __file__ in some builds.
+        # The documented launch command starts in the repository root.
+        repo_root = Path.cwd().resolve()
     parser = parser_with_defaults(repo_root)
     # PyMOL itself may leave flags in sys.argv. Only this script's known flags matter.
     args, _unknown = parser.parse_known_args(sys.argv[1:])
