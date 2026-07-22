@@ -1036,11 +1036,17 @@ def parser_with_defaults(repo_root: Path) -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    # PyMOL recommends disabling undo for automation that repeatedly loads and
-    # transforms many structures; otherwise the undo history can retain a large
-    # amount of coordinate data during this 4,108-PDB run.
-    cmd.set("suspend_undo", 1)
-    script_value = globals().get("__file__")
+    # ``suspend_undo`` is an Incentive-only setting.  Calling it in Open-Source
+    # PyMOL emits a Setting-Warning and can make ``-y`` terminate the batch
+    # before any structures are processed, so do not set it here.  Objects are
+    # explicitly deleted after each comparison instead.
+
+    # PyMOL's ``run`` command executes a Python file inside PyMOL's global
+    # namespace.  In that mode ``__file__`` points to pymol/__init__.py, while
+    # ``__script__`` contains the path of the script actually being executed.
+    # Prefer ``__script__`` so repository-relative inputs resolve correctly for
+    # both ``pymol script.py`` and ``pymol -r script.py`` launches.
+    script_value = globals().get("__script__") or globals().get("__file__")
     if script_value:
         script_path = Path(str(script_value)).resolve()
         repo_root = script_path.parents[2]
