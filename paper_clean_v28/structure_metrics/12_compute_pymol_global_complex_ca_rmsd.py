@@ -1036,6 +1036,10 @@ def parser_with_defaults(repo_root: Path) -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    # PyMOL recommends disabling undo for automation that repeatedly loads and
+    # transforms many structures; otherwise the undo history can retain a large
+    # amount of coordinate data during this 4,108-PDB run.
+    cmd.set("suspend_undo", 1)
     script_path = Path(__file__).resolve()
     repo_root = script_path.parents[2]
     parser = parser_with_defaults(repo_root)
