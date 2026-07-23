@@ -1,12 +1,18 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-"""Batch whole-complex and complete cyclic-peptide C-alpha RMSD.
+"""Align each whole complex once, then measure its final cyclic-peptide chain.
 
-The whole complex is first aligned exactly as in script 12.  Without any
-second fit, every C-alpha in the last (cyclic-peptide) chain is then paired by
-residue order with the complete native peptide chain.  This prevents sequence
-alignment from silently measuring only a few peptide residues.
+The operation is intentionally two measurements from one coordinate frame:
+
+1. PyMOL aligns all complex C-alpha atoms exactly as in script 12.
+2. The transformed coordinates are left untouched.  Every C-alpha in the
+   final predicted chain is paired by residue order with every C-alpha in the
+   final native chain, and their current RMSD is calculated directly.
+
+There is no second peptide ``align``, ``fit``, ``pair_fit`` or superposition.
+Consequently, the peptide result measures its pose/conformation in the
+whole-complex alignment frame, not a self-superposed peptide conformation.
 
 The program runs two cohorts in one invocation:
 
@@ -34,12 +40,8 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 try:
     from pymol import cmd
-except ImportError as exc:  # pragma: no cover - exercised in the user's PyMOL env
-    raise SystemExit(
-        "PyMOL's Python module is required. Run this script with PyMOL, for example:\n"
-        "  pymol -cq paper_clean_v28/structure_metrics/"
-        "12_compute_pymol_global_complex_ca_rmsd.py"
-    ) from exc
+except ImportError:  # Allows pure helper tests outside the user's PyMOL env.
+    cmd = None
 
 
 TEMP_MAP = {
@@ -78,6 +80,12 @@ CHECKPOINT = {
     "pdb_file": "4kel_13_rcrrrGNrQGQCGR_model.pdb",
     "temperature": "0.3",
     "global_complex_ca_rmsd": 1.8244132995605469,
+    "cyclic_peptide_ca_rmsd_after_global_complex_alignment": 2.318990,
+    "predicted_peptide_chain": "B",
+    "native_peptide_chain": "B",
+    "n_predicted_peptide_ca": 14,
+    "n_native_peptide_ca": 14,
+    "n_complete_positional_peptide_ca_pairs": 14,
     "n_global_aligned_ca_pairs": 228,
     "n_matched_receptor_ca_pairs": 223,
     "n_matched_peptide_ca_pairs": 5,
@@ -326,6 +334,12 @@ def choose_predicted_peptide_chain(
     return list(chain_sequences)[-1] if chain_sequences else ""
 
 
+def choose_native_peptide_chain(record: Mapping[str, object]) -> str:
+    """Return the final native chain in its JSONL/PDB construction order."""
+    sequences = native_sequences(record)
+    return list(sequences)[-1] if sequences else ""
+
+
 def choose_native_peptide_chains(
     record: Mapping[str, object],
     selected_chains: Sequence[str],
@@ -430,53 +444,67 @@ def evaluate_pdb(
         "pymol_align_max_gap": 50,
         "pymol_align_matrix": "BLOSUM62",
         "pymol_align_max_skip": 0,
+        "whole_complex_align_call_count": 0,
+        "cyclic_peptide_second_fit_performed": 0,
+        "cyclic_peptide_rmsd_coordinate_frame": (
+            "after_single_whole_complex_pymol_align"
+        ),
+        "cyclic_peptide_ca_pairing_rule": (
+            "all_CA_in_final_predicted_and_native_chains_by_residue_order"
+        ),
         "global_complex_ca_rmsd_threshold_angstrom": threshold,
         "global_complex_ca_rmsd_status": "",
+        "cyclic_peptide_ca_rmsd_status": "",
     }
 
     try:
         pred_meta = parse_predicted_ca_metadata(pdb_path)
-        predicted_peptide_chain = str(
+        predicted_chain_order = list(pred_meta["chain_sequences"])
+        predicted_peptide_chain = choose_predicted_peptide_chain(
+            pred_meta["chain_sequences"], design_seq, design_length
+        )
+        native_chain_order = list(native_sequences(native_record))
+        native_peptide_chain = choose_native_peptide_chain(native_record)
+
+        metadata_predicted_chain = str(
             metadata.get("predicted_peptide_chain", "")
         ).strip()
-        if not predicted_peptide_chain:
-            predicted_peptide_chain = choose_predicted_peptide_chain(
-                pred_meta["chain_sequences"], design_seq, design_length
-            )
-
-        equivalent_native = parse_chain_list(
-            metadata.get("equivalent_native_peptide_chains", "")
-        )
-        native_peptide_chain = str(
+        metadata_native_chain = str(
             metadata.get("native_peptide_chain_used")
             or metadata.get("native_peptide_chain")
             or ""
         ).strip()
-        selected_native = parse_chain_list(metadata.get("selected_chains", ""))
-        if native_peptide_chain:
-            selected_native = [native_peptide_chain] + selected_native
-        native_peptide_chains = equivalent_native or choose_native_peptide_chains(
-            native_record,
-            selected_native,
-            str(metadata.get("native_seq", "")),
-            design_length,
-        )
-        if native_peptide_chain and native_peptide_chain not in native_peptide_chains:
-            native_peptide_chains.insert(0, native_peptide_chain)
-        native_peptide_chains = list(dict.fromkeys(native_peptide_chains))
 
         base["predicted_peptide_chain"] = predicted_peptide_chain
-        base["native_peptide_chains_considered"] = ";".join(native_peptide_chains)
+        base["native_peptide_chain"] = native_peptide_chain
+        base["predicted_chain_order_in_pdb"] = ";".join(predicted_chain_order)
+        base["native_chain_order_in_jsonl"] = ";".join(native_chain_order)
+        base["metadata_predicted_peptide_chain_for_audit_only"] = (
+            metadata_predicted_chain
+        )
+        base["metadata_native_peptide_chain_for_audit_only"] = (
+            metadata_native_chain
+        )
+        base["metadata_predicted_chain_matches_final_chain"] = (
+            ""
+            if not metadata_predicted_chain
+            else int(metadata_predicted_chain == predicted_peptide_chain)
+        )
+        base["metadata_native_chain_matches_final_chain"] = (
+            ""
+            if not metadata_native_chain
+            else int(metadata_native_chain == native_peptide_chain)
+        )
         base["pdb_ca_bfactor_mean"] = fmt(pred_meta["pdb_ca_bfactor_mean"])
         base["predicted_chain_ca_counts"] = ";".join(
-            f"{chain}:{len(items)}"
-            for chain, items in sorted(pred_meta["chains"].items())
+            f"{chain}:{len(pred_meta['chains'][chain])}"
+            for chain in predicted_chain_order
         )
 
         if not predicted_peptide_chain:
-            raise ValueError("predicted peptide chain could not be inferred")
-        if not native_peptide_chains:
-            raise ValueError("native peptide chain could not be inferred")
+            raise ValueError("predicted final cyclic-peptide chain is missing")
+        if not native_peptide_chain:
+            raise ValueError("native final cyclic-peptide chain is missing")
 
         cleanup_pymol_objects()
         cmd.read_pdbstr(native_record_to_pdbstr(native_record), "batch_native")
@@ -501,6 +529,7 @@ def evaluate_pdb(
             transform=1,
             reset=0,
         )
+        base["whole_complex_align_call_count"] = 1
         if len(result) != 7:
             raise RuntimeError(f"Unexpected PyMOL align result: {result!r}")
 
@@ -525,7 +554,6 @@ def evaluate_pdb(
         receptor_pairs = 0
         peptide_pairs = 0
         mixed_pairs = 0
-        native_peptide_pair_counts: Counter = Counter()
         raw_columns = cmd.get_raw_alignment("batch_global_ca_alignment")
         for column in raw_columns:
             pred_atoms = [item for item in column if item[0] == "batch_pred"]
@@ -537,39 +565,24 @@ def evaluate_pdb(
             native_chain = atom_info.get(tuple(native_atoms[0]), {}).get("chain", "?")
             chain_pairs[(pred_chain, native_chain)] += 1
             pred_is_peptide = pred_chain == predicted_peptide_chain
-            native_is_peptide = native_chain in set(native_peptide_chains)
+            native_is_peptide = native_chain == native_peptide_chain
             if pred_is_peptide and native_is_peptide:
                 peptide_pairs += 1
-                native_peptide_pair_counts[native_chain] += 1
             elif not pred_is_peptide and not native_is_peptide:
                 receptor_pairs += 1
             else:
                 mixed_pairs += 1
 
-        native_peptide_chain_used = ""
-        if native_peptide_pair_counts:
-            native_peptide_chain_used = sorted(
-                native_peptide_pair_counts,
-                key=lambda chain: (-native_peptide_pair_counts[chain], chain),
-            )[0]
-        elif native_peptide_chain:
-            native_peptide_chain_used = native_peptide_chain
-        else:
-            native_peptide_chain_used = native_peptide_chains[0]
-
         pred_peptide_ca = count_selection(
             f"batch_pred and chain {predicted_peptide_chain} and name CA"
         )
         native_peptide_ca = count_selection(
-            f"batch_native and chain {native_peptide_chain_used} and name CA"
+            f"batch_native and chain {native_peptide_chain} and name CA"
         )
         pred_total_ca = count_selection("batch_pred and name CA")
         native_total_ca = count_selection("batch_native and name CA")
         pred_receptor_ca = pred_total_ca - pred_peptide_ca
-        native_receptor_ca = native_total_ca - sum(
-            count_selection(f"batch_native and chain {chain} and name CA")
-            for chain in native_peptide_chains
-        )
+        native_receptor_ca = native_total_ca - native_peptide_ca
 
         decoded_design_seq = pred_meta["chain_sequences"].get(
             predicted_peptide_chain, ""
@@ -579,34 +592,28 @@ def evaluate_pdb(
             naturalize(decoded_design_seq) == naturalize(design_seq)
         )
 
-        peptide_results = []
-        for candidate_chain in native_peptide_chains:
-            candidate_selection = (
-                f"batch_native and chain {candidate_chain} and name CA"
-            )
-            try:
-                candidate_rmsd, candidate_pairs = complete_positional_ca_rmsd(
-                    f"batch_pred and chain {predicted_peptide_chain} and name CA",
-                    candidate_selection,
-                )
-                peptide_results.append(
-                    (candidate_rmsd, candidate_chain, candidate_pairs)
-                )
-            except ValueError:
-                continue
-        if not peptide_results:
-            raise ValueError(
-                "no native peptide chain permits complete positional CA pairing"
-            )
-        cyclic_peptide_ca_rmsd, positional_native_chain, positional_pairs = min(
-            peptide_results, key=lambda item: (item[0], item[1])
+        cyclic_peptide_ca_rmsd, positional_pairs = complete_positional_ca_rmsd(
+            f"batch_pred and chain {predicted_peptide_chain} and name CA",
+            f"batch_native and chain {native_peptide_chain} and name CA",
         )
+        complete_pairing_gate = int(
+            positional_pairs > 0
+            and positional_pairs == pred_peptide_ca
+            and positional_pairs == native_peptide_ca
+        )
+        if not complete_pairing_gate:
+            raise ValueError(
+                "complete final-chain CA pairing gate failed: "
+                f"pairs={positional_pairs}, predicted={pred_peptide_ca}, "
+                f"native={native_peptide_ca}"
+            )
         global_pass = int(float(rms_after) < threshold)
         peptide_pass = int(cyclic_peptide_ca_rmsd < threshold)
 
         base.update(
             {
                 "predicted_peptide_chain_rule": "last_chain_in_predicted_pdb",
+                "native_peptide_chain_rule": "last_chain_in_native_jsonl",
                 "decoded_design_seq_from_pdb": decoded_design_seq,
                 "decoded_design_seq_matches_design_exactly": int(
                     sequence_matches_design_exactly
@@ -614,8 +621,7 @@ def evaluate_pdb(
                 "decoded_design_seq_matches_design_naturalized": int(
                     sequence_matches_design_naturalized
                 ),
-                "native_peptide_chain_used_by_global_alignment": native_peptide_chain_used,
-                "native_peptide_chain_used_by_complete_positional_rmsd": positional_native_chain,
+                "native_peptide_chain_used_by_complete_positional_rmsd": native_peptide_chain,
                 "global_complex_ca_rmsd": fmt(rms_after),
                 "n_global_aligned_ca_pairs": int(n_after),
                 "global_align_cycles_performed": int(n_cycles),
@@ -658,6 +664,7 @@ def evaluate_pdb(
                     cyclic_peptide_ca_rmsd
                 ),
                 "n_complete_positional_peptide_ca_pairs": positional_pairs,
+                "complete_final_chain_ca_pairing_gate": complete_pairing_gate,
                 "complete_positional_peptide_ca_coverage": fmt(
                     positional_pairs / pred_peptide_ca if pred_peptide_ca else None
                 ),
@@ -672,10 +679,12 @@ def evaluate_pdb(
                 ),
                 "passes_global_complex_ca_rmsd_lt_threshold": global_pass,
                 "global_complex_ca_rmsd_status": "ok",
+                "cyclic_peptide_ca_rmsd_status": "ok",
             }
         )
     except Exception as exc:
         base["global_complex_ca_rmsd_status"] = "failed"
+        base["cyclic_peptide_ca_rmsd_status"] = "failed"
         base["global_complex_ca_rmsd_error"] = repr(exc)
     finally:
         cleanup_pymol_objects()
@@ -995,12 +1004,14 @@ def cohort_report_lines(
             f"fraction < {threshold:.3f} among RMSD-OK: {len(passed) / len(ok):.8f}"
             if ok else f"fraction < {threshold:.3f} among RMSD-OK: NA"
         ),
-        f"full peptide CA alignment coverage: "
+        f"diagnostic full peptide coverage inside PyMOL sequence alignment: "
         f"{sum(str(row.get('full_peptide_ca_alignment_coverage', '')) == '1' for row in ok)}"
         f"/{len(ok)}",
         (
-            f"median peptide CA alignment coverage vs native: {median(coverage):.6f}"
-            if coverage else "median peptide CA alignment coverage vs native: NA"
+            "diagnostic median peptide coverage inside PyMOL sequence alignment "
+            f"vs native: {median(coverage):.6f}"
+            if coverage
+            else "diagnostic median peptide coverage inside PyMOL sequence alignment: NA"
         ),
         "",
         "Status counts:",
@@ -1013,8 +1024,10 @@ def cohort_report_lines(
             "  This is the requested whole-complex CA metric.",
             "  It can be dominated by receptor residues and can align only a subset of",
             "  peptide residues when designed and native peptide sequences differ.",
-            "  Peptide/receptor pair counts and coverage must therefore travel with RMSD.",
-            "  The receptor-frame peptide RMSD audit remains a separate complementary result.",
+            "  Those sequence-alignment pair counts are diagnostic only.",
+            "  The same CSV also reports complete final-chain peptide CA RMSD after",
+            "  that one global transform using all final-chain CAs by position, with",
+            "  no peptide-only second fit.",
         ]
     )
     return lines
@@ -1031,7 +1044,10 @@ def write_checkpoint_report(
         if row.get("pdb_file") == CHECKPOINT["pdb_file"]
         and norm_temp(row.get("temperature")) == CHECKPOINT["temperature"]
     ]
-    lines = ["===== PYMOL MANUAL 4KEL CHECKPOINT =====", ""]
+    lines = [
+        "===== 4KEL SINGLE GLOBAL-ALIGN + CYCLIC-PEPTIDE CHECKPOINT =====",
+        "",
+    ]
     if len(matches) != 1:
         lines.extend(
             [
@@ -1046,6 +1062,7 @@ def write_checkpoint_report(
     checks = []
     for field in (
         "global_complex_ca_rmsd",
+        "cyclic_peptide_ca_rmsd_after_global_complex_alignment",
         "global_align_raw_score",
     ):
         observed = safe_float(row.get(field))
@@ -1055,18 +1072,54 @@ def write_checkpoint_report(
         "n_global_aligned_ca_pairs",
         "n_matched_receptor_ca_pairs",
         "n_matched_peptide_ca_pairs",
+        "n_predicted_peptide_ca",
+        "n_native_peptide_ca",
+        "n_complete_positional_peptide_ca_pairs",
     ):
         observed = safe_float(row.get(field))
         expected = int(CHECKPOINT[field])
         checks.append((field, observed is not None and int(observed) == expected))
+    for field in (
+        "predicted_peptide_chain",
+        "native_peptide_chain",
+    ):
+        observed = str(row.get(field, ""))
+        expected = str(CHECKPOINT[field])
+        checks.append((field, observed == expected))
+    checks.extend(
+        [
+            (
+                "whole_complex_align_call_count",
+                str(row.get("whole_complex_align_call_count", "")) == "1",
+            ),
+            (
+                "cyclic_peptide_second_fit_performed",
+                str(row.get("cyclic_peptide_second_fit_performed", "")) == "0",
+            ),
+            (
+                "complete_final_chain_ca_pairing_gate",
+                str(row.get("complete_final_chain_ca_pairing_gate", "")) == "1",
+            ),
+        ]
+    )
 
     passed = all(value for _field, value in checks)
     lines.append(f"status: {'PASS' if passed else 'FAIL'}")
     lines.append(f"numeric tolerance: {tolerance}")
     lines.append("")
+    fixed_expectations = {
+        "whole_complex_align_call_count": 1,
+        "cyclic_peptide_second_fit_performed": 0,
+        "complete_final_chain_ca_pairing_gate": 1,
+    }
     for field, field_passed in checks:
+        expected_display = CHECKPOINT.get(
+            field,
+            fixed_expectations.get(field, ""),
+        )
         lines.append(
-            f"{field}: observed={row.get(field, '')}, expected={CHECKPOINT[field]}, "
+            f"{field}: observed={row.get(field, '')}, "
+            f"expected={expected_display}, "
             f"check={'PASS' if field_passed else 'FAIL'}"
         )
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1076,7 +1129,10 @@ def write_checkpoint_report(
 
 def parser_with_defaults(repo_root: Path) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Batch exact PyMOL whole-complex CA RMSD for best85 and all PDBs."
+        description=(
+            "Align every whole complex once, then calculate complete final-chain "
+            "cyclic-peptide CA RMSD without a second fit."
+        )
     )
     parser.add_argument(
         "--best85",
@@ -1101,7 +1157,7 @@ def parser_with_defaults(repo_root: Path) -> argparse.ArgumentParser:
             / "paper_clean_v28_outputs/structure_metrics/rmsd_recheck_all_designs/"
             "all_design_receptor_backbone_rmsd_by_pdb.csv"
         ),
-        help="Optional prior audit used only for peptide-chain labels.",
+        help="Optional prior audit used only as metadata; it cannot override final chains.",
     )
     parser.add_argument(
         "--out_dir",
@@ -1119,6 +1175,13 @@ def parser_with_defaults(repo_root: Path) -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    if cmd is None:
+        raise SystemExit(
+            "PyMOL's Python module is required. Run this script with PyMOL:\n"
+            "  pymol -cq -r paper_clean_v28/structure_metrics/"
+            "13_compute_global_and_cyclic_peptide_ca_rmsd.py"
+        )
+
     # ``suspend_undo`` is an Incentive-only setting.  Calling it in Open-Source
     # PyMOL emits a misleading Setting-Warning and has no effect, so do not set
     # it here.  Objects are explicitly deleted after each comparison instead.
@@ -1178,7 +1241,10 @@ def main() -> None:
         )
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    print("===== PYMOL GLOBAL COMPLEX CA RMSD BATCH =====", flush=True)
+    print(
+        "===== ONE GLOBAL COMPLEX ALIGN + FINAL-CHAIN PEPTIDE RMSD =====",
+        flush=True,
+    )
     print("best85 rows:", len(best_source), flush=True)
     print("all PDB files:", len(pdb_files), flush=True)
     print("unique designs:", len(designs), flush=True)
@@ -1366,12 +1432,18 @@ def main() -> None:
         if row.get("global_complex_ca_rmsd_status") == "ok"
     )
     combined_lines = [
-        "===== GLOBAL + COMPLETE CYCLIC-PEPTIDE CA RMSD =====",
+        "===== ONE WHOLE-COMPLEX ALIGN + FINAL-CHAIN CYCLIC-PEPTIDE CA RMSD =====",
         "",
         f"strict threshold for both metrics: < {args.threshold:.3f} Angstrom",
-        "cyclic peptide rule: final predicted chain",
-        "peptide pairing: every CA by residue position after whole-complex alignment",
-        "second peptide fit: no",
+        "predicted cyclic peptide: final chain in predicted PDB file order",
+        "native cyclic peptide: final chain in native JSONL/PDB construction order",
+        "whole-complex alignment calls per structure: exactly 1",
+        "peptide pairing: every final-chain CA by residue position after that alignment",
+        "second peptide align/fit/superposition: NEVER",
+        (
+            "PyMOL sequence-alignment peptide coverage is diagnostic only; "
+            "it does not limit the complete peptide RMSD"
+        ),
         "",
         f"best85 global pass: {len(best85_pass)}/{len(best85_rows)}",
         f"best85 cyclic-peptide pass: {len(best85_peptide_pass)}/{len(best85_rows)}",
@@ -1386,7 +1458,7 @@ def main() -> None:
         f"confidence representatives joint pass: {len(confidence_joint_pass)}/{len(confidence_designs)}",
         "",
         f"naturalized design sequence matches: {sequence_ok}/{len(all_pdb_rows)}",
-        f"4KEL manual global checkpoint: {'PASS' if checkpoint_ok else 'FAIL'}",
+        f"4KEL global + complete peptide checkpoint: {'PASS' if checkpoint_ok else 'FAIL'}",
     ]
     (out_dir / "global_and_cyclic_peptide_ca_rmsd_report.txt").write_text(
         "\n".join(combined_lines) + "\n", encoding="utf-8"
@@ -1399,7 +1471,15 @@ def main() -> None:
     write_json(
         out_dir / "global_complex_ca_rmsd_run_metadata.json",
         {
-            "metric": "PyMOL whole-complex CA align",
+            "metric": (
+                "one PyMOL whole-complex CA align followed by complete final-chain "
+                "CA RMSD in the unchanged aligned frame"
+            ),
+            "whole_complex_align_calls_per_structure": 1,
+            "cyclic_peptide_second_fit_performed": False,
+            "predicted_cyclic_peptide_chain_rule": "last chain in predicted PDB order",
+            "native_cyclic_peptide_chain_rule": "last chain in native JSONL order",
+            "cyclic_peptide_ca_pairing_rule": "all final-chain CA by residue order",
             "cycles": 0,
             "cutoff": 2.0,
             "gap": -10.0,

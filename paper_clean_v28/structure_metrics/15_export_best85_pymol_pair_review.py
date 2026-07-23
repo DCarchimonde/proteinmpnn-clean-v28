@@ -1,24 +1,20 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-"""Export the best85 as convenient, reproducible two-structure PyMOL reviews.
+"""Export all 85 single-global-align predicted/native PyMOL review pairs.
 
-This script does not change any RMSD definition or pass/fail classification.
-It consumes the best85 table produced by script 14 and creates one review
-folder per row.  Every folder contains:
+For every row this exporter independently reproduces script 13:
 
-* the raw predicted complex;
-* the native complex reconstructed exactly as in scripts 12--14;
-* the two aligned cyclic-peptide chains;
-* a PyMOL session with exactly two molecular structures;
-* a PML file that reruns the same cyclic-peptide ``align`` operation; and
-* a short text record of the metric and chain identities.
+1. load the complete predicted and native complexes;
+2. call PyMOL ``align`` exactly once on all complex C-alpha atoms;
+3. do not align or fit the cyclic peptide again;
+4. take the final chain from each already aligned complex;
+5. calculate complete final-chain C-alpha RMSD by residue order; and
+6. verify both global and peptide RMSDs against the saved best85 CSV.
 
-The exporter independently repeats the script-14 PyMOL operation
-(``name CA``, ``cycles=0``, BLOSUM62 defaults fixed explicitly) and checks both
-the RMSD and aligned-pair count against the saved CSV before a row is accepted.
-The generated master PML adds ``best_next``, ``best_prev``, ``best_load`` and
-``best_info`` commands for quick one-pair-at-a-time inspection.
+The saved session therefore opens directly in the scientifically relevant
+whole-complex alignment frame.  The user should rotate/zoom the view, not click
+another ``align`` command.
 """
 
 from __future__ import annotations
@@ -49,7 +45,7 @@ NATIVE_OBJECT = "best85_native_complex"
 PREDICTED_PEPTIDE = "best85_predicted_cyclic_peptide"
 NATIVE_PEPTIDE = "best85_native_cyclic_peptide"
 PEPTIDE_OVERLAY = "best85_cyclic_peptide_overlay"
-ALIGNMENT_OBJECT = "best85_peptide_ca_alignment"
+ALIGNMENT_OBJECT = "best85_global_complex_ca_alignment"
 
 ALIGN_KWARGS = {
     "cutoff": 2.0,
@@ -170,10 +166,6 @@ def write_pair_pml(
     native_chain: str,
     group_name: str,
 ) -> None:
-    predicted_selection = (
-        f"{PREDICTED_OBJECT} and chain {predicted_chain} and name CA"
-    )
-    native_selection = f"{NATIVE_OBJECT} and chain {native_chain} and name CA"
     lines = [
         f"delete {OBJECT_PREFIX}*",
         f"load {pml_quote(predicted_raw)}, {PREDICTED_OBJECT}",
@@ -181,7 +173,8 @@ def write_pair_pml(
         f"sort {PREDICTED_OBJECT}",
         f"sort {NATIVE_OBJECT}",
         (
-            f"align {predicted_selection}, {native_selection}, "
+            f"align {PREDICTED_OBJECT} and name CA, "
+            f"{NATIVE_OBJECT} and name CA, "
             "cutoff=2.0, cycles=0, gap=-10.0, extend=-0.5, max_gap=50, "
             f"object={ALIGNMENT_OBJECT}, matrix=BLOSUM62, mobile_state=0, "
             "target_state=0, quiet=0, max_skip=0, transform=1, reset=0"
@@ -283,8 +276,10 @@ def pair_info_lines(
     row: Mapping[str, object],
     predicted_chain: str,
     native_chain: str,
-    actual_rmsd: float,
-    aligned_pairs: int,
+    actual_global_rmsd: float,
+    global_aligned_pairs: int,
+    actual_peptide_rmsd: float,
+    complete_peptide_pairs: int,
     predicted_count: int,
     native_count: int,
 ) -> List[str]:
@@ -298,13 +293,17 @@ def pair_info_lines(
         f"predicted cyclic-peptide chain: {predicted_chain}",
         f"native cyclic-peptide chain: {native_chain}",
         "",
-        f"global-complex PyMOL CA RMSD: {row.get('global_complex_ca_rmsd', '')}",
-        f"cyclic-peptide PyMOL CA RMSD: {actual_rmsd:.6f}",
-        f"PyMOL-aligned cyclic-peptide CA pairs: {aligned_pairs}",
+        f"reproduced global-complex PyMOL CA RMSD: {actual_global_rmsd:.6f}",
+        f"global PyMOL-aligned CA pairs: {global_aligned_pairs}",
+        (
+            "complete cyclic-peptide CA RMSD after global-complex alignment: "
+            f"{actual_peptide_rmsd:.6f}"
+        ),
+        f"complete cyclic-peptide CA pairs: {complete_peptide_pairs}",
         f"predicted/native cyclic-peptide CA counts: {predicted_count}/{native_count}",
         (
             "naturalized design-sequence match: "
-            f"{row.get('cyclic_peptide_naturalized_sequence_matches_design', '')}"
+            f"{row.get('decoded_design_seq_matches_design_naturalized', '')}"
         ),
         "",
         "Colour legend:",
@@ -313,8 +312,13 @@ def pair_info_lines(
         "  predicted cyclic peptide: orange",
         "  native cyclic peptide: magenta",
         "",
-        "The visible pair uses the exact script-14 independent peptide fit.",
-        "The RMSD is based on PyMOL sequence-matched CA pairs, shown above.",
+        "The visible pair uses exactly one whole-complex PyMOL CA align.",
+        "The orange peptide was moved only with its complete predicted complex.",
+        "The peptide RMSD uses every final-chain CA by residue order.",
+        "No peptide-only align, fit, pair_fit or superposition was performed.",
+        "",
+        "IMPORTANT: the session is already in the required aligned frame.",
+        "Rotate and zoom it; do not click Align again.",
     ]
 
 
@@ -328,9 +332,13 @@ def export_pair(
     support,
     tolerance: float,
 ) -> dict:
-    status = str(row.get("cyclic_peptide_same_align_status", ""))
-    if status != "ok":
-        raise ValueError(f"best85 row status is not ok: {status!r}")
+    global_status = str(row.get("global_complex_ca_rmsd_status", ""))
+    peptide_status = str(row.get("cyclic_peptide_ca_rmsd_status", ""))
+    if global_status != "ok" or peptide_status not in ("", "ok"):
+        raise ValueError(
+            "best85 row status is not OK: "
+            f"global={global_status!r}, peptide={peptide_status!r}"
+        )
 
     predicted_path = support.resolve_repo_path(repo_root, row.get("pdb_path", ""))
     if not predicted_path.is_file():
@@ -350,7 +358,7 @@ def export_pair(
         "predicted final chain",
     )
     saved_predicted_chain = str(
-        row.get("cyclic_peptide_predicted_chain", "")
+        row.get("predicted_peptide_chain", "")
     ).strip()
     if saved_predicted_chain and predicted_chain != saved_predicted_chain:
         raise ValueError(
@@ -358,14 +366,22 @@ def export_pair(
             f"PDB={predicted_chain}, CSV={saved_predicted_chain}"
         )
 
-    native_chain = validate_chain(
-        row.get("cyclic_peptide_native_chain_used_for_same_align", ""),
-        "native peptide chain",
-    )
     native_sequences = support.native_sequences(native_record)
-    if native_chain not in native_sequences:
+    if not native_sequences:
+        raise ValueError(f"No native chains found for {target}")
+    native_chain = validate_chain(
+        list(native_sequences)[-1],
+        "native final chain",
+    )
+    saved_native_chain = str(
+        row.get("native_peptide_chain")
+        or row.get("native_peptide_chain_used_by_complete_positional_rmsd")
+        or ""
+    ).strip()
+    if saved_native_chain and native_chain != saved_native_chain:
         raise ValueError(
-            f"Native peptide chain {native_chain!r} not found for {target}"
+            "Native final-chain quality gate failed: "
+            f"JSONL={native_chain}, CSV={saved_native_chain}"
         )
 
     folder_name = (
@@ -377,11 +393,17 @@ def export_pair(
     pair_dir.mkdir(parents=True, exist_ok=True)
     predicted_raw = pair_dir / "01_predicted_complex_raw.pdb"
     native_raw = pair_dir / "02_native_complex_raw.pdb"
+    predicted_aligned_complex = (
+        pair_dir / "03_predicted_complex_after_global_align.pdb"
+    )
+    native_reference_complex = (
+        pair_dir / "04_native_complex_reference.pdb"
+    )
     predicted_aligned_peptide = (
-        pair_dir / "03_predicted_cyclic_peptide_aligned.pdb"
+        pair_dir / "05_predicted_cyclic_peptide_after_global_align.pdb"
     )
     native_reference_peptide = (
-        pair_dir / "04_native_cyclic_peptide_reference.pdb"
+        pair_dir / "06_native_cyclic_peptide_reference.pdb"
     )
     pair_pml = pair_dir / "OPEN_PAIR_IN_PYMOL.pml"
     pair_session = pair_dir / "OPEN_PAIR_IN_PYMOL.pse"
@@ -409,42 +431,101 @@ def export_pair(
         )
 
     result = cmd.align(
-        predicted_selection,
-        native_selection,
+        f"{PREDICTED_OBJECT} and name CA",
+        f"{NATIVE_OBJECT} and name CA",
         object=ALIGNMENT_OBJECT,
         **ALIGN_KWARGS,
     )
     if len(result) != 7:
         raise RuntimeError(f"Unexpected PyMOL align result: {result!r}")
-    actual_rmsd = float(result[0])
-    aligned_pairs = int(result[1])
-    recorded_rmsd = safe_float(
-        row.get("cyclic_peptide_self_aligned_pymol_ca_rmsd")
+    actual_global_rmsd = float(result[0])
+    global_aligned_pairs = int(result[1])
+    actual_peptide_rmsd, complete_peptide_pairs = (
+        support.complete_positional_ca_rmsd(
+            predicted_selection,
+            native_selection,
+        )
     )
-    recorded_pairs_value = row.get("n_cyclic_peptide_self_aligned_ca_pairs")
-    try:
-        recorded_pairs = int(float(str(recorded_pairs_value)))
-    except (TypeError, ValueError):
-        recorded_pairs = None
-    if recorded_rmsd is None:
-        raise ValueError("Saved cyclic-peptide RMSD is missing")
-    if abs(actual_rmsd - recorded_rmsd) > tolerance:
+    if (
+        complete_peptide_pairs != predicted_count
+        or complete_peptide_pairs != native_count
+    ):
         raise ValueError(
-            "RMSD reproduction gate failed: "
-            f"observed={actual_rmsd:.6f}, saved={recorded_rmsd:.6f}, "
+            "Complete final-chain CA pairing gate failed: "
+            f"pairs={complete_peptide_pairs}, predicted={predicted_count}, "
+            f"native={native_count}"
+        )
+
+    recorded_global_rmsd = safe_float(row.get("global_complex_ca_rmsd"))
+    recorded_peptide_rmsd = safe_float(
+        row.get("cyclic_peptide_ca_rmsd_after_global_complex_alignment")
+    )
+    recorded_global_pairs_value = row.get("n_global_aligned_ca_pairs")
+    recorded_complete_pairs_value = row.get(
+        "n_complete_positional_peptide_ca_pairs"
+    )
+    try:
+        recorded_global_pairs = int(float(str(recorded_global_pairs_value)))
+    except (TypeError, ValueError):
+        recorded_global_pairs = None
+    try:
+        recorded_complete_pairs = int(
+            float(str(recorded_complete_pairs_value))
+        )
+    except (TypeError, ValueError):
+        recorded_complete_pairs = None
+    if recorded_global_rmsd is None or recorded_peptide_rmsd is None:
+        raise ValueError("Saved global or cyclic-peptide RMSD is missing")
+    if abs(actual_global_rmsd - recorded_global_rmsd) > tolerance:
+        raise ValueError(
+            "Global RMSD reproduction gate failed: "
+            f"observed={actual_global_rmsd:.6f}, "
+            f"saved={recorded_global_rmsd:.6f}, "
             f"tolerance={tolerance:.6f}"
         )
-    if recorded_pairs is None or aligned_pairs != recorded_pairs:
+    if abs(actual_peptide_rmsd - recorded_peptide_rmsd) > tolerance:
         raise ValueError(
-            "Aligned-pair reproduction gate failed: "
-            f"observed={aligned_pairs}, saved={recorded_pairs_value!r}"
+            "Cyclic-peptide RMSD reproduction gate failed: "
+            f"observed={actual_peptide_rmsd:.6f}, "
+            f"saved={recorded_peptide_rmsd:.6f}, "
+            f"tolerance={tolerance:.6f}"
+        )
+    if (
+        recorded_global_pairs is None
+        or global_aligned_pairs != recorded_global_pairs
+    ):
+        raise ValueError(
+            "Global aligned-pair reproduction gate failed: "
+            f"observed={global_aligned_pairs}, "
+            f"saved={recorded_global_pairs_value!r}"
+        )
+    if (
+        recorded_complete_pairs is None
+        or complete_peptide_pairs != recorded_complete_pairs
+    ):
+        raise ValueError(
+            "Complete peptide-pair reproduction gate failed: "
+            f"observed={complete_peptide_pairs}, "
+            f"saved={recorded_complete_pairs_value!r}"
+        )
+    if str(row.get("whole_complex_align_call_count", "")) != "1":
+        raise ValueError(
+            "Saved one-align quality gate failed: "
+            f"{row.get('whole_complex_align_call_count')!r}"
+        )
+    if str(row.get("cyclic_peptide_second_fit_performed", "")) != "0":
+        raise ValueError(
+            "Saved no-second-fit quality gate failed: "
+            f"{row.get('cyclic_peptide_second_fit_performed')!r}"
         )
 
     group_name = (
         f"best85_pair_{index:03d}_{sanitize_component(target, 12)}_"
-        f"rmsd_{actual_rmsd:.3f}".replace(".", "p")
+        f"peptide_rmsd_{actual_peptide_rmsd:.3f}".replace(".", "p")
     )
     style_pair(predicted_chain, native_chain, group_name)
+    cmd.save(str(predicted_aligned_complex), PREDICTED_OBJECT)
+    cmd.save(str(native_reference_complex), NATIVE_OBJECT)
     cmd.save(
         str(predicted_aligned_peptide),
         f"{PREDICTED_OBJECT} and chain {predicted_chain}",
@@ -470,8 +551,10 @@ def export_pair(
                 row,
                 predicted_chain,
                 native_chain,
-                actual_rmsd,
-                aligned_pairs,
+                actual_global_rmsd,
+                global_aligned_pairs,
+                actual_peptide_rmsd,
+                complete_peptide_pairs,
                 predicted_count,
                 native_count,
             )
@@ -488,26 +571,34 @@ def export_pair(
         "pdb_file": row.get("pdb_file", ""),
         "predicted_cyclic_peptide_chain": predicted_chain,
         "native_cyclic_peptide_chain": native_chain,
-        "global_complex_ca_rmsd": row.get("global_complex_ca_rmsd", ""),
-        "cyclic_peptide_pymol_ca_rmsd_saved": fmt(recorded_rmsd),
-        "cyclic_peptide_pymol_ca_rmsd_reproduced": fmt(actual_rmsd),
-        "n_pymol_aligned_peptide_ca_pairs": aligned_pairs,
+        "global_complex_ca_rmsd_saved": fmt(recorded_global_rmsd),
+        "global_complex_ca_rmsd_reproduced": fmt(actual_global_rmsd),
+        "n_global_pymol_aligned_ca_pairs": global_aligned_pairs,
+        "cyclic_peptide_ca_rmsd_after_global_align_saved": fmt(
+            recorded_peptide_rmsd
+        ),
+        "cyclic_peptide_ca_rmsd_after_global_align_reproduced": fmt(
+            actual_peptide_rmsd
+        ),
+        "n_complete_positional_peptide_ca_pairs": complete_peptide_pairs,
         "n_predicted_peptide_ca": predicted_count,
         "n_native_peptide_ca": native_count,
         "naturalized_design_sequence_matches": row.get(
-            "cyclic_peptide_naturalized_sequence_matches_design",
+            "decoded_design_seq_matches_design_naturalized",
             "",
         ),
+        "whole_complex_align_calls": 1,
+        "cyclic_peptide_second_fit_performed": 0,
         "global_pass_lt3": row.get(
             "passes_global_complex_ca_rmsd_lt_threshold",
             "",
         ),
         "peptide_pass_lt3": row.get(
-            "passes_cyclic_peptide_self_aligned_pymol_ca_rmsd_lt_threshold",
+            "passes_cyclic_peptide_ca_rmsd_lt_threshold",
             "",
         ),
         "joint_pass_lt3": row.get(
-            "passes_joint_global_and_cyclic_peptide_same_align_lt_threshold",
+            "passes_joint_global_and_cyclic_peptide_lt_threshold",
             "",
         ),
         "pair_folder": relative_text(pair_dir, repo_root),
@@ -532,8 +623,9 @@ def write_navigator(
             f"{int(row['review_index']):03d}/"
             f"{len(manifest_rows):03d} "
             f"{row['target_name']} t={row['temperature']} "
-            f"peptide_RMSD={row['cyclic_peptide_pymol_ca_rmsd_reproduced']} "
-            f"pairs={row['n_pymol_aligned_peptide_ca_pairs']}/"
+            f"global_RMSD={row['global_complex_ca_rmsd_reproduced']} "
+            f"peptide_RMSD={row['cyclic_peptide_ca_rmsd_after_global_align_reproduced']} "
+            f"peptide_pairs={row['n_complete_positional_peptide_ca_pairs']}/"
             f"{row['n_native_peptide_ca']}"
         )
         for row in manifest_rows
@@ -568,18 +660,31 @@ def best_prev():
 def best_info():
     print("[BEST85 REVIEW] " + PAIR_LABELS[STATE["index"]])
     print("Pair PML: " + PAIR_PMLS[STATE["index"]])
+    print("One whole-complex align is already applied. Do NOT align the peptide.")
+
+
+def best_show_complex():
+    cmd.orient("best85_predicted_complex or best85_native_complex")
+    cmd.zoom("best85_predicted_complex or best85_native_complex", buffer=4)
+
+
+def best_show_peptide():
+    cmd.orient("best85_cyclic_peptide_overlay")
+    cmd.zoom("best85_cyclic_peptide_overlay", buffer=5)
 
 
 cmd.extend("best_load", best_load)
 cmd.extend("best_next", best_next)
 cmd.extend("best_prev", best_prev)
 cmd.extend("best_info", best_info)
+cmd.extend("best_show_complex", best_show_complex)
+cmd.extend("best_show_peptide", best_show_peptide)
 best_load(1)
 '''
     navigator_path.write_text(source, encoding="utf-8")
     master_pml = review_root / "OPEN_BEST85_REVIEW.pml"
     master_pml.write_text(
-        f"run {pml_quote(navigator_path)}\n",
+        f"run {navigator_path.resolve().as_posix()}\n",
         encoding="utf-8",
     )
 
@@ -596,6 +701,8 @@ def write_start_here(review_root: Path) -> None:
         "  best_prev          -> previous pair",
         "  best_load, 37      -> jump to pair 37",
         "  best_info          -> print current target, RMSD and pair count",
+        "  best_show_complex  -> zoom to both complete complexes",
+        "  best_show_peptide  -> zoom to both final peptide chains",
         "",
         "You can also open any pair folder and double-click:",
         "  OPEN_PAIR_IN_PYMOL.pse",
@@ -606,7 +713,9 @@ def write_start_here(review_root: Path) -> None:
         "  predicted cyclic peptide = orange",
         "  native cyclic peptide = magenta",
         "",
-        "The displayed peptide overlay repeats the exact script-14 PyMOL align.",
+        "Every view has already received one whole-complex CA align.",
+        "The peptide chains have NOT been aligned a second time.",
+        "Do not click Align. Rotate/zoom the already aligned structures instead.",
         "The manifest CSV includes blank manual_visual_result and manual_notes columns.",
     ]
     (review_root / "00_START_HERE.txt").write_text(
@@ -619,14 +728,16 @@ def build_parser(repo_root: Path) -> argparse.ArgumentParser:
     metric_dir = (
         repo_root
         / "paper_clean_v28_outputs/structure_metrics/"
-        "cyclic_peptide_same_pymol_align"
+        "global_and_cyclic_peptide_ca_rmsd"
     )
     parser = argparse.ArgumentParser(
-        description="Export best85 as one predicted/native PyMOL pair per review."
+        description=(
+            "Export best85 after one whole-complex align; never refit the peptide."
+        )
     )
     parser.add_argument(
         "--best85_csv",
-        default=str(metric_dir / "cyclic_peptide_same_pymol_align_best85.csv"),
+        default=str(metric_dir / "global_complex_ca_rmsd_best85.csv"),
     )
     parser.add_argument(
         "--native_jsonl",
@@ -680,7 +791,7 @@ def main() -> None:
     print("best85 rows:", len(rows), flush=True)
     print("review directory:", review_root, flush=True)
     print(
-        "metric: exact script-14 independent cyclic-peptide PyMOL align",
+        "metric: one whole-complex PyMOL align, then complete final-chain CA RMSD",
         flush=True,
     )
 
@@ -731,16 +842,20 @@ def main() -> None:
         f"export failures: {len(failures)}",
         "count gate: PASS",
         (
-            "saved RMSD + aligned-pair reproduction gate: "
+            "saved global + peptide RMSD and pair-count reproduction gate: "
             f"PASS ({len(manifest_rows)}/{len(manifest_rows)})"
         ),
+        "one whole-complex align per pair: PASS",
+        "peptide-only second fit: 0/85",
         "",
         "Each pair contains:",
         "  raw predicted complex PDB",
         "  reconstructed native complex PDB",
-        "  aligned predicted/native cyclic-peptide PDBs",
+        "  complete predicted complex after the one global align",
+        "  native complex reference",
+        "  predicted/native final-chain peptide PDBs in that same frame",
         "  directly openable PyMOL PSE session",
-        "  reproducible PyMOL PML script",
+        "  reproducible one-global-align PyMOL PML script",
         "  pair metric information text",
         "",
         "Master viewer: OPEN_BEST85_REVIEW.pml",
@@ -754,7 +869,8 @@ def main() -> None:
 
     print("\n===== COMPLETE =====", flush=True)
     print(f"exported pairs: {len(manifest_rows)}/{args.expected_rows}", flush=True)
-    print("RMSD and aligned-pair reproduction: PASS", flush=True)
+    print("global + peptide RMSD reproduction: PASS", flush=True)
+    print("one whole-complex align and no peptide refit: PASS", flush=True)
     print("open in PyMOL:", review_root / "OPEN_BEST85_REVIEW.pml", flush=True)
     print(
         "manual checklist:",
