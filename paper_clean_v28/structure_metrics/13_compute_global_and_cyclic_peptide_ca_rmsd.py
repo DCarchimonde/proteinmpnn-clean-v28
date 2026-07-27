@@ -7,8 +7,10 @@ The operation is intentionally two measurements from one coordinate frame:
 
 1. PyMOL aligns all complex C-alpha atoms exactly as in script 12.
 2. The transformed coordinates are left untouched.  Every C-alpha in the
-   final predicted chain is paired by residue order with every C-alpha in the
-   final native chain, and their current RMSD is calculated directly.
+   final predicted chain is paired with every C-alpha in the final native
+   chain under every possible *forward* cyclic register shift.
+3. The minimum complete-chain RMSD is retained.  Fixed-order RMSD and every
+   tested shift remain in the CSV as audit fields.
 
 There is no second peptide ``align``, ``fit``, ``pair_fit`` or superposition.
 Consequently, the peptide result measures its pose/conformation in the
@@ -80,7 +82,7 @@ CHECKPOINT = {
     "pdb_file": "4kel_13_rcrrrGNrQGQCGR_model.pdb",
     "temperature": "0.3",
     "global_complex_ca_rmsd": 1.8244132995605469,
-    "cyclic_peptide_ca_rmsd_after_global_complex_alignment": 2.318990,
+    "cyclic_peptide_ca_rmsd_after_global_complex_alignment_fixed_order": 2.318990,
     "predicted_peptide_chain": "B",
     "native_peptide_chain": "B",
     "n_predicted_peptide_ca": 14,
@@ -381,19 +383,58 @@ def ordered_ca_coordinates(selection: str) -> List[Tuple[float, float, float]]:
     return [tuple(map(float, atom.coord)) for atom in cmd.get_model(selection).atom]
 
 
-def complete_positional_ca_rmsd(mobile: str, target: str) -> Tuple[float, int]:
-    mobile_xyz = ordered_ca_coordinates(mobile)
-    target_xyz = ordered_ca_coordinates(target)
+def forward_cyclic_ca_rmsd(
+    mobile_xyz: Sequence[Tuple[float, float, float]],
+    target_xyz: Sequence[Tuple[float, float, float]],
+) -> Tuple[float, int, float, List[float]]:
+    """Return best forward cyclic RMSD, shift, fixed RMSD, and all shift RMSDs.
+
+    No coordinates are transformed here.  Shift ``s`` pairs mobile residue
+    ``i`` with target residue ``(i + s) mod L``.  Reverse ordering and partial
+    atom subsets are deliberately unsupported.
+    """
     if not mobile_xyz or len(mobile_xyz) != len(target_xyz):
         raise ValueError(
             f"complete peptide CA pairing requires equal nonzero counts; "
             f"observed {len(mobile_xyz)} vs {len(target_xyz)}"
         )
-    squared = sum(
-        (mx - tx) ** 2 + (my - ty) ** 2 + (mz - tz) ** 2
-        for (mx, my, mz), (tx, ty, tz) in zip(mobile_xyz, target_xyz)
+    length = len(mobile_xyz)
+    shift_rmsds: List[float] = []
+    for shift in range(length):
+        squared = 0.0
+        for index, (mx, my, mz) in enumerate(mobile_xyz):
+            tx, ty, tz = target_xyz[(index + shift) % length]
+            squared += (mx - tx) ** 2 + (my - ty) ** 2 + (mz - tz) ** 2
+        shift_rmsds.append(math.sqrt(squared / length))
+    best_shift = min(range(length), key=lambda shift: (shift_rmsds[shift], shift))
+    return (
+        shift_rmsds[best_shift],
+        best_shift,
+        shift_rmsds[0],
+        shift_rmsds,
     )
-    return math.sqrt(squared / len(mobile_xyz)), len(mobile_xyz)
+
+
+def complete_forward_cyclic_ca_rmsd(
+    mobile: str,
+    target: str,
+) -> Tuple[float, int, float, List[float], int]:
+    mobile_xyz = ordered_ca_coordinates(mobile)
+    target_xyz = ordered_ca_coordinates(target)
+    best, best_shift, fixed, shift_rmsds = forward_cyclic_ca_rmsd(
+        mobile_xyz,
+        target_xyz,
+    )
+    return best, best_shift, fixed, shift_rmsds, len(mobile_xyz)
+
+
+def complete_positional_ca_rmsd(mobile: str, target: str) -> Tuple[float, int]:
+    """Backward-compatible fixed-order audit helper."""
+    _best, _shift, fixed, _all_shifts, count = complete_forward_cyclic_ca_rmsd(
+        mobile,
+        target,
+    )
+    return fixed, count
 
 
 def cleanup_pymol_objects() -> None:
@@ -450,8 +491,9 @@ def evaluate_pdb(
             "after_single_whole_complex_pymol_align"
         ),
         "cyclic_peptide_ca_pairing_rule": (
-            "all_CA_in_final_predicted_and_native_chains_by_residue_order"
+            "all_CA_in_final_chains_best_forward_cyclic_shift"
         ),
+        "cyclic_peptide_reverse_order_allowed": 0,
         "global_complex_ca_rmsd_threshold_angstrom": threshold,
         "global_complex_ca_rmsd_status": "",
         "cyclic_peptide_ca_rmsd_status": "",
@@ -592,7 +634,13 @@ def evaluate_pdb(
             naturalize(decoded_design_seq) == naturalize(design_seq)
         )
 
-        cyclic_peptide_ca_rmsd, positional_pairs = complete_positional_ca_rmsd(
+        (
+            cyclic_peptide_ca_rmsd,
+            best_forward_shift,
+            fixed_order_ca_rmsd,
+            forward_shift_rmsds,
+            positional_pairs,
+        ) = complete_forward_cyclic_ca_rmsd(
             f"batch_pred and chain {predicted_peptide_chain} and name CA",
             f"batch_native and chain {native_peptide_chain} and name CA",
         )
@@ -662,6 +710,28 @@ def evaluate_pdb(
                 ),
                 "cyclic_peptide_ca_rmsd_after_global_complex_alignment": fmt(
                     cyclic_peptide_ca_rmsd
+                ),
+                (
+                    "cyclic_peptide_ca_rmsd_after_global_complex_alignment_"
+                    "best_forward_cyclic_shift"
+                ): fmt(cyclic_peptide_ca_rmsd),
+                (
+                    "cyclic_peptide_ca_rmsd_after_global_complex_alignment_"
+                    "fixed_order"
+                ): fmt(fixed_order_ca_rmsd),
+                "cyclic_peptide_best_forward_cyclic_shift": best_forward_shift,
+                "cyclic_peptide_fixed_order_is_best_forward_shift": int(
+                    best_forward_shift == 0
+                ),
+                "cyclic_peptide_ca_rmsd_improvement_from_forward_shift": fmt(
+                    fixed_order_ca_rmsd - cyclic_peptide_ca_rmsd
+                ),
+                "cyclic_peptide_n_forward_cyclic_shifts_tested": len(
+                    forward_shift_rmsds
+                ),
+                "cyclic_peptide_forward_shift_rmsds": ";".join(
+                    f"{shift}:{value:.6f}"
+                    for shift, value in enumerate(forward_shift_rmsds)
                 ),
                 "n_complete_positional_peptide_ca_pairs": positional_pairs,
                 "complete_final_chain_ca_pairing_gate": complete_pairing_gate,
@@ -785,6 +855,7 @@ def evaluate_all_pdbs(
     repo_root: Path,
 ) -> List[dict]:
     output = []
+    phase_started = time.time()
     for index, pdb_path in enumerate(pdb_files, start=1):
         parsed = parse_pdb_filename(pdb_path)
         temperature, _folder = parse_temperature(pdb_path)
@@ -818,7 +889,14 @@ def evaluate_all_pdbs(
             row["matched_all_design_rows"] = len(design_rows)
         output.append(row)
         if index % 100 == 0 or index == len(pdb_files):
-            print(f"[all PDBs] processed: {index}/{len(pdb_files)}", flush=True)
+            elapsed = max(time.time() - phase_started, 1e-9)
+            rate = index / elapsed
+            eta_seconds = (len(pdb_files) - index) / rate if rate else 0.0
+            print(
+                f"[all PDBs] processed: {index}/{len(pdb_files)}; "
+                f"rate={rate:.2f} PDB/s; ETA={eta_seconds / 60:.1f} min",
+                flush=True,
+            )
     return output
 
 
@@ -828,13 +906,76 @@ def representative_sort_confidence(row: Mapping[str, object]) -> tuple:
 
 
 def representative_sort_best_rmsd(row: Mapping[str, object]) -> tuple:
-    value = safe_float(row.get("global_complex_ca_rmsd"))
+    peptide_value = safe_float(
+        row.get("cyclic_peptide_ca_rmsd_after_global_complex_alignment")
+    )
+    global_value = safe_float(row.get("global_complex_ca_rmsd"))
     confidence = safe_float(row.get("pdb_ca_bfactor_mean"))
     return (
-        value if value is not None else math.inf,
+        peptide_value if peptide_value is not None else math.inf,
+        global_value if global_value is not None else math.inf,
         -(confidence if confidence is not None else -math.inf),
         str(row.get("pdb_file", "")),
     )
+
+
+def select_group_top(
+    rows: Sequence[dict],
+    keys: Sequence[str],
+    top_n: int,
+    require_downstream_eligibility: bool,
+) -> List[dict]:
+    """Rank complete-chain forward-cyclic RMSD within explicit groups."""
+    groups: Dict[Tuple[str, ...], List[dict]] = defaultdict(list)
+    for row in rows:
+        groups[tuple(str(row.get(key, "")) for key in keys)].append(row)
+
+    output: List[dict] = []
+    for values, items in sorted(groups.items()):
+        valid = [
+            row
+            for row in items
+            if row.get("global_complex_ca_rmsd_status") == "ok"
+            and str(row.get("complete_final_chain_ca_pairing_gate", "")) == "1"
+            and safe_float(
+                row.get("cyclic_peptide_ca_rmsd_after_global_complex_alignment")
+            )
+            is not None
+        ]
+        eligible = [
+            row
+            for row in valid
+            if str(
+                row.get("decoded_design_seq_matches_design_naturalized", "")
+            )
+            == "1"
+        ]
+        ranked_pool = eligible if require_downstream_eligibility else valid
+        for rank, row in enumerate(
+            sorted(ranked_pool, key=representative_sort_best_rmsd)[:top_n],
+            start=1,
+        ):
+            enriched = dict(row)
+            enriched.update(
+                {
+                    "rmsd_rank_group_keys": ";".join(keys),
+                    "rmsd_rank_group_values": ";".join(values),
+                    "rmsd_rank_within_group": rank,
+                    "rmsd_rank_top_n_requested": top_n,
+                    "n_all_rows_in_group": len(items),
+                    "n_complete_valid_rows_in_group": len(valid),
+                    "n_downstream_eligible_rows_in_group": len(eligible),
+                    "rmsd_rank_requires_naturalized_sequence_match": int(
+                        require_downstream_eligibility
+                    ),
+                    "rmsd_rank_rule": (
+                        "minimum_complete_final_chain_CA_RMSD_over_all_forward_"
+                        "cyclic_shifts_then_global_RMSD_then_confidence"
+                    ),
+                }
+            )
+            output.append(enriched)
+    return output
 
 
 def build_design_tables(
@@ -892,7 +1033,8 @@ def build_design_tables(
             )
             exploratory_row = {**base, **exploratory}
             exploratory_row["unique_design_representative_rule"] = (
-                "lowest_global_rmsd_among_joint_pass_pdbs_else_all_valid_exploratory"
+                "lowest_best_forward_cyclic_peptide_rmsd_among_joint_pass_"
+                "pdbs_else_all_valid_exploratory"
             )
         elif candidates:
             fallback = sorted(candidates, key=lambda row: str(row.get("pdb_file", "")))[0]
@@ -926,8 +1068,21 @@ def summarize(rows: Sequence[dict], keys: Sequence[str]) -> List[dict]:
             row for row in ok
             if str(row.get("passes_global_complex_ca_rmsd_lt_threshold", "")) == "1"
         ]
+        peptide_passed = [
+            row for row in ok
+            if str(row.get("passes_cyclic_peptide_ca_rmsd_lt_threshold", "")) == "1"
+        ]
         rmsd_values = [safe_float(row.get("global_complex_ca_rmsd")) for row in ok]
         rmsd_values = [value for value in rmsd_values if value is not None]
+        peptide_rmsd_values = [
+            safe_float(
+                row.get("cyclic_peptide_ca_rmsd_after_global_complex_alignment")
+            )
+            for row in ok
+        ]
+        peptide_rmsd_values = [
+            value for value in peptide_rmsd_values if value is not None
+        ]
         peptide_coverage = [
             safe_float(row.get("matched_peptide_ca_coverage_vs_native")) for row in ok
         ]
@@ -939,6 +1094,9 @@ def summarize(rows: Sequence[dict], keys: Sequence[str]) -> List[dict]:
                 "n_global_complex_ca_rmsd_ok": len(ok),
                 "n_failed_or_missing": len(items) - len(ok),
                 "n_global_complex_ca_rmsd_lt_threshold": len(passed),
+                "n_best_forward_cyclic_peptide_ca_rmsd_lt_threshold": len(
+                    peptide_passed
+                ),
                 "fraction_lt_threshold_among_ok": fmt(
                     len(passed) / len(ok) if ok else None, 8
                 ),
@@ -953,6 +1111,18 @@ def summarize(rows: Sequence[dict], keys: Sequence[str]) -> List[dict]:
                 ),
                 "max_global_complex_ca_rmsd": fmt(
                     max(rmsd_values) if rmsd_values else None
+                ),
+                "mean_best_forward_cyclic_peptide_ca_rmsd": fmt(
+                    mean(peptide_rmsd_values) if peptide_rmsd_values else None
+                ),
+                "median_best_forward_cyclic_peptide_ca_rmsd": fmt(
+                    median(peptide_rmsd_values) if peptide_rmsd_values else None
+                ),
+                "min_best_forward_cyclic_peptide_ca_rmsd": fmt(
+                    min(peptide_rmsd_values) if peptide_rmsd_values else None
+                ),
+                "max_best_forward_cyclic_peptide_ca_rmsd": fmt(
+                    max(peptide_rmsd_values) if peptide_rmsd_values else None
                 ),
                 "median_matched_peptide_ca_coverage_vs_native": fmt(
                     median(peptide_coverage) if peptide_coverage else None
@@ -1062,7 +1232,7 @@ def write_checkpoint_report(
     checks = []
     for field in (
         "global_complex_ca_rmsd",
-        "cyclic_peptide_ca_rmsd_after_global_complex_alignment",
+        "cyclic_peptide_ca_rmsd_after_global_complex_alignment_fixed_order",
         "global_align_raw_score",
     ):
         observed = safe_float(row.get(field))
@@ -1089,6 +1259,45 @@ def write_checkpoint_report(
     checks.extend(
         [
             (
+                "best_forward_cyclic_rmsd_not_worse_than_fixed_order",
+                safe_float(
+                    row.get(
+                        "cyclic_peptide_ca_rmsd_after_global_complex_alignment"
+                    )
+                )
+                is not None
+                and safe_float(
+                    row.get(
+                        "cyclic_peptide_ca_rmsd_after_global_complex_alignment_"
+                        "fixed_order"
+                    )
+                )
+                is not None
+                and float(
+                    row[
+                        "cyclic_peptide_ca_rmsd_after_global_complex_alignment"
+                    ]
+                )
+                <= float(
+                    row[
+                        "cyclic_peptide_ca_rmsd_after_global_complex_alignment_"
+                        "fixed_order"
+                    ]
+                )
+                + 1e-12,
+            ),
+            (
+                "all_forward_cyclic_shifts_tested",
+                str(
+                    row.get("cyclic_peptide_n_forward_cyclic_shifts_tested", "")
+                )
+                == str(row.get("n_native_peptide_ca", "")),
+            ),
+            (
+                "reverse_cyclic_order_allowed",
+                str(row.get("cyclic_peptide_reverse_order_allowed", "")) == "0",
+            ),
+            (
                 "whole_complex_align_call_count",
                 str(row.get("whole_complex_align_call_count", "")) == "1",
             ),
@@ -1108,6 +1317,9 @@ def write_checkpoint_report(
     lines.append(f"numeric tolerance: {tolerance}")
     lines.append("")
     fixed_expectations = {
+        "best_forward_cyclic_rmsd_not_worse_than_fixed_order": True,
+        "all_forward_cyclic_shifts_tested": "all final-chain CA shifts",
+        "reverse_cyclic_order_allowed": 0,
         "whole_complex_align_call_count": 1,
         "cyclic_peptide_second_fit_performed": 0,
         "complete_final_chain_ca_pairing_gate": 1,
@@ -1131,7 +1343,8 @@ def parser_with_defaults(repo_root: Path) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Align every whole complex once, then calculate complete final-chain "
-            "cyclic-peptide CA RMSD without a second fit."
+            "cyclic-peptide CA RMSD over every forward cyclic shift without a "
+            "second fit."
         )
     )
     parser.add_argument(
@@ -1163,13 +1376,16 @@ def parser_with_defaults(repo_root: Path) -> argparse.ArgumentParser:
         "--out_dir",
         default=str(
             repo_root
-            / "paper_clean_v28_outputs/structure_metrics/global_and_cyclic_peptide_ca_rmsd"
+            / "paper_clean_v28_outputs/structure_metrics/"
+            "best_forward_cyclic_shift_ca_rmsd"
         ),
     )
     parser.add_argument("--threshold", type=float, default=3.0)
     parser.add_argument("--expected_best85", type=int, default=85)
     parser.add_argument("--expected_all_pdbs", type=int, default=4108)
     parser.add_argument("--expected_unique_designs", type=int, default=4015)
+    parser.add_argument("--expected_target_temperature_groups", type=int, default=85)
+    parser.add_argument("--top_n_per_group", type=int, default=5)
     parser.add_argument("--checkpoint_tolerance", type=float, default=0.005)
     return parser
 
@@ -1216,6 +1432,8 @@ def main() -> None:
             raise FileNotFoundError(f"Required input not found: {required}")
     if args.threshold <= 0:
         raise ValueError("--threshold must be positive")
+    if args.top_n_per_group <= 0:
+        raise ValueError("--top_n_per_group must be positive")
 
     started = time.time()
     best_source = read_csv(best85_path)
@@ -1242,7 +1460,7 @@ def main() -> None:
 
     out_dir.mkdir(parents=True, exist_ok=True)
     print(
-        "===== ONE GLOBAL COMPLEX ALIGN + FINAL-CHAIN PEPTIDE RMSD =====",
+        "===== ONE GLOBAL ALIGN + BEST FORWARD CYCLIC-SHIFT PEPTIDE RMSD =====",
         flush=True,
     )
     print("best85 rows:", len(best_source), flush=True)
@@ -1353,8 +1571,56 @@ def main() -> None:
         if row.get("global_complex_ca_rmsd_status") == "ok"
         and str(row.get("passes_joint_global_and_cyclic_peptide_lt_threshold", "")) == "1"
     ]
+    top_target_temperature_all_valid = select_group_top(
+        all_pdb_rows,
+        ("target_name", "temperature"),
+        args.top_n_per_group,
+        require_downstream_eligibility=False,
+    )
+    top_target_temperature_eligible = select_group_top(
+        all_pdb_rows,
+        ("target_name", "temperature"),
+        args.top_n_per_group,
+        require_downstream_eligibility=True,
+    )
+    new_rmsd_best85 = [
+        row
+        for row in top_target_temperature_eligible
+        if int(row["rmsd_rank_within_group"]) == 1
+    ]
+    top_by_target = select_group_top(
+        all_pdb_rows,
+        ("target_name",),
+        args.top_n_per_group,
+        require_downstream_eligibility=True,
+    )
+    top_by_temperature = select_group_top(
+        all_pdb_rows,
+        ("temperature",),
+        args.top_n_per_group,
+        require_downstream_eligibility=True,
+    )
+    observed_target_temperature_groups = len(
+        {
+            (str(row.get("target_name", "")), norm_temp(row.get("temperature")))
+            for row in all_pdb_rows
+        }
+    )
+    category_count_gate_ok = (
+        not args.expected_target_temperature_groups
+        or observed_target_temperature_groups
+        == args.expected_target_temperature_groups
+    )
+    new_best85_gate_ok = (
+        not args.expected_target_temperature_groups
+        or len(new_rmsd_best85) == args.expected_target_temperature_groups
+    )
 
     write_csv(out_dir / "global_complex_ca_rmsd_all_pdbs.csv", all_pdb_rows)
+    write_csv(
+        out_dir / "best_forward_cyclic_shift_ca_rmsd_all_4108_pdbs.csv",
+        all_pdb_rows,
+    )
     write_csv(out_dir / "global_complex_ca_rmsd_all_pdbs_lt3.csv", all_pdb_pass)
     write_csv(out_dir / "cyclic_peptide_ca_rmsd_all_pdbs_lt3.csv", all_pdb_peptide_pass)
     write_csv(out_dir / "joint_global_and_cyclic_peptide_all_pdbs_lt3.csv", all_pdb_joint_pass)
@@ -1384,12 +1650,51 @@ def main() -> None:
         downstream_candidates,
     )
     write_csv(
+        out_dir
+        / (
+            "best_forward_cyclic_shift_"
+            f"top{args.top_n_per_group}_by_target_temperature_all_valid.csv"
+        ),
+        top_target_temperature_all_valid,
+    )
+    write_csv(
+        out_dir
+        / (
+            "best_forward_cyclic_shift_"
+            f"top{args.top_n_per_group}_by_target_temperature_"
+            "downstream_eligible.csv"
+        ),
+        top_target_temperature_eligible,
+    )
+    write_csv(
+        out_dir / "best_forward_cyclic_shift_new_rmsd_best85.csv",
+        new_rmsd_best85,
+    )
+    write_csv(
+        out_dir
+        / f"best_forward_cyclic_shift_top{args.top_n_per_group}_by_target.csv",
+        top_by_target,
+    )
+    write_csv(
+        out_dir
+        / f"best_forward_cyclic_shift_top{args.top_n_per_group}_by_temperature.csv",
+        top_by_temperature,
+    )
+    write_csv(
         out_dir / "global_complex_ca_rmsd_all_pdbs_summary_by_target_temperature.csv",
         summarize(all_pdb_rows, ("target_name", "temperature")),
     )
     write_csv(
         out_dir / "global_complex_ca_rmsd_all_designs_summary_by_target_temperature.csv",
         summarize(confidence_designs, ("target_name", "temperature")),
+    )
+    write_csv(
+        out_dir / "best_forward_cyclic_shift_summary_by_target.csv",
+        summarize(all_pdb_rows, ("target_name",)),
+    )
+    write_csv(
+        out_dir / "best_forward_cyclic_shift_summary_by_temperature.csv",
+        summarize(all_pdb_rows, ("temperature",)),
     )
 
     checkpoint_ok = write_checkpoint_report(
@@ -1417,9 +1722,18 @@ def main() -> None:
             "",
             "Selection rules:",
             "  Primary unique-design table: highest mean CA B-factor among RMSD-OK PDBs.",
-            "  Downstream discovery manifest: lowest global RMSD PDB per design, only when < threshold.",
+            "  New RMSD-best85: one minimum forward-cyclic peptide RMSD row per target x temperature.",
+            "  New RMSD-best85 requires complete final-chain pairing and a naturalized sequence match.",
+            f"  Top-list size per group: {args.top_n_per_group}.",
             "  The exploratory minimum must not be reported as an unbiased population success rate.",
+            "  No other metrics are recalculated by this script.",
             "",
+            f"target x temperature groups: {observed_target_temperature_groups}",
+            f"target x temperature count gate: "
+            f"{'PASS' if category_count_gate_ok else 'FAIL'}",
+            f"new RMSD-best85 rows: {len(new_rmsd_best85)}",
+            f"new RMSD-best85 eligibility gate: "
+            f"{'PASS' if new_best85_gate_ok else 'FAIL'}",
             f"4KEL manual checkpoint: {'PASS' if checkpoint_ok else 'FAIL'}",
         ]
     )
@@ -1431,14 +1745,35 @@ def main() -> None:
         for row in all_pdb_rows
         if row.get("global_complex_ca_rmsd_status") == "ok"
     )
+    cyclic_ok_rows = [
+        row
+        for row in all_pdb_rows
+        if row.get("cyclic_peptide_ca_rmsd_status") == "ok"
+    ]
+    fixed_order_best_count = sum(
+        str(row.get("cyclic_peptide_fixed_order_is_best_forward_shift", ""))
+        == "1"
+        for row in cyclic_ok_rows
+    )
+    cyclic_improvements = [
+        safe_float(
+            row.get("cyclic_peptide_ca_rmsd_improvement_from_forward_shift")
+        )
+        for row in cyclic_ok_rows
+    ]
+    cyclic_improvements = [
+        value for value in cyclic_improvements if value is not None
+    ]
     combined_lines = [
-        "===== ONE WHOLE-COMPLEX ALIGN + FINAL-CHAIN CYCLIC-PEPTIDE CA RMSD =====",
+        "===== ONE WHOLE-COMPLEX ALIGN + BEST FORWARD CYCLIC-SHIFT CA RMSD =====",
         "",
         f"strict threshold for both metrics: < {args.threshold:.3f} Angstrom",
         "predicted cyclic peptide: final chain in predicted PDB file order",
         "native cyclic peptide: final chain in native JSONL/PDB construction order",
         "whole-complex alignment calls per structure: exactly 1",
-        "peptide pairing: every final-chain CA by residue position after that alignment",
+        "peptide pairing: all final-chain CA under every forward cyclic shift",
+        "primary peptide RMSD: minimum across those complete-chain forward shifts",
+        "reverse order: forbidden",
         "second peptide align/fit/superposition: NEVER",
         (
             "PyMOL sequence-alignment peptide coverage is diagnostic only; "
@@ -1458,6 +1793,17 @@ def main() -> None:
         f"confidence representatives joint pass: {len(confidence_joint_pass)}/{len(confidence_designs)}",
         "",
         f"naturalized design sequence matches: {sequence_ok}/{len(all_pdb_rows)}",
+        f"fixed order already best: {fixed_order_best_count}/{len(cyclic_ok_rows)}",
+        "median RMSD improvement from forward cyclic shift: "
+        f"{fmt(median(cyclic_improvements) if cyclic_improvements else None)} Angstrom",
+        "maximum RMSD improvement from forward cyclic shift: "
+        f"{fmt(max(cyclic_improvements) if cyclic_improvements else None)} Angstrom",
+        f"target x temperature groups: {observed_target_temperature_groups}",
+        f"target x temperature count gate: "
+        f"{'PASS' if category_count_gate_ok else 'FAIL'}",
+        f"new RMSD-best85 rows: {len(new_rmsd_best85)}",
+        f"new RMSD-best85 eligibility gate: "
+        f"{'PASS' if new_best85_gate_ok else 'FAIL'}",
         f"4KEL global + complete peptide checkpoint: {'PASS' if checkpoint_ok else 'FAIL'}",
     ]
     (out_dir / "global_and_cyclic_peptide_ca_rmsd_report.txt").write_text(
@@ -1473,13 +1819,17 @@ def main() -> None:
         {
             "metric": (
                 "one PyMOL whole-complex CA align followed by complete final-chain "
-                "CA RMSD in the unchanged aligned frame"
+                "CA RMSD over all forward cyclic shifts in the unchanged aligned frame"
             ),
             "whole_complex_align_calls_per_structure": 1,
             "cyclic_peptide_second_fit_performed": False,
             "predicted_cyclic_peptide_chain_rule": "last chain in predicted PDB order",
             "native_cyclic_peptide_chain_rule": "last chain in native JSONL order",
-            "cyclic_peptide_ca_pairing_rule": "all final-chain CA by residue order",
+            "cyclic_peptide_ca_pairing_rule": (
+                "all final-chain CA; minimum over every forward cyclic shift"
+            ),
+            "reverse_cyclic_order_allowed": False,
+            "fixed_order_rmsd_retained_for_audit": True,
             "cycles": 0,
             "cutoff": 2.0,
             "gap": -10.0,
@@ -1492,6 +1842,18 @@ def main() -> None:
             "best85_rows": len(best85_rows),
             "all_pdb_rows": len(all_pdb_rows),
             "unique_designs": len(designs),
+            "target_temperature_groups": observed_target_temperature_groups,
+            "top_n_per_group": args.top_n_per_group,
+            "new_rmsd_best85_rows": len(new_rmsd_best85),
+            "fixed_order_already_best_rows": fixed_order_best_count,
+            "median_forward_cyclic_shift_rmsd_improvement_angstrom": (
+                median(cyclic_improvements) if cyclic_improvements else None
+            ),
+            "maximum_forward_cyclic_shift_rmsd_improvement_angstrom": (
+                max(cyclic_improvements) if cyclic_improvements else None
+            ),
+            "target_temperature_count_gate_pass": category_count_gate_ok,
+            "new_rmsd_best85_eligibility_gate_pass": new_best85_gate_ok,
             "strict_chain_label_audit_used": bool(strict_rows),
             "manual_4kel_checkpoint_pass": checkpoint_ok,
             "elapsed_seconds": time.time() - started,
@@ -1536,6 +1898,12 @@ def main() -> None:
         raise RuntimeError(
             "The batch implementation did not reproduce the confirmed 4KEL PyMOL result. "
             "Do not use these outputs downstream; inspect pymol_manual_checkpoint_4kel.txt."
+        )
+    if not category_count_gate_ok or not new_best85_gate_ok:
+        raise RuntimeError(
+            "Grouping/eligibility quality gate failed after writing the complete "
+            "all-PDB tables. Inspect the report and target-temperature Top-N files; "
+            "do not recalculate downstream metrics from an incomplete RMSD-best85."
         )
 
 

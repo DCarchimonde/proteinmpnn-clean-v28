@@ -9,8 +9,9 @@ For every row this exporter independently reproduces script 13:
 2. call PyMOL ``align`` exactly once on all complex C-alpha atoms;
 3. do not align or fit the cyclic peptide again;
 4. take the final chain from each already aligned complex;
-5. calculate complete final-chain C-alpha RMSD by residue order; and
-6. verify both global and peptide RMSDs against the saved best85 CSV.
+5. calculate complete final-chain C-alpha RMSD for every forward cyclic shift;
+6. retain the minimum without moving either peptide; and
+7. verify both global and peptide RMSDs against the saved RMSD-best85 CSV.
 
 The saved session therefore opens directly in the scientifically relevant
 whole-complex alignment frame.  The user should rotate/zoom the view, not click
@@ -279,6 +280,8 @@ def pair_info_lines(
     actual_global_rmsd: float,
     global_aligned_pairs: int,
     actual_peptide_rmsd: float,
+    fixed_order_peptide_rmsd: float,
+    best_forward_shift: int,
     complete_peptide_pairs: int,
     predicted_count: int,
     native_count: int,
@@ -296,9 +299,11 @@ def pair_info_lines(
         f"reproduced global-complex PyMOL CA RMSD: {actual_global_rmsd:.6f}",
         f"global PyMOL-aligned CA pairs: {global_aligned_pairs}",
         (
-            "complete cyclic-peptide CA RMSD after global-complex alignment: "
+            "best-forward-shift complete cyclic-peptide CA RMSD: "
             f"{actual_peptide_rmsd:.6f}"
         ),
+        f"fixed-order complete cyclic-peptide CA RMSD: {fixed_order_peptide_rmsd:.6f}",
+        f"best forward cyclic shift: {best_forward_shift}",
         f"complete cyclic-peptide CA pairs: {complete_peptide_pairs}",
         f"predicted/native cyclic-peptide CA counts: {predicted_count}/{native_count}",
         (
@@ -314,7 +319,9 @@ def pair_info_lines(
         "",
         "The visible pair uses exactly one whole-complex PyMOL CA align.",
         "The orange peptide was moved only with its complete predicted complex.",
-        "The peptide RMSD uses every final-chain CA by residue order.",
+        "The peptide RMSD uses every final-chain CA at every forward cyclic shift.",
+        "The reported primary value is the minimum; reverse order is forbidden.",
+        "Changing correspondence does not move or refit either peptide.",
         "No peptide-only align, fit, pair_fit or superposition was performed.",
         "",
         "IMPORTANT: the session is already in the required aligned frame.",
@@ -440,11 +447,15 @@ def export_pair(
         raise RuntimeError(f"Unexpected PyMOL align result: {result!r}")
     actual_global_rmsd = float(result[0])
     global_aligned_pairs = int(result[1])
-    actual_peptide_rmsd, complete_peptide_pairs = (
-        support.complete_positional_ca_rmsd(
-            predicted_selection,
-            native_selection,
-        )
+    (
+        actual_peptide_rmsd,
+        actual_best_forward_shift,
+        actual_fixed_order_peptide_rmsd,
+        actual_forward_shift_rmsds,
+        complete_peptide_pairs,
+    ) = support.complete_forward_cyclic_ca_rmsd(
+        predicted_selection,
+        native_selection,
     )
     if (
         complete_peptide_pairs != predicted_count
@@ -460,6 +471,17 @@ def export_pair(
     recorded_peptide_rmsd = safe_float(
         row.get("cyclic_peptide_ca_rmsd_after_global_complex_alignment")
     )
+    recorded_fixed_order_peptide_rmsd = safe_float(
+        row.get(
+            "cyclic_peptide_ca_rmsd_after_global_complex_alignment_fixed_order"
+        )
+    )
+    try:
+        recorded_best_forward_shift = int(
+            float(str(row.get("cyclic_peptide_best_forward_cyclic_shift", "")))
+        )
+    except (TypeError, ValueError):
+        recorded_best_forward_shift = None
     recorded_global_pairs_value = row.get("n_global_aligned_ca_pairs")
     recorded_complete_pairs_value = row.get(
         "n_complete_positional_peptide_ca_pairs"
@@ -474,7 +496,12 @@ def export_pair(
         )
     except (TypeError, ValueError):
         recorded_complete_pairs = None
-    if recorded_global_rmsd is None or recorded_peptide_rmsd is None:
+    if (
+        recorded_global_rmsd is None
+        or recorded_peptide_rmsd is None
+        or recorded_fixed_order_peptide_rmsd is None
+        or recorded_best_forward_shift is None
+    ):
         raise ValueError("Saved global or cyclic-peptide RMSD is missing")
     if abs(actual_global_rmsd - recorded_global_rmsd) > tolerance:
         raise ValueError(
@@ -489,6 +516,24 @@ def export_pair(
             f"observed={actual_peptide_rmsd:.6f}, "
             f"saved={recorded_peptide_rmsd:.6f}, "
             f"tolerance={tolerance:.6f}"
+        )
+    if (
+        abs(
+            actual_fixed_order_peptide_rmsd
+            - recorded_fixed_order_peptide_rmsd
+        )
+        > tolerance
+    ):
+        raise ValueError(
+            "Fixed-order cyclic-peptide RMSD reproduction gate failed: "
+            f"observed={actual_fixed_order_peptide_rmsd:.6f}, "
+            f"saved={recorded_fixed_order_peptide_rmsd:.6f}"
+        )
+    if actual_best_forward_shift != recorded_best_forward_shift:
+        raise ValueError(
+            "Best forward cyclic-shift reproduction gate failed: "
+            f"observed={actual_best_forward_shift}, "
+            f"saved={recorded_best_forward_shift}"
         )
     if (
         recorded_global_pairs is None
@@ -554,6 +599,8 @@ def export_pair(
                 actual_global_rmsd,
                 global_aligned_pairs,
                 actual_peptide_rmsd,
+                actual_fixed_order_peptide_rmsd,
+                actual_best_forward_shift,
                 complete_peptide_pairs,
                 predicted_count,
                 native_count,
@@ -579,6 +626,18 @@ def export_pair(
         ),
         "cyclic_peptide_ca_rmsd_after_global_align_reproduced": fmt(
             actual_peptide_rmsd
+        ),
+        "cyclic_peptide_ca_rmsd_fixed_order_saved": fmt(
+            recorded_fixed_order_peptide_rmsd
+        ),
+        "cyclic_peptide_ca_rmsd_fixed_order_reproduced": fmt(
+            actual_fixed_order_peptide_rmsd
+        ),
+        "best_forward_cyclic_shift_saved": recorded_best_forward_shift,
+        "best_forward_cyclic_shift_reproduced": actual_best_forward_shift,
+        "all_forward_cyclic_shift_rmsds_reproduced": ";".join(
+            f"{shift}:{value:.6f}"
+            for shift, value in enumerate(actual_forward_shift_rmsds)
         ),
         "n_complete_positional_peptide_ca_pairs": complete_peptide_pairs,
         "n_predicted_peptide_ca": predicted_count,
@@ -625,6 +684,7 @@ def write_navigator(
             f"{row['target_name']} t={row['temperature']} "
             f"global_RMSD={row['global_complex_ca_rmsd_reproduced']} "
             f"peptide_RMSD={row['cyclic_peptide_ca_rmsd_after_global_align_reproduced']} "
+            f"shift={row.get('best_forward_cyclic_shift_reproduced', '')} "
             f"peptide_pairs={row['n_complete_positional_peptide_ca_pairs']}/"
             f"{row['n_native_peptide_ca']}"
         )
@@ -660,7 +720,8 @@ def best_prev():
 def best_info():
     print("[BEST85 REVIEW] " + PAIR_LABELS[STATE["index"]])
     print("Pair PML: " + PAIR_PMLS[STATE["index"]])
-    print("One whole-complex align is already applied. Do NOT align the peptide.")
+    print("One whole-complex align is already applied. Forward shift changes correspondence only.")
+    print("Do NOT align the peptide.")
 
 
 def best_show_complex():
@@ -715,6 +776,8 @@ def write_start_here(review_root: Path) -> None:
         "",
         "Every view has already received one whole-complex CA align.",
         "The peptide chains have NOT been aligned a second time.",
+        "The RMSD checks all forward cyclic register shifts using every peptide CA.",
+        "The best shift changes correspondence only; it does not move either structure.",
         "Do not click Align. Rotate/zoom the already aligned structures instead.",
         "The manifest CSV includes blank manual_visual_result and manual_notes columns.",
     ]
@@ -728,7 +791,7 @@ def build_parser(repo_root: Path) -> argparse.ArgumentParser:
     metric_dir = (
         repo_root
         / "paper_clean_v28_outputs/structure_metrics/"
-        "global_and_cyclic_peptide_ca_rmsd"
+        "best_forward_cyclic_shift_ca_rmsd"
     )
     parser = argparse.ArgumentParser(
         description=(
@@ -737,7 +800,9 @@ def build_parser(repo_root: Path) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--best85_csv",
-        default=str(metric_dir / "global_complex_ca_rmsd_best85.csv"),
+        default=str(
+            metric_dir / "best_forward_cyclic_shift_new_rmsd_best85.csv"
+        ),
     )
     parser.add_argument(
         "--native_jsonl",
@@ -753,7 +818,7 @@ def build_parser(repo_root: Path) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--review_dir",
-        default=str(metric_dir / "best85_pair_review"),
+        default=str(metric_dir / "new_rmsd_best85_pair_review"),
     )
     parser.add_argument("--expected_rows", type=int, default=85)
     parser.add_argument("--rmsd_tolerance", type=float, default=0.005)
@@ -791,7 +856,8 @@ def main() -> None:
     print("best85 rows:", len(rows), flush=True)
     print("review directory:", review_root, flush=True)
     print(
-        "metric: one whole-complex PyMOL align, then complete final-chain CA RMSD",
+        "metric: one whole-complex align, then minimum complete final-chain "
+        "CA RMSD over all forward cyclic shifts",
         flush=True,
     )
 
@@ -847,6 +913,8 @@ def main() -> None:
         ),
         "one whole-complex align per pair: PASS",
         "peptide-only second fit: 0/85",
+        "all forward cyclic register shifts checked: PASS",
+        "reverse peptide ordering used: 0/85",
         "",
         "Each pair contains:",
         "  raw predicted complex PDB",

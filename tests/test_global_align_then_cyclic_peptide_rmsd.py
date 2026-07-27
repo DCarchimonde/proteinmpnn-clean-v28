@@ -60,7 +60,8 @@ class MetricFakeCmd:
     def __init__(self):
         self.align_calls = []
         self.predicted_peptide = [(0, 0, 0), (1, 0, 0), (2, 0, 0)]
-        self.native_final_peptide = [(0, 1, 0), (1, 1, 0), (2, 1, 0)]
+        # Same cyclic ring with an arbitrary forward register offset.
+        self.native_final_peptide = [(1, 1, 0), (2, 1, 0), (0, 1, 0)]
 
     def delete(self, _name):
         return None
@@ -190,12 +191,124 @@ class GlobalAlignThenPeptideTests(unittest.TestCase):
             1.0,
             places=6,
         )
+        self.assertAlmostEqual(
+            float(
+                result[
+                    "cyclic_peptide_ca_rmsd_after_global_complex_alignment_"
+                    "fixed_order"
+                ]
+            ),
+            3 ** 0.5,
+            places=6,
+        )
+        self.assertEqual(
+            result["cyclic_peptide_best_forward_cyclic_shift"],
+            2,
+        )
+        self.assertEqual(
+            result["cyclic_peptide_n_forward_cyclic_shifts_tested"],
+            3,
+        )
+        self.assertEqual(result["cyclic_peptide_reverse_order_allowed"], 0)
+        self.assertEqual(
+            result["cyclic_peptide_forward_shift_rmsds"],
+            "0:1.732051;1:1.732051;2:1.000000",
+        )
         self.assertEqual(len(fake_cmd.align_calls), 1)
         mobile, target, kwargs = fake_cmd.align_calls[0]
         self.assertEqual(mobile, "batch_pred and name CA")
         self.assertEqual(target, "batch_native and name CA")
         self.assertEqual(kwargs["cycles"], 0)
         self.assertEqual(kwargs["transform"], 1)
+
+    def test_forward_cyclic_helper_rejects_partial_and_never_reverses(self):
+        fake_cmd = MetricFakeCmd()
+        module = load_module("forward_cyclic_helper", METRIC_SCRIPT, fake_cmd)
+
+        best, shift, fixed, values = module.forward_cyclic_ca_rmsd(
+            [(0, 0, 0), (1, 0, 0), (2, 0, 0)],
+            [(1, 1, 0), (2, 1, 0), (0, 1, 0)],
+        )
+        self.assertAlmostEqual(best, 1.0, places=6)
+        self.assertEqual(shift, 2)
+        self.assertAlmostEqual(fixed, 3 ** 0.5, places=6)
+        self.assertEqual(len(values), 3)
+
+        with self.assertRaisesRegex(ValueError, "equal nonzero counts"):
+            module.forward_cyclic_ca_rmsd(
+                [(0, 0, 0), (1, 0, 0)],
+                [(0, 0, 0)],
+            )
+
+    def test_group_top_keeps_all_rows_but_excludes_mismatch_from_new_best(self):
+        module = load_module(
+            "forward_cyclic_group_top",
+            METRIC_SCRIPT,
+            MetricFakeCmd(),
+        )
+        rows = [
+            {
+                "target_name": "TST",
+                "temperature": "0.1",
+                "pdb_file": "mismatch_but_lowest.pdb",
+                "global_complex_ca_rmsd_status": "ok",
+                "complete_final_chain_ca_pairing_gate": 1,
+                "decoded_design_seq_matches_design_naturalized": 0,
+                "cyclic_peptide_ca_rmsd_after_global_complex_alignment": "0.5",
+                "global_complex_ca_rmsd": "1.0",
+                "pdb_ca_bfactor_mean": "90",
+            },
+            {
+                "target_name": "TST",
+                "temperature": "0.1",
+                "pdb_file": "eligible_second.pdb",
+                "global_complex_ca_rmsd_status": "ok",
+                "complete_final_chain_ca_pairing_gate": 1,
+                "decoded_design_seq_matches_design_naturalized": 1,
+                "cyclic_peptide_ca_rmsd_after_global_complex_alignment": "1.5",
+                "global_complex_ca_rmsd": "1.0",
+                "pdb_ca_bfactor_mean": "90",
+            },
+            {
+                "target_name": "TST",
+                "temperature": "0.1",
+                "pdb_file": "eligible_third.pdb",
+                "global_complex_ca_rmsd_status": "ok",
+                "complete_final_chain_ca_pairing_gate": 1,
+                "decoded_design_seq_matches_design_naturalized": 1,
+                "cyclic_peptide_ca_rmsd_after_global_complex_alignment": "2.0",
+                "global_complex_ca_rmsd": "1.0",
+                "pdb_ca_bfactor_mean": "90",
+            },
+        ]
+
+        all_valid = module.select_group_top(
+            rows,
+            ("target_name", "temperature"),
+            2,
+            require_downstream_eligibility=False,
+        )
+        eligible = module.select_group_top(
+            rows,
+            ("target_name", "temperature"),
+            2,
+            require_downstream_eligibility=True,
+        )
+
+        self.assertEqual(
+            [row["pdb_file"] for row in all_valid],
+            ["mismatch_but_lowest.pdb", "eligible_second.pdb"],
+        )
+        self.assertEqual(
+            [row["pdb_file"] for row in eligible],
+            ["eligible_second.pdb", "eligible_third.pdb"],
+        )
+        self.assertEqual(
+            [row["rmsd_rank_within_group"] for row in eligible],
+            [1, 2],
+        )
+        self.assertEqual(eligible[0]["n_all_rows_in_group"], 3)
+        self.assertEqual(eligible[0]["n_downstream_eligible_rows_in_group"], 2)
 
     def test_review_pml_contains_one_global_align_and_no_peptide_align(self):
         module = load_module(
