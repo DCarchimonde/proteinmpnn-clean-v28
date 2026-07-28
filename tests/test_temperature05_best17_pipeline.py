@@ -22,6 +22,12 @@ FINAL_PATH = (
     / "structure_metrics"
     / "17_finalize_temperature05_best17.py"
 )
+CONTROLLER_PATH = (
+    ROOT
+    / "paper_clean_v28"
+    / "structure_metrics"
+    / "run_temperature05_best17_all.ps1"
+)
 
 
 def load(path: Path, name: str):
@@ -111,6 +117,14 @@ class Temperature05PipelineTests(unittest.TestCase):
             table.loc[0, "within_target_tm_diversity_status"],
             "not_estimable_one_temperature_one_structure_per_target",
         )
+
+    def test_controller_supports_safe_step8_resume_and_direct_wsl_mount_conversion(self):
+        text = CONTROLLER_PATH.read_text(encoding="utf-8")
+        self.assertIn("[ValidateRange(1, 9)][int]$StartStep = 1", text)
+        self.assertIn("Convert-WindowsPathToWslMountPath", text)
+        self.assertIn('return "/mnt/$Drive/$Rest"', text)
+        self.assertNotIn("wslpath -a $Workspace", text)
+        self.assertIn("Cannot resume: missing $Purpose file", text)
 
 
 if __name__ == "__main__":
