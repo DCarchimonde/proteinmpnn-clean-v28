@@ -120,11 +120,14 @@ class Temperature05PipelineTests(unittest.TestCase):
 
     def test_controller_supports_safe_step8_resume_and_direct_wsl_mount_conversion(self):
         text = CONTROLLER_PATH.read_text(encoding="utf-8")
-        self.assertIn("[ValidateRange(1, 9)][int]$StartStep = 1", text)
+        self.assertIn("[ValidateRange(1, 12)][int]$StartStep = 1", text)
+        self.assertIn("if ($StartStep -le 8)", text)
         self.assertIn("Convert-WindowsPathToWslMountPath", text)
         self.assertIn('return "/mnt/$Drive/$Rest"', text)
         self.assertNotIn("wslpath -a $Workspace", text)
-        self.assertIn("Cannot resume: missing $Purpose file", text)
+        self.assertIn("Cannot continue: missing $Purpose file", text)
+        self.assertNotIn('$BashCommand = @"', text)
+        self.assertEqual(text.count(') -join "; "'), 2)
 
 
 if __name__ == "__main__":
