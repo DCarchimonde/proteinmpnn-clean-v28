@@ -218,15 +218,36 @@ class FinalQualityTests(unittest.TestCase):
     def test_controller_keeps_step8_resume_and_adds_monomer_stages(self):
         text = CONTROLLER_PATH.read_text(encoding="utf-8")
         self.assertIn("[ValidateRange(1, 12)][int]$StartStep = 1", text)
+        self.assertIn('[string]$TmCondaEnv = "tmdiv"', text)
         self.assertIn("if ($StartStep -le 8)", text)
         self.assertIn("18_compute_monomer_structure_metrics.py", text)
         self.assertIn("19_compute_monomer_pyrosetta_energy.py", text)
         self.assertIn("20_finalize_temperature05_best17_and_monomer.py", text)
+        self.assertIn(
+            "-n $TmCondaEnv python $MonomerStructureScript",
+            text,
+        )
+        self.assertNotIn(
+            "-n $WindowsCondaEnv python $MonomerStructureScript",
+            text,
+        )
+        self.assertIn("import numpy, pandas, openpyxl", text)
+        self.assertIn("import numpy, pandas, tmtools", text)
+        self.assertIn("Expected tmtools==0.3.0", text)
+        self.assertIn("$MonomerEnergyBaseCommand --limit 1", text)
+        self.assertIn("Assert-ExactFileCount", text)
+        self.assertIn("ExpectedCount 560", text)
+        self.assertIn("QUALITY GATE:\\s*PASS", text)
         self.assertIn("Convert-WindowsPathToWslMountPath", text)
         self.assertNotIn("wslpath -a", text)
         self.assertNotIn('$BashCommand = @"', text)
-        self.assertEqual(text.count(') -join "; "'), 2)
-        self.assertEqual(text.count('"set -euo pipefail"'), 2)
+        self.assertEqual(text.count(') -join "; "'), 3)
+        self.assertEqual(text.count('"set -euo pipefail"'), 3)
+
+    def test_monomer_tm_dependency_message_names_the_tmdiv_environment(self):
+        text = MONOMER_STRUCTURE_PATH.read_text(encoding="utf-8")
+        self.assertIn("tmdiv environment", text)
+        self.assertNotIn("Activate the wain environment", text)
 
 
 if __name__ == "__main__":
