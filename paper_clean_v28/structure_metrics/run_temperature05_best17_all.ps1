@@ -5,6 +5,7 @@ param(
     [string]$MonomerPdbDir = "",
     [string]$MonomerPermeabilityRoot = "",
     [string]$WindowsCondaEnv = "wain",
+    [string]$TmCondaEnv = "tmdiv",
     [string]$WslDistribution = "Ubuntu",
     [string]$WslCondaRoot = "/home/aaron/miniconda3",
     [string]$PyRosettaEnv = "pyrosetta_eval",
@@ -101,6 +102,25 @@ function Assert-RequiredDirectory {
     }
 }
 
+function Assert-ExactFileCount {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Filter,
+        [Parameter(Mandatory = $true)][int]$ExpectedCount,
+        [Parameter(Mandatory = $true)][string]$Purpose
+    )
+    $ObservedCount = @(
+        Get-ChildItem -LiteralPath $Path -File -Filter $Filter
+    ).Count
+    if ($ObservedCount -ne $ExpectedCount) {
+        throw (
+            "Cannot continue: expected $ExpectedCount $Purpose files in " +
+            "$Path, observed $ObservedCount"
+        )
+    }
+    Write-Host "$Purpose file count: $ObservedCount/$ExpectedCount"
+}
+
 Assert-RequiredFile $SelectionCsv "corrected RMSD-best85 selection"
 Assert-RequiredFile $AllDesigns "complex all_designs"
 Assert-RequiredDirectory $ComplexPermeabilityDir "complex permeability"
@@ -109,6 +129,11 @@ Assert-RequiredFile $MonomerReferenceManifest "monomer reference manifest"
 Assert-RequiredFile $MonomerModelSummary "monomer clean-evaluation summary"
 Assert-RequiredDirectory $MonomerPdbDir "560-PDB monomer input"
 Assert-RequiredDirectory $MonomerPermeabilityRoot "monomer permeability search root"
+Assert-RequiredFile $PrepareScript "temperature-0.5 preparation script"
+Assert-RequiredFile $FinalizeComplexScript "complex finalization script"
+Assert-RequiredFile $MonomerStructureScript "monomer structure script"
+Assert-RequiredFile $MonomerEnergyScript "monomer PyRosetta script"
+Assert-RequiredFile $FinalizeAllScript "joint finalization script"
 
 New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
 $LogPath = Join-Path $RunDir "run_console.log"
@@ -121,6 +146,51 @@ else {
 
 try {
     Write-Host "Requested start step: $StartStep"
+
+    Invoke-Checked "Preflight Windows analysis environment '$WindowsCondaEnv'" {
+        $WindowsPreflightCode = (
+            "import numpy, pandas, openpyxl; " +
+            "print('Windows analysis environment OK')"
+        )
+        conda run --no-capture-output -n $WindowsCondaEnv python -c `
+            $WindowsPreflightCode
+    }
+
+    if ($StartStep -le 10) {
+        Assert-ExactFileCount `
+            -Path $MonomerPdbDir `
+            -Filter "*.pdb" `
+            -ExpectedCount 560 `
+            -Purpose "monomer PDB"
+        Invoke-Checked "Preflight TM-score environment '$TmCondaEnv'" {
+            $TmPreflightCode = (
+                "from importlib.metadata import version; " +
+                "import numpy, pandas, tmtools; " +
+                "v=version('tmtools'); " +
+                "assert v == '0.3.0', " +
+                "'Expected tmtools==0.3.0, found '+v; " +
+                "print('TM-score environment OK: tmtools='+v)"
+            )
+            conda run --no-capture-output -n $TmCondaEnv python -c `
+                $TmPreflightCode
+        }
+    }
+
+    if ($StartStep -le 11) {
+        Invoke-Checked "Preflight WSL PyRosetta environment '$PyRosettaEnv'" {
+            $RepoRootWsl = Convert-WindowsPathToWslMountPath $RepoRoot
+            $BashCommand = @(
+                "set -euo pipefail"
+                "test -d '$RepoRootWsl'"
+                "test -f '$WslCondaRoot/etc/profile.d/conda.sh'"
+                "source '$WslCondaRoot/etc/profile.d/conda.sh'"
+                "cd '$RepoRootWsl'"
+                "conda run --no-capture-output -n '$PyRosettaEnv' python -c 'import pandas, pyrosetta'"
+            ) -join "; "
+            wsl.exe -d $WslDistribution -- bash -lc $BashCommand
+        }
+    }
+
     if ($StartStep -le 1) {
         Invoke-Checked "1/12 Prepare isolated temperature-0.5 best17 workspace" {
             conda run --no-capture-output -n $WindowsCondaEnv python $PrepareScript `
@@ -233,7 +303,7 @@ try {
     $MonomerOutDir = Join-Path $RunDir "monomer"
     if ($StartStep -le 10) {
         Invoke-Checked "10/12 Recompute all applicable monomer structure/confidence/TM/permeability metrics" {
-            conda run --no-capture-output -n $WindowsCondaEnv python $MonomerStructureScript `
+            conda run --no-capture-output -n $TmCondaEnv python $MonomerStructureScript `
                 --design_manifest $MonomerDesignManifest `
                 --reference_manifest $MonomerReferenceManifest `
                 --pdb_dir $MonomerPdbDir `
@@ -254,7 +324,15 @@ try {
             Write-Host "Windows monomer PDB directory: $MonomerPdbDir"
             Write-Host "WSL monomer PDB directory: $MonomerPdbDirWsl"
             # Keep this command single-line for the same CRLF-safety reason
-            # as the complex PyRosetta stage above.
+            # as the complex PyRosetta stage above. Run one sample first so
+            # environment/helper incompatibilities fail before all 302 jobs.
+            $MonomerEnergyBaseCommand = (
+                "conda run --no-capture-output -n '$PyRosettaEnv' python " +
+                "'paper_clean_v28/structure_metrics/19_compute_monomer_pyrosetta_energy.py' " +
+                "--structure_csv '$MonomerStructureCsvWsl' " +
+                "--pdb_dir '$MonomerPdbDirWsl' " +
+                "--out_dir '$MonomerOutDirWsl'"
+            )
             $BashCommand = @(
                 "set -euo pipefail"
                 "test -d '$RepoRootWsl'"
@@ -263,7 +341,8 @@ try {
                 "test -f '$WslCondaRoot/etc/profile.d/conda.sh'"
                 "source '$WslCondaRoot/etc/profile.d/conda.sh'"
                 "cd '$RepoRootWsl'"
-                "conda run --no-capture-output -n '$PyRosettaEnv' python 'paper_clean_v28/structure_metrics/19_compute_monomer_pyrosetta_energy.py' --structure_csv '$MonomerStructureCsvWsl' --pdb_dir '$MonomerPdbDirWsl' --out_dir '$MonomerOutDirWsl'"
+                "$MonomerEnergyBaseCommand --limit 1"
+                $MonomerEnergyBaseCommand
             ) -join "; "
             wsl.exe -d $WslDistribution -- bash -lc $BashCommand
         }
@@ -282,6 +361,15 @@ try {
 
     $FinalWorkbook = Join-Path $RunDir "temperature05_best17_and_monomer_all_metrics.xlsx"
     $FinalReport = Join-Path $RunDir "temperature05_best17_and_monomer_report.txt"
+    Assert-RequiredFile $FinalWorkbook "final Excel workbook"
+    Assert-RequiredFile $FinalReport "final quality report"
+    $FinalReportText = Get-Content -LiteralPath $FinalReport -Raw
+    if (
+        $FinalReportText -notmatch "QUALITY GATE:\s*PASS" -or
+        $FinalReportText -notmatch "PROBLEMS:\s*0"
+    ) {
+        throw "Final report did not certify QUALITY GATE: PASS and PROBLEMS: 0: $FinalReport"
+    }
     Write-Host ""
     Write-Host "===== ALL DONE =====" -ForegroundColor Green
     Write-Host "Complex 17-row CSV: $ComplexFinalCsv"
