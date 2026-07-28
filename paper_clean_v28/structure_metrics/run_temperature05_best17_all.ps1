@@ -203,14 +203,18 @@ try {
             $WorkspaceWsl = Convert-WindowsPathToWslMountPath $Workspace
             Write-Host "Windows complex workspace: $Workspace"
             Write-Host "WSL complex workspace: $WorkspaceWsl"
-            $BashCommand = @"
-set -euo pipefail
-test -d '$WorkspaceWsl'
-test -f '$WslCondaRoot/etc/profile.d/conda.sh'
-source '$WslCondaRoot/etc/profile.d/conda.sh'
-cd '$WorkspaceWsl'
-conda run --no-capture-output -n '$PyRosettaEnv' python 'paper_clean_v28/structure_metrics/10_compute_pyrosetta_energy_naturalized.py'
-"@
+            # Build a single-line Bash program explicitly.  A PowerShell
+            # here-string inherits CRLF after a normal Windows Git checkout;
+            # Bash then sees "pipefail\r" and rejects the option before
+            # PyRosetta starts.
+            $BashCommand = @(
+                "set -euo pipefail"
+                "test -d '$WorkspaceWsl'"
+                "test -f '$WslCondaRoot/etc/profile.d/conda.sh'"
+                "source '$WslCondaRoot/etc/profile.d/conda.sh'"
+                "cd '$WorkspaceWsl'"
+                "conda run --no-capture-output -n '$PyRosettaEnv' python 'paper_clean_v28/structure_metrics/10_compute_pyrosetta_energy_naturalized.py'"
+            ) -join "; "
             wsl.exe -d $WslDistribution -- bash -lc $BashCommand
         }
     }
@@ -249,20 +253,18 @@ conda run --no-capture-output -n '$PyRosettaEnv' python 'paper_clean_v28/structu
             $MonomerStructureCsvWsl = Convert-WindowsPathToWslMountPath $MonomerStructureCsv
             Write-Host "Windows monomer PDB directory: $MonomerPdbDir"
             Write-Host "WSL monomer PDB directory: $MonomerPdbDirWsl"
-            $BashCommand = @"
-set -euo pipefail
-test -d '$RepoRootWsl'
-test -d '$MonomerPdbDirWsl'
-test -f '$MonomerStructureCsvWsl'
-test -f '$WslCondaRoot/etc/profile.d/conda.sh'
-source '$WslCondaRoot/etc/profile.d/conda.sh'
-cd '$RepoRootWsl'
-conda run --no-capture-output -n '$PyRosettaEnv' python \
-  'paper_clean_v28/structure_metrics/19_compute_monomer_pyrosetta_energy.py' \
-  --structure_csv '$MonomerStructureCsvWsl' \
-  --pdb_dir '$MonomerPdbDirWsl' \
-  --out_dir '$MonomerOutDirWsl'
-"@
+            # Keep this command single-line for the same CRLF-safety reason
+            # as the complex PyRosetta stage above.
+            $BashCommand = @(
+                "set -euo pipefail"
+                "test -d '$RepoRootWsl'"
+                "test -d '$MonomerPdbDirWsl'"
+                "test -f '$MonomerStructureCsvWsl'"
+                "test -f '$WslCondaRoot/etc/profile.d/conda.sh'"
+                "source '$WslCondaRoot/etc/profile.d/conda.sh'"
+                "cd '$RepoRootWsl'"
+                "conda run --no-capture-output -n '$PyRosettaEnv' python 'paper_clean_v28/structure_metrics/19_compute_monomer_pyrosetta_energy.py' --structure_csv '$MonomerStructureCsvWsl' --pdb_dir '$MonomerPdbDirWsl' --out_dir '$MonomerOutDirWsl'"
+            ) -join "; "
             wsl.exe -d $WslDistribution -- bash -lc $BashCommand
         }
     }
