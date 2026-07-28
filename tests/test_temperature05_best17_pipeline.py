@@ -127,7 +127,7 @@ class Temperature05PipelineTests(unittest.TestCase):
         self.assertNotIn("wslpath -a $Workspace", text)
         self.assertIn("Cannot continue: missing $Purpose file", text)
         self.assertNotIn('$BashCommand = @"', text)
-        self.assertEqual(text.count(') -join "; "'), 2)
+        self.assertEqual(text.count(') -join "; "'), 3)
 
 
 if __name__ == "__main__":
