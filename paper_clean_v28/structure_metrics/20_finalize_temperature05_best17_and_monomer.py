@@ -52,11 +52,13 @@ def count_status(frame: pd.DataFrame, column: str, expected: str = "ok") -> int:
 
 
 def median_or_nan(frame: pd.DataFrame, column: str) -> float:
-    return float(numeric(frame, column).median())
+    values = numeric(frame, column).dropna()
+    return float(values.median()) if len(values) else math.nan
 
 
 def mean_or_nan(frame: pd.DataFrame, column: str) -> float:
-    return float(numeric(frame, column).mean())
+    values = numeric(frame, column).dropna()
+    return float(values.mean()) if len(values) else math.nan
 
 
 def add_metric(
