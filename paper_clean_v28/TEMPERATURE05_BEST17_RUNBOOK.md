@@ -119,7 +119,9 @@ These fields are recorded as `NA` with an explicit status, never as zero.
 
 Windows drive paths are converted directly to WSL mount paths, for example
 `E:\work` → `/mnt/e/work`; raw backslash paths are not passed through
-`wslpath`.
+`wslpath`.  The controller also constructs each WSL Bash program as one
+semicolon-delimited line.  This prevents a Windows CRLF checkout from turning
+Bash's `pipefail` option into the invalid token `pipefail\\r`.
 
 ## Outputs
 
