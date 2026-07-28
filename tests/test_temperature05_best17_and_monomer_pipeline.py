@@ -224,6 +224,9 @@ class FinalQualityTests(unittest.TestCase):
         self.assertIn("20_finalize_temperature05_best17_and_monomer.py", text)
         self.assertIn("Convert-WindowsPathToWslMountPath", text)
         self.assertNotIn("wslpath -a", text)
+        self.assertNotIn('$BashCommand = @"', text)
+        self.assertEqual(text.count(') -join "; "'), 2)
+        self.assertEqual(text.count('"set -euo pipefail"'), 2)
 
 
 if __name__ == "__main__":
