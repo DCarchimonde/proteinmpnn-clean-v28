@@ -428,7 +428,7 @@ def cyclic_tm_metrics(
     if tm_align is None:
         raise RuntimeError(
             "tmtools is required for monomer TM-score. "
-            "Use the same wain environment that ran the earlier complex "
+            "Use the same tmdiv environment that ran the earlier complex "
             "structural-diversity workflow (tmtools==0.3.0)."
         )
 
@@ -640,6 +640,14 @@ def aggregate_summary(frame: pd.DataFrame, label: str) -> Dict[str, object]:
             return pd.Series(dtype=float)
         return pd.to_numeric(frame[column], errors="coerce")
 
+    def safe_median(series: pd.Series) -> float:
+        available = series.dropna()
+        return float(available.median()) if len(available) else math.nan
+
+    def safe_mean(series: pd.Series) -> float:
+        available = series.dropna()
+        return float(available.mean()) if len(available) else math.nan
+
     primary_rmsd = number("naturalized_ca_rmsd_best_forward_cyclic_shift")
     tm_score = number("naturalized_tm_score_symmetric_best_forward_cyclic_shift")
     diversity = number(
@@ -668,16 +676,16 @@ def aggregate_summary(frame: pd.DataFrame, label: str) -> Dict[str, object]:
             .eq("ok")
             .sum()
         ),
-        "median_naturalized_ca_rmsd": primary_rmsd.median(),
-        "mean_naturalized_ca_rmsd": primary_rmsd.mean(),
+        "median_naturalized_ca_rmsd": safe_median(primary_rmsd),
+        "mean_naturalized_ca_rmsd": safe_mean(primary_rmsd),
         "naturalized_ca_rmsd_lt_2": int(primary_rmsd.lt(2).sum()),
         "naturalized_ca_rmsd_lt_3": int(primary_rmsd.lt(3).sum()),
         "naturalized_ca_rmsd_lt_5": int(primary_rmsd.lt(5).sum()),
-        "median_tm_score": tm_score.median(),
-        "median_diversity_1_minus_tm": diversity.median(),
-        "median_e2e_ca_bfactor_plddt": e2e_plddt.median(),
+        "median_tm_score": safe_median(tm_score),
+        "median_diversity_1_minus_tm": safe_median(diversity),
+        "median_e2e_ca_bfactor_plddt": safe_median(e2e_plddt),
         "e2e_permeability_available": int(permeability.notna().sum()),
-        "median_e2e_permeability": permeability.median(),
+        "median_e2e_permeability": safe_median(permeability),
     }
 
 
@@ -788,8 +796,9 @@ def main() -> int:
         raise FileNotFoundError(f"missing monomer PDB directory: {pdb_dir}")
     if tm_align is None:
         raise RuntimeError(
-            "tmtools is not importable. Activate the wain environment used for "
-            "the earlier TM-diversity run, or install tmtools==0.3.0 there."
+            "tmtools is not importable. Run this script in the tmdiv environment "
+            "used for the earlier TM-diversity analysis (tmtools==0.3.0). "
+            "Do not install it into the separate wain or WSL PyRosetta environments."
         )
 
     design_manifest = pd.read_csv(design_manifest_path)
