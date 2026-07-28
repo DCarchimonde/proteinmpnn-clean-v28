@@ -33,6 +33,16 @@ The resumed command performs complex PyRosetta scoring and finalization, then
 continues automatically through the complete monomer workflow and final
 workbook.
 
+If the controller already reached step 10, then complex steps 8–9 completed and
+the 17-row complex table passed its existence check. Resume directly at the
+monomer structure stage:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File `
+  .\paper_clean_v28\structure_metrics\run_temperature05_best17_all.ps1 `
+  -StartStep 10
+```
+
 ## Twelve stages
 
 1. Select and isolate the 17 exact temperature-0.5 complex PDBs.
@@ -109,19 +119,24 @@ These fields are recorded as `NA` with an explicit status, never as zero.
 
 ## Software environments
 
-- Windows conda environment `wain`: audits, RMSD, confidence, TM-score,
-  permeability, merging, and Excel output.
+- Windows conda environment `wain`: complex audits/RMSD/confidence/
+  permeability, merging, and Excel output (`numpy`, `pandas`, `openpyxl`).
+- Windows conda environment `tmdiv`: monomer structure/TM-score/permeability
+  stage (`numpy`, `pandas`, and exactly `tmtools==0.3.0`). This is the same
+  isolated environment used by the earlier 170-pair complex TM-diversity run.
 - WSL2 distribution `Ubuntu`, conda environment `pyrosetta_eval`: complex and
   monomer PyRosetta scoring.
-- The Windows environment must retain `tmtools==0.3.0`, as used by the earlier
-  complex TM-diversity workflow.
-- Excel creation uses `openpyxl`.
+
+Do not install or assume `tmtools` in `wain` or `pyrosetta_eval`; these three
+environments are intentionally separate. The controller performs all
+environment imports and the exact 560-PDB count as preflight checks before
+starting the remaining calculations. Step 11 also scores one monomer pair as a
+smoke test before launching all 302 structures.
 
 Windows drive paths are converted directly to WSL mount paths, for example
 `E:\work` → `/mnt/e/work`; raw backslash paths are not passed through
-`wslpath`.  The controller also constructs each WSL Bash program as one
-semicolon-delimited line.  This prevents a Windows CRLF checkout from turning
-Bash's `pipefail` option into the invalid token `pipefail\\r`.
+`wslpath`. Each WSL Bash program is constructed as one semicolon-delimited
+line, so a Windows CRLF checkout cannot turn `pipefail` into `pipefail\r`.
 
 ## Outputs
 
