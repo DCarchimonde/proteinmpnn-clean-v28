@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import csv
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,6 +29,21 @@ selector = load_module(
     "t05_selector",
     ROOT / "paper_clean_v28" / "rerun_t05" / "02_select_after_permeability.py",
 )
+
+
+class WindowsLauncherRegressionTests(unittest.TestCase):
+    def test_python_probe_avoids_windows_powershell_dash_c_quoting(self):
+        launcher = (ROOT / "run_t05_rerun.ps1").read_text(encoding="utf-8")
+        self.assertNotIn("& $Candidate.Path -c $ProbeCode", launcher)
+        self.assertIn("& $Candidate.Path $ProbePath", launcher)
+        self.assertIn("Remove-Item -LiteralPath $TemporaryPath", launcher)
+
+    def test_embedded_python_probe_programs_compile(self):
+        launcher = (ROOT / "run_t05_rerun.ps1").read_text(encoding="utf-8")
+        programs = re.findall(r"\$ProbeCode = '([^'\r\n]+)'", launcher)
+        self.assertEqual(len(programs), 2)
+        for program in programs:
+            compile(program, "<PowerShell Python probe>", "exec")
 
 
 class GenerationProtocolTests(unittest.TestCase):

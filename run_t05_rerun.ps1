@@ -120,12 +120,37 @@ function Invoke-PythonProbe {
         $ProbeCode = 'import json, sys; print("__T05_PYTHON__" + json.dumps({"executable": sys.executable, "python": sys.version.split()[0], "numpy": "not required", "torch": "not required", "torch_cuda": None, "cuda": False, "device": "not required"}))'
     }
 
+    # Windows PowerShell 5.1 can corrupt nested quotes when a Python program is
+    # passed through `python -c $ProbeCode`.  It can also promote the first line
+    # written to native stderr into a terminating PowerShell error, hiding the
+    # useful remainder of a Python traceback.  Execute a temporary .py file and
+    # capture stdout/stderr in files so the probe is both quote-safe and fully
+    # diagnosable on the user's Windows setup.
+    $ProbeStem = "proteinmpnn_t05_probe_$([Guid]::NewGuid().ToString('N'))"
+    $ProbePath = Join-Path ([System.IO.Path]::GetTempPath()) ($ProbeStem + ".py")
+    $StdoutPath = Join-Path ([System.IO.Path]::GetTempPath()) ($ProbeStem + ".stdout.txt")
+    $StderrPath = Join-Path ([System.IO.Path]::GetTempPath()) ($ProbeStem + ".stderr.txt")
     try {
-        $ProbeOutput = @(& $Candidate.Path -c $ProbeCode 2>&1)
+        $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($ProbePath, $ProbeCode, $Utf8NoBom)
+        & $Candidate.Path $ProbePath 1> $StdoutPath 2> $StderrPath
         $ProbeExitCode = $LASTEXITCODE
+        $ProbeOutput = @()
+        if (Test-Path -LiteralPath $StdoutPath -PathType Leaf) {
+            $ProbeOutput += @(Get-Content -LiteralPath $StdoutPath)
+        }
+        if (Test-Path -LiteralPath $StderrPath -PathType Leaf) {
+            $ProbeOutput += @(Get-Content -LiteralPath $StderrPath)
+        }
     } catch {
         $ProbeOutput = @($_.Exception.Message)
         $ProbeExitCode = 1
+    } finally {
+        foreach ($TemporaryPath in @($ProbePath, $StdoutPath, $StderrPath)) {
+            if (Test-Path -LiteralPath $TemporaryPath) {
+                Remove-Item -LiteralPath $TemporaryPath -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
 
     $TextLines = @($ProbeOutput | ForEach-Object { [string]$_ })
