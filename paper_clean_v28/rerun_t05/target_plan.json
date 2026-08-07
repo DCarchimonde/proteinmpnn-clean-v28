@@ -1,0 +1,88 @@
+{
+  "protocol": "temperature_0.5_multiseed_local_prescreen_v1",
+  "temperature": 0.5,
+  "methyl_threshold": 0.6,
+  "seeds": [101, 202, 303, 404, 505],
+  "sequence_identity_ceiling": 0.8,
+  "frozen_targets": ["1SFI", "3WNE", "4K1E", "4KEL"],
+  "targets": [
+    {
+      "target_name": "3P8F",
+      "sequences_per_seed": 100,
+      "structure_quota": 10,
+      "current_problem": "joint_rmsd_pass_but_permeability_not_improved"
+    },
+    {
+      "target_name": "3ZGC",
+      "sequences_per_seed": 100,
+      "structure_quota": 10,
+      "current_problem": "joint_rmsd_pass_but_permeability_not_improved"
+    },
+    {
+      "target_name": "3AV9",
+      "sequences_per_seed": 200,
+      "structure_quota": 15,
+      "current_problem": "joint_rmsd_and_permeability_both_need_improvement"
+    },
+    {
+      "target_name": "3AVA",
+      "sequences_per_seed": 200,
+      "structure_quota": 15,
+      "current_problem": "joint_rmsd_and_permeability_both_need_improvement"
+    },
+    {
+      "target_name": "3AVB",
+      "sequences_per_seed": 200,
+      "structure_quota": 15,
+      "current_problem": "joint_rmsd_and_permeability_both_need_improvement"
+    },
+    {
+      "target_name": "3AVF",
+      "sequences_per_seed": 200,
+      "structure_quota": 15,
+      "current_problem": "joint_rmsd_and_permeability_both_need_improvement"
+    },
+    {
+      "target_name": "3AVJ",
+      "sequences_per_seed": 200,
+      "structure_quota": 15,
+      "current_problem": "permeability_improved_but_joint_rmsd_failed"
+    },
+    {
+      "target_name": "3AVG",
+      "sequences_per_seed": 300,
+      "structure_quota": 20,
+      "current_problem": "permeability_improved_but_joint_rmsd_failed"
+    },
+    {
+      "target_name": "3AVI",
+      "sequences_per_seed": 300,
+      "structure_quota": 20,
+      "current_problem": "joint_rmsd_and_permeability_both_need_improvement"
+    },
+    {
+      "target_name": "3AVK",
+      "sequences_per_seed": 300,
+      "structure_quota": 20,
+      "current_problem": "permeability_improved_but_joint_rmsd_failed"
+    },
+    {
+      "target_name": "3AVH",
+      "sequences_per_seed": 200,
+      "structure_quota": 10,
+      "current_problem": "permeability_improved_but_joint_rmsd_far_from_gate"
+    },
+    {
+      "target_name": "3AVM",
+      "sequences_per_seed": 200,
+      "structure_quota": 10,
+      "current_problem": "permeability_improved_but_joint_rmsd_far_from_gate"
+    },
+    {
+      "target_name": "3AVN",
+      "sequences_per_seed": 200,
+      "structure_quota": 10,
+      "current_problem": "joint_rmsd_and_permeability_both_need_improvement"
+    }
+  ]
+}
