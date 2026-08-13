@@ -20,15 +20,26 @@ paper_clean_v28_outputs/generated_fasta_clean_auto_single/all_designs.csv
 paper_clean_v28_outputs/af3_manifest.csv
 ```
 
-## 温度 0.5 多种子重跑
+## 当前恢复流程：Ser 来源质控、结构先行
 
-只重跑尚未同时达到“透膜性相对 native 提高 + 双 RMSD <3 Å”的13个目标，并先在本地将13,500条序列压缩为最多185个结构任务：
+当前应运行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\run_t05_rerun.ps1
+powershell -ExecutionPolicy Bypass -File .\run_serine_qc_recovery.ps1
 ```
 
-完整口径和透膜性预测返回后的第二步见：
+该流程从固定旧提交的原始 PDB 重建 Ser 标签，只更新 canonical V28 的
+Ser expert，冻结 7 个已过结构门的 T=0.5 靶点，仅重跑 10 个未通过靶点，
+并在结构返回前禁止生成透膜输入。完整证据、门槛和输出说明见：
+
+```text
+paper_clean_v28/serine_qc_retrain/README.md
+```
+
+## 历史 T=0.5 预筛流程
+
+`run_t05_rerun.ps1` 和 `paper_clean_v28/rerun_t05/` 保留用于复现此前
+13-target、透膜预筛在前的历史批次，不能用于当前恢复交付。
 
 ```text
 paper_clean_v28/rerun_t05/README.md

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Generate the fixed T=0.5 multiseed rerun and permeability input.
+"""Generate the fixed T=0.5 multiseed rerun.
 
 The sampler deliberately follows the historical V28 generation rule from
 ``DCarchimonde/ProteinMPNN:nmethyl/generate_100_seqs_robust.py``:
@@ -13,8 +13,9 @@ The sampler deliberately follows the historical V28 generation rule from
 
 This version adds reproducible seeds, strict clean-V28 checkpoint loading,
 target-wise sampling budgets, complete provenance, exact old-pool exclusion,
-and a permeability-model input manifest. It does not predict structures or
-permeability.
+and an optional permeability-model input manifest.  ``--defer-permeability-``
+``until-structure`` enforces the structure-first collaboration workflow by
+omitting every permeability input until the structure gate has been run.
 """
 
 from __future__ import annotations
@@ -68,6 +69,10 @@ KNOWN_OUTPUTS = (
     "target_manifest.csv",
     "generation_summary_by_target.csv",
     "generation_manifest.json",
+)
+PERMEABILITY_OUTPUTS = (
+    "permeability_input.csv",
+    "permeability_input_manifest.csv",
 )
 
 
@@ -183,8 +188,14 @@ def validate_plan(plan: Mapping[str, Any], seeds_override: Sequence[int] | None 
 
     targets = list(plan["targets"])
     names = [str(item["target_name"]).upper() for item in targets]
-    if len(targets) != 13 or len(names) != len(set(names)):
-        raise ValueError("The frozen rerun plan must contain exactly 13 unique targets")
+    expected_target_count = int(plan.get("expected_target_count", 13))
+    if expected_target_count <= 0:
+        raise ValueError("expected_target_count must be positive")
+    if len(targets) != expected_target_count or len(names) != len(set(names)):
+        raise ValueError(
+            "The rerun plan must contain exactly "
+            f"{expected_target_count} unique targets"
+        )
     frozen = {str(value).upper() for value in plan["frozen_targets"]}
     if set(names) & frozen:
         raise ValueError("A frozen target is also present in the rerun list")
@@ -199,6 +210,7 @@ def validate_plan(plan: Mapping[str, Any], seeds_override: Sequence[int] | None 
         "seeds": seeds,
         "targets": targets,
         "target_names": names,
+        "expected_target_count": expected_target_count,
         "expected_raw_candidates": expected_raw,
         "planned_structure_handoff": expected_handoff,
     }
@@ -415,6 +427,11 @@ def generate_batch(
     orders_cpu = orders.detach().cpu().tolist()
     for index in range(batch_size):
         sequence = "".join(extended_alphabet[int(token)] for token in peptide_tokens[index])
+        methyl_site_probabilities = [
+            float(methyl_p[index][position])
+            for position, token in enumerate(sequence)
+            if token.islower()
+        ]
         results.append(
             {
                 "design_seq": sequence,
@@ -425,6 +442,21 @@ def generate_batch(
                 "methyl_probability_min": float(min(methyl_p[index])),
                 "methyl_probability_mean": float(sum(methyl_p[index]) / peptide_length),
                 "methyl_probability_max": float(max(methyl_p[index])),
+                "methyl_site_probability_min": (
+                    float(min(methyl_site_probabilities))
+                    if methyl_site_probabilities
+                    else ""
+                ),
+                "methyl_site_probability_mean": (
+                    float(sum(methyl_site_probabilities) / len(methyl_site_probabilities))
+                    if methyl_site_probabilities
+                    else ""
+                ),
+                "methyl_site_probability_max": (
+                    float(max(methyl_site_probabilities))
+                    if methyl_site_probabilities
+                    else ""
+                ),
                 "methyl_probabilities": json.dumps(
                     [round(float(value), 8) for value in methyl_p[index]]
                 ),
@@ -596,6 +628,14 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
         if not required.is_file():
             raise FileNotFoundError(required)
     ensure_output_scope(out_dir, args.overwrite)
+    if args.defer_permeability_until_structure and args.overwrite:
+        # ``--overwrite`` is an explicit request to replace this isolated run.
+        # Do not let permeability inputs from an older non-structure-first run
+        # survive and masquerade as outputs of the new protocol.
+        for output_name in PERMEABILITY_OUTPUTS:
+            stale_path = out_dir / output_name
+            if stale_path.is_file():
+                stale_path.unlink()
 
     if args.device == "cuda":
         if not torch.cuda.is_available():
@@ -741,13 +781,17 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
 
     unique_rows = aggregate_unique_candidates(raw_rows, old_keys)
     eligible_rows = [row for row in unique_rows if int(row["eligible_for_new_permeability_screen"])]
-    permeability_input, permeability_manifest, eligible_with_ids = build_permeability_rows(
-        eligible_rows, all_native
-    )
-    eligible_id_by_key = {
-        (str(row["target_name"]), str(row["design_seq"])): str(row["permeability_id"])
-        for row in eligible_with_ids
-    }
+    permeability_input: List[Dict[str, Any]] = []
+    permeability_manifest: List[Dict[str, Any]] = []
+    eligible_id_by_key: Dict[Tuple[str, str], str] = {}
+    if not args.defer_permeability_until_structure:
+        permeability_input, permeability_manifest, eligible_with_ids = build_permeability_rows(
+            eligible_rows, all_native
+        )
+        eligible_id_by_key = {
+            (str(row["target_name"]), str(row["design_seq"])): str(row["permeability_id"])
+            for row in eligible_with_ids
+        }
     for row in unique_rows:
         row["permeability_id"] = eligible_id_by_key.get(
             (str(row["target_name"]), str(row["design_seq"])), ""
@@ -770,24 +814,25 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
         [row for row in unique_rows if int(row["eligible_for_new_permeability_screen"])],
         unique_fields,
     )
-    atomic_write_csv(
-        out_dir / "permeability_input.csv",
-        permeability_input,
-        ["id", "fasta", "methy_index"],
-    )
-    atomic_write_csv(
-        out_dir / "permeability_input_manifest.csv",
-        permeability_manifest,
-        [
-            "id",
-            "record_type",
-            "target_name",
-            "candidate_id",
-            "design_seq",
-            "design_natural_seq",
-            "methy_index",
-        ],
-    )
+    if not args.defer_permeability_until_structure:
+        atomic_write_csv(
+            out_dir / "permeability_input.csv",
+            permeability_input,
+            ["id", "fasta", "methy_index"],
+        )
+        atomic_write_csv(
+            out_dir / "permeability_input_manifest.csv",
+            permeability_manifest,
+            [
+                "id",
+                "record_type",
+                "target_name",
+                "candidate_id",
+                "design_seq",
+                "design_natural_seq",
+                "methy_index",
+            ],
+        )
     atomic_write_csv(
         out_dir / "target_manifest.csv",
         target_manifest,
@@ -848,7 +893,19 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
         "raw_candidates_generated": len(raw_rows),
         "unique_candidates": len(unique_rows),
         "new_methylated_candidates_for_permeability": len(eligible_rows),
-        "native_permeability_controls": len(all_native),
+        "workflow_order": (
+            "STRUCTURE_FIRST_THEN_PERMEABILITY"
+            if args.defer_permeability_until_structure
+            else "GENERATION_THEN_PERMEABILITY_INPUT"
+        ),
+        "permeability_status": (
+            "DEFERRED_UNTIL_STRUCTURE_RETURNS"
+            if args.defer_permeability_until_structure
+            else "INPUT_READY_NOT_PREDICTED"
+        ),
+        "native_permeability_controls": (
+            0 if args.defer_permeability_until_structure else len(all_native)
+        ),
         "permeability_input_rows": len(permeability_input),
         "planned_structure_handoff": int(validated["planned_structure_handoff"]),
         "targets_below_pre_permeability_quota": [
@@ -870,8 +927,11 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
     print("\n===== GENERATION COMPLETE =====", flush=True)
     print(f"Raw candidates: {len(raw_rows)}", flush=True)
     print(f"Unique candidates: {len(unique_rows)}", flush=True)
-    print(f"New methylated candidates for permeability: {len(eligible_rows)}", flush=True)
-    print(f"Permeability input: {out_dir / 'permeability_input.csv'}", flush=True)
+    print(f"New methylated candidates: {len(eligible_rows)}", flush=True)
+    if args.defer_permeability_until_structure:
+        print("Permeability: DEFERRED_UNTIL_STRUCTURE_RETURNS", flush=True)
+    else:
+        print(f"Permeability input: {out_dir / 'permeability_input.csv'}", flush=True)
     print(f"Quality gate: {manifest_payload['quality_gate']}", flush=True)
 
 
@@ -889,6 +949,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-cpu", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument(
+        "--defer-permeability-until-structure",
+        action="store_true",
+        help=(
+            "enforce the executed structure-first workflow by not writing "
+            "permeability_input.csv or its manifest"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -908,6 +976,7 @@ def main() -> None:
                     "seeds": validated["seeds"],
                     "rerun_targets": validated["target_names"],
                     "frozen_targets": plan["frozen_targets"],
+                    "expected_target_count": validated["expected_target_count"],
                     "expected_raw_candidates": validated["expected_raw_candidates"],
                     "planned_structure_handoff": validated["planned_structure_handoff"],
                 },

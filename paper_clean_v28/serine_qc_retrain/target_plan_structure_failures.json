@@ -1,0 +1,103 @@
+{
+  "protocol": "temperature_0.5_serine_qc_structure_failure_recovery_v1",
+  "temperature": 0.5,
+  "methyl_threshold": 0.6,
+  "seeds": [101, 202, 303, 404, 505],
+  "sequence_identity_ceiling": 0.8,
+  "expected_target_count": 10,
+  "selection_source": "best_forward_cyclic_shift_new_rmsd_best85_all_valid.csv",
+  "selection_source_sha256": "132bf1102f5e316595a03dbae3a9a5245138b38ffeccc4dc068dc2c340795fcb",
+  "selection_rule": "T=0.5 row failed the frozen joint gate: global complex CA RMSD <3 A AND complete final-chain cyclic-peptide CA RMSD <3 A after one global alignment and best forward cyclic shift; no peptide-only refit",
+  "frozen_targets": ["1SFI", "3AV9", "3P8F", "3WNE", "3ZGC", "4K1E", "4KEL"],
+  "frozen_target_evidence": {
+    "1SFI": {"global_rmsd": 0.536454, "cyclic_rmsd": 2.818333, "design_seq": "RCCrGNCGQCQFGG"},
+    "3AV9": {"global_rmsd": 2.508240, "cyclic_rmsd": 2.754180, "design_seq": "QICGRGRG"},
+    "3P8F": {"global_rmsd": 0.300110, "cyclic_rmsd": 2.075042, "design_seq": "CrrrGrQGKGrRGC"},
+    "3WNE": {"global_rmsd": 0.933407, "cyclic_rmsd": 1.458877, "design_seq": "GrKWNC"},
+    "3ZGC": {"global_rmsd": 0.972879, "cyclic_rmsd": 2.075724, "design_seq": "rEGGQNR"},
+    "4K1E": {"global_rmsd": 0.899695, "cyclic_rmsd": 1.916051, "design_seq": "rcrrrQCrQGNCDR"},
+    "4KEL": {"global_rmsd": 0.654500, "cyclic_rmsd": 2.379375, "design_seq": "RcrrGNCrQGFCDR"}
+  },
+  "targets": [
+    {
+      "target_name": "3AVA",
+      "sequences_per_seed": 200,
+      "structure_quota": 15,
+      "current_problem": "t05_joint_structure_gate_failed",
+      "prior_global_rmsd": 5.181069,
+      "prior_cyclic_rmsd": 3.002955
+    },
+    {
+      "target_name": "3AVB",
+      "sequences_per_seed": 200,
+      "structure_quota": 15,
+      "current_problem": "t05_joint_structure_gate_failed",
+      "prior_global_rmsd": 2.503315,
+      "prior_cyclic_rmsd": 3.785873
+    },
+    {
+      "target_name": "3AVF",
+      "sequences_per_seed": 200,
+      "structure_quota": 15,
+      "current_problem": "t05_joint_structure_gate_failed",
+      "prior_global_rmsd": 3.296136,
+      "prior_cyclic_rmsd": 3.036800
+    },
+    {
+      "target_name": "3AVG",
+      "sequences_per_seed": 300,
+      "structure_quota": 20,
+      "current_problem": "t05_joint_structure_gate_failed",
+      "prior_global_rmsd": 0.424254,
+      "prior_cyclic_rmsd": 4.273840
+    },
+    {
+      "target_name": "3AVH",
+      "sequences_per_seed": 200,
+      "structure_quota": 10,
+      "current_problem": "t05_joint_structure_gate_failed",
+      "prior_global_rmsd": 4.989189,
+      "prior_cyclic_rmsd": 3.441989
+    },
+    {
+      "target_name": "3AVI",
+      "sequences_per_seed": 300,
+      "structure_quota": 20,
+      "current_problem": "t05_joint_structure_gate_failed",
+      "prior_global_rmsd": 2.940697,
+      "prior_cyclic_rmsd": 5.753683
+    },
+    {
+      "target_name": "3AVJ",
+      "sequences_per_seed": 200,
+      "structure_quota": 15,
+      "current_problem": "t05_joint_structure_gate_failed",
+      "prior_global_rmsd": 0.472543,
+      "prior_cyclic_rmsd": 4.242763
+    },
+    {
+      "target_name": "3AVK",
+      "sequences_per_seed": 300,
+      "structure_quota": 20,
+      "current_problem": "t05_joint_structure_gate_failed",
+      "prior_global_rmsd": 2.942720,
+      "prior_cyclic_rmsd": 3.330213
+    },
+    {
+      "target_name": "3AVM",
+      "sequences_per_seed": 200,
+      "structure_quota": 10,
+      "current_problem": "t05_joint_structure_gate_failed",
+      "prior_global_rmsd": 4.961329,
+      "prior_cyclic_rmsd": 3.042736
+    },
+    {
+      "target_name": "3AVN",
+      "sequences_per_seed": 200,
+      "structure_quota": 10,
+      "current_problem": "t05_joint_structure_gate_failed",
+      "prior_global_rmsd": 5.889788,
+      "prior_cyclic_rmsd": 2.828668
+    }
+  ]
+}

@@ -16,8 +16,11 @@ NATURAL_RESIDUE_MAP = {
     'SER': 'S', 'THR': 'T', 'TRP': 'W', 'TYR': 'Y', 'VAL': 'V',
 }
 
-# N-甲基化氨基酸：根据 PDB 原子分析结果修正后的 20 种映射
-# 键：HETATM 代码 | 值：对应天然氨基酸的单字母 (小写)
+# N-甲基化氨基酸：化学组分名 -> 对应天然氨基酸的小写 token。
+#
+# SER 不在这里。原始 PDB 同时包含 ATOM-SER（天然 Ser）和带 CN 原子的
+# HETATM-SER（历史 N-甲基 Ser 别名）。仅按残基名合并字典会静默覆盖
+# SER -> S。必须通过 residue_token_from_pdb() 结合 record type 和 CN 原子解析。
 NMETHYL_RESIDUE_MAP = {
     # --- 疏水性 / 脂肪族 ---
     'MAA': 'a', # Ala (数据验证: 仅含CB)
@@ -32,7 +35,6 @@ NMETHYL_RESIDUE_MAP = {
 
     # --- 极性 / 电荷 ---
     '5JP': 's', # Ser
-    'SER': 's', # Ser (HETATM version)
     'NZC': 't', # Thr
     'NCY': 'c', # Cys
     'ZCA': 'n', # Asn (数据验证: 含OD1, ND2)
@@ -43,6 +45,49 @@ NMETHYL_RESIDUE_MAP = {
     'MMO': 'r', # Arg
     'E9V': 'h', # His
 }
+
+_RESIDUE_NAME_COLLISIONS = set(NATURAL_RESIDUE_MAP) & set(NMETHYL_RESIDUE_MAP)
+if _RESIDUE_NAME_COLLISIONS:
+    raise ValueError(
+        "Natural and N-methyl residue maps overlap: "
+        + ", ".join(sorted(_RESIDUE_NAME_COLLISIONS))
+    )
+
+
+def residue_token_from_pdb(record_name, residue_name, atom_names=()):
+    """Resolve one PDB residue without collapsing natural and N-methyl Ser.
+
+    The historical data use ``5JP`` for most N-methyl Ser residues and use
+    ``HETATM SER`` once.  That exceptional residue contains the N-methyl
+    carbon atom ``CN``.  Ordinary ``ATOM SER`` is always natural serine.
+    Unknown or chemically ambiguous residues raise instead of being silently
+    relabelled.
+    """
+
+    record_name = str(record_name).strip().upper()
+    residue_name = str(residue_name).strip().upper()
+    atoms = {str(atom).strip().upper() for atom in atom_names}
+
+    if record_name == "ATOM":
+        if residue_name not in NATURAL_RESIDUE_MAP:
+            raise ValueError(f"Unsupported ATOM residue: {residue_name}")
+        return NATURAL_RESIDUE_MAP[residue_name]
+
+    if record_name != "HETATM":
+        raise ValueError(f"Unsupported PDB record type: {record_name}")
+
+    if residue_name == "SER":
+        if "CN" not in atoms:
+            raise ValueError("HETATM SER is ambiguous without the N-methyl CN atom")
+        return "s"
+
+    if residue_name not in NMETHYL_RESIDUE_MAP:
+        raise ValueError(f"Unsupported HETATM residue: {residue_name}")
+    if "CN" not in atoms:
+        raise ValueError(
+            f"N-methyl component {residue_name} is missing the expected CN atom"
+        )
+    return NMETHYL_RESIDUE_MAP[residue_name]
 
 # 将所有映射合并为一个总的映射表
 ALL_RESIDUE_MAP = {**NATURAL_RESIDUE_MAP, **NMETHYL_RESIDUE_MAP}
@@ -56,7 +101,7 @@ ALL_RESIDUE_MAP = {**NATURAL_RESIDUE_MAP, **NMETHYL_RESIDUE_MAP}
 NATURAL_AA_ALPHABET = "ACDEFGHIKLMNPQRSTVWY"
 
 # 自动生成N-甲基化氨基酸的字母表 (去重并排序)
-# 修正后应该包含: a,c,d,e,f,g,h,i,k,l,m,n,q,r,s,t,v,w,y (共19种, 因为5JP和SER都映射为s)
+# 当前包含: a,c,d,e,f,g,h,i,k,l,m,n,q,r,s,t,v,w,y（共19种；无 p 训练类别）
 METHYL_AA_ALPHABET = "".join(sorted(list(set(NMETHYL_RESIDUE_MAP.values()))))
 
 # 构建完整的扩展字母表
