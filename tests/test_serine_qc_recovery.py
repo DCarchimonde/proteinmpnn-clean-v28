@@ -153,6 +153,7 @@ class FrozenRecoveryPlanTests(unittest.TestCase):
             self.assertLess(float(evidence["global_rmsd"]), 3.0)
             self.assertLess(float(evidence["cyclic_rmsd"]), 3.0)
             self.assertNotIn("s", evidence["design_seq"])
+            self.assertTrue(evidence["selected_chain"])
 
     def test_each_rerun_target_failed_at_least_one_frozen_gate(self):
         for target in self.plan["targets"]:
@@ -162,14 +163,14 @@ class FrozenRecoveryPlanTests(unittest.TestCase):
             )
 
 
-class MinimalRetrainIsolationTests(unittest.TestCase):
+class CompleteExpertRetrainIsolationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.trainer_text = (
             ROOT
             / "paper_clean_v28"
             / "serine_qc_retrain"
-            / "02_retrain_canonical_serine_expert.py"
+            / "02_retrain_canonical_expert_heads.py"
         ).read_text(encoding="utf-8")
 
     def test_train_and_test_naturalize_labels_before_model_forward(self):
@@ -182,12 +183,37 @@ class MinimalRetrainIsolationTests(unittest.TestCase):
         )
         self.assertEqual(leaked_forwards, [])
 
-    def test_only_canonical_ser_expert_is_trainable_and_allowed_to_change(self):
-        self.assertIn("serine_expert = model.experts[SER_INDEX]", self.trainer_text)
+    def test_all_canonical_expert_heads_are_trainable_and_only_experts_change(self):
+        self.assertIn("parameters = list(model.experts.parameters())", self.trainer_text)
         self.assertIn("parameter.requires_grad_(False)", self.trainer_text)
-        self.assertIn("set(changed_keys) != ALLOWED_CHANGED_STATE_KEYS", self.trainer_text)
+        self.assertIn("set(changed_keys) != ALL_EXPERT_STATE_KEYS", self.trainer_text)
+        self.assertIn("deterministic_train_validation_split", self.trainer_text)
+        self.assertIn("validation_balanced_bce", self.trainer_text)
         self.assertNotIn("strict=False", self.trainer_text)
         self.assertNotIn("splice", self.trainer_text.lower())
+
+    def test_padding_is_made_safe_before_20_expert_gather(self):
+        self.assertIn("safe_true_base", self.trainer_text)
+        self.assertIn("safe_true_base >= N_NATURAL", self.trainer_text)
+        self.assertNotIn(
+            "expert_logits, -1, true_base.unsqueeze(-1)", self.trainer_text
+        )
+
+    def test_promotion_metrics_match_t05_generation_temperature(self):
+        self.assertIn("known_logits / deployment_temperature", self.trainer_text)
+        self.assertIn('default=0.5', self.trainer_text)
+        self.assertIn("probability_methyl_deployment_scaled", self.trainer_text)
+
+    def test_trainer_evaluates_test_partition_only_after_training(self):
+        training_position = self.trainer_text.rindex("train_all_expert_heads(")
+        final_test_position = self.trainer_text.rindex("corrected_summary, corrected_per_residue")
+        self.assertGreater(final_test_position, training_position)
+        test_evaluations = re.findall(
+            r"evaluate\(\s*model,\s*test_records,", self.trainer_text, flags=re.MULTILINE
+        )
+        self.assertEqual(len(test_evaluations), 1)
+        self.assertNotIn("baseline_test", self.trainer_text)
+        self.assertNotIn("baseline_frankenstein_v28", self.trainer_text)
 
     def test_checkpoint_is_promoted_only_after_quality_gate_passes(self):
         gate_position = self.trainer_text.index('quality_gate = "PASS"')
@@ -216,8 +242,10 @@ class StructureFirstHandoffTests(unittest.TestCase):
             self.assertNotIn("02_select_after_permeability.py", text)
             positions = [
                 text.index("01_rebuild_provenance_labels.py"),
-                text.index("02_retrain_canonical_serine_expert.py"),
-                text.index("01_generate_t05_multiseed.py"),
+                text.index("02_retrain_canonical_expert_heads.py"),
+                text.index("01_eval_clean_model.py"),
+                text.index("03_revalidate_frozen_structures.py"),
+                text.rindex("01_generate_t05_multiseed.py"),
                 text.index("03_select_structure_first_handoff.py"),
             ]
             self.assertEqual(positions, sorted(positions))
@@ -232,6 +260,15 @@ class StructureFirstHandoffTests(unittest.TestCase):
         )
         self.assertIn('"DEFERRED_UNTIL_STRUCTURE_RETURNS"', text)
 
+    def test_generator_never_feeds_lowercase_annotation_back_to_model(self):
+        text = (
+            ROOT / "paper_clean_v28" / "rerun_t05" / "01_generate_t05_multiseed.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("X, S_context, mask", text)
+        self.assertIn("S_context[row_indices, positions] = sampled_base", text)
+        self.assertIn("S_output[row_indices, positions] = final_token", text)
+        self.assertNotIn("S_context[row_indices, positions] = final_token", text)
+
     def test_prior_exact_sequences_are_identified_for_exclusion(self):
         with tempfile.TemporaryDirectory() as temporary_name:
             path = Path(temporary_name) / "prior.csv"
@@ -241,19 +278,62 @@ class StructureFirstHandoffTests(unittest.TestCase):
                     fieldnames=["candidate_id", "target_name", "design_seq", "design_natural_seq"],
                 )
                 writer.writeheader()
-                writer.writerow(
-                    {
-                        "candidate_id": "old-1",
-                        "target_name": "3AVA",
-                        "design_seq": "ACsD",
-                        "design_natural_seq": "ACSD",
-                    }
-                )
+                for index in range(1_333):
+                    writer.writerow(
+                        {
+                            "candidate_id": f"old-{index}",
+                            "target_name": "3AVA",
+                            "design_seq": "ACsD",
+                            "design_natural_seq": "ACSD",
+                        }
+                    )
             natural_index, exact_keys, manifest = selector.prior_handoff_index(path)
 
         self.assertIn(("3AVA", "ACsD"), exact_keys)
         self.assertIn(("3AVA", "ACSD"), natural_index)
         self.assertEqual(manifest["unique_exact_target_sequence_keys"], 1)
+
+    def test_launchers_require_prior_1333_before_generation(self):
+        powershell = (ROOT / "run_serine_qc_recovery.ps1").read_text(encoding="utf-8")
+        shell = (ROOT / "run_serine_qc_recovery.sh").read_text(encoding="utf-8")
+        self.assertIn("$Plan, $PriorHandoff", powershell)
+        self.assertIn('"--prior_designs_csv", $PriorHandoff', powershell)
+        self.assertIn('[[ ! -f "$PRIOR_HANDOFF" ]]', shell)
+        self.assertIn('--prior_designs_csv "$PRIOR_HANDOFF"', shell)
+        self.assertLess(
+            powershell.index("--validate-prior-designs-only"),
+            powershell.index("$PinnedSource = Prepare-PinnedSourceRepo"),
+        )
+        self.assertLess(
+            shell.index("--validate-prior-designs-only"),
+            shell.index('"$TASK_PYTHON" paper_clean_v28/serine_qc_retrain/01_rebuild'),
+        )
+
+    def test_selector_excludes_prior_naturalized_sequences_before_ranking(self):
+        text = (
+            ROOT
+            / "paper_clean_v28"
+            / "serine_qc_retrain"
+            / "03_select_structure_first_handoff.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            '(target, str(row["design_natural_seq"]).upper()) not in prior_index',
+            text,
+        )
+        self.assertIn("prior_handoff_naturalized_sequences_excluded", text)
+
+    def test_frozen_structures_are_bridged_without_regeneration(self):
+        text = (
+            ROOT
+            / "paper_clean_v28"
+            / "serine_qc_retrain"
+            / "03_revalidate_frozen_structures.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("KEEP_EXISTING_PDB_NO_HIGHFOLD_RERUN", text)
+        self.assertIn("PRE_QC_GENERATION_AUDITED_BY_FINAL_CHECKPOINT", text)
+        self.assertIn("retained_result_design_seq", text)
+        self.assertIn("final_model_suggested_design_seq", text)
+        self.assertIn("DO_NOT_SUBSTITUTE_MODEL_SUGGESTION", text)
 
     def test_structure_selector_ranks_and_collapses_without_permeability(self):
         base = {

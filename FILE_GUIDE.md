@@ -154,6 +154,7 @@ provenance correction and structure-first recovery.
 
 ### `run_serine_qc_recovery.ps1` / `run_serine_qc_recovery.sh`
 One-command Windows and AutoDL/Linux launchers. They rebuild labels from the
-pinned raw PDB source, retrain only the canonical Ser expert, regenerate only
-the ten failed T=0.5 targets, and create the structure handoff. Permeability is
-deliberately deferred until structures return.
+pinned raw PDB source, retrain all 20 canonical expert heads while freezing the
+trunk/base head, bridge the seven already-passed structures to the final
+checkpoint, regenerate only the ten failed T=0.5 targets, and create the
+structure handoff. Permeability is deliberately deferred until structures return.

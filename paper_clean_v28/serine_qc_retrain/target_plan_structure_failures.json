@@ -1,5 +1,5 @@
 {
-  "protocol": "temperature_0.5_serine_qc_structure_failure_recovery_v1",
+  "protocol": "temperature_0.5_all_expert_qc_structure_failure_recovery_v2",
   "temperature": 0.5,
   "methyl_threshold": 0.6,
   "seeds": [101, 202, 303, 404, 505],
@@ -10,13 +10,13 @@
   "selection_rule": "T=0.5 row failed the frozen joint gate: global complex CA RMSD <3 A AND complete final-chain cyclic-peptide CA RMSD <3 A after one global alignment and best forward cyclic shift; no peptide-only refit",
   "frozen_targets": ["1SFI", "3AV9", "3P8F", "3WNE", "3ZGC", "4K1E", "4KEL"],
   "frozen_target_evidence": {
-    "1SFI": {"global_rmsd": 0.536454, "cyclic_rmsd": 2.818333, "design_seq": "RCCrGNCGQCQFGG"},
-    "3AV9": {"global_rmsd": 2.508240, "cyclic_rmsd": 2.754180, "design_seq": "QICGRGRG"},
-    "3P8F": {"global_rmsd": 0.300110, "cyclic_rmsd": 2.075042, "design_seq": "CrrrGrQGKGrRGC"},
-    "3WNE": {"global_rmsd": 0.933407, "cyclic_rmsd": 1.458877, "design_seq": "GrKWNC"},
-    "3ZGC": {"global_rmsd": 0.972879, "cyclic_rmsd": 2.075724, "design_seq": "rEGGQNR"},
-    "4K1E": {"global_rmsd": 0.899695, "cyclic_rmsd": 1.916051, "design_seq": "rcrrrQCrQGNCDR"},
-    "4KEL": {"global_rmsd": 0.654500, "cyclic_rmsd": 2.379375, "design_seq": "RcrrGNCrQGFCDR"}
+    "1SFI": {"global_rmsd": 0.536454, "cyclic_rmsd": 2.818333, "selected_chain": "I", "design_seq": "RCCrGNCGQCQFGG"},
+    "3AV9": {"global_rmsd": 2.508240, "cyclic_rmsd": 2.754180, "selected_chain": "X", "design_seq": "QICGRGRG"},
+    "3P8F": {"global_rmsd": 0.300110, "cyclic_rmsd": 2.075042, "selected_chain": "I", "design_seq": "CrrrGrQGKGrRGC"},
+    "3WNE": {"global_rmsd": 0.933407, "cyclic_rmsd": 1.458877, "selected_chain": "C", "design_seq": "GrKWNC"},
+    "3ZGC": {"global_rmsd": 0.972879, "cyclic_rmsd": 2.075724, "selected_chain": "C", "design_seq": "rEGGQNR"},
+    "4K1E": {"global_rmsd": 0.899695, "cyclic_rmsd": 1.916051, "selected_chain": "B", "design_seq": "rcrrrQCrQGNCDR"},
+    "4KEL": {"global_rmsd": 0.654500, "cyclic_rmsd": 2.379375, "selected_chain": "B", "design_seq": "RcrrGNCrQGFCDR"}
   },
   "targets": [
     {

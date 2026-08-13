@@ -19,7 +19,7 @@ import math
 import os
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, MutableMapping, Sequence, Tuple
 
 
 SCRIPT_PATH = Path(__file__).resolve()
@@ -33,6 +33,7 @@ DEFAULT_PRIOR_HANDOFF = (
     / "rerun_temperature_0.5_multiseed"
     / "methylated_new_candidates.csv"
 )
+EXPECTED_PRIOR_HANDOFF_ROWS = 1_333
 
 
 def read_csv(path: Path) -> List[Dict[str, str]]:
@@ -210,17 +211,26 @@ def prior_handoff_index(
     Dict[str, Any],
 ]:
     if path is None or not path.is_file():
-        return {}, set(), {"available": False, "path": str(path) if path else None}
+        raise FileNotFoundError(
+            "The prior 1,333-row handoff CSV is required for duplicate exclusion"
+        )
     rows = read_csv(path)
+    if len(rows) != EXPECTED_PRIOR_HANDOFF_ROWS:
+        raise RuntimeError(
+            "Prior handoff row count changed: expected "
+            f"{EXPECTED_PRIOR_HANDOFF_ROWS}, observed {len(rows)}"
+        )
     grouped: MutableMapping[Tuple[str, str], List[Dict[str, str]]] = defaultdict(list)
     exact_keys: set[Tuple[str, str]] = set()
     for row in rows:
         target = str(row.get("target_name", "")).upper()
         design_sequence = str(row.get("design_seq", ""))
-        key = (
-            target,
-            str(row.get("design_natural_seq", "")).upper(),
-        )
+        natural_sequence = str(row.get("design_natural_seq", "")).strip().upper()
+        if not natural_sequence:
+            natural_sequence = design_sequence.upper()
+        if not target or not design_sequence:
+            raise RuntimeError("Prior handoff contains an empty target_name or design_seq")
+        key = (target, natural_sequence)
         grouped[key].append(row)
         if target and design_sequence:
             exact_keys.add((target, design_sequence))
@@ -260,7 +270,7 @@ def make_task(row: Mapping[str, Any], metadata: Mapping[str, str]) -> Dict[str, 
     target = str(row["target_name"]).upper()
     rank = int(row["structure_selection_rank"])
     return {
-        "suggested_job_name": f"{target}_T0_5_SERQC_{rank:02d}",
+        "suggested_job_name": f"{target}_T0_5_EXPERTQC_{rank:02d}",
         "target_name": target,
         "temperature": 0.5,
         "selected_chain": metadata["selected_chain"],
@@ -420,12 +430,18 @@ def main() -> None:
         all_target_rows = [
             row for row in candidates if str(row["target_name"]).upper() == target
         ]
-        target_rows = [
+        after_exact = [
             row
             for row in all_target_rows
             if (target, str(row["design_seq"])) not in prior_exact_keys
         ]
-        prior_exact_excluded = len(all_target_rows) - len(target_rows)
+        prior_exact_excluded = len(all_target_rows) - len(after_exact)
+        target_rows = [
+            row
+            for row in after_exact
+            if (target, str(row["design_natural_seq"]).upper()) not in prior_index
+        ]
+        prior_naturalized_excluded = len(after_exact) - len(target_rows)
         collapsed = collapse_naturalized_variants(target_rows)
         collapsed = [attach_reuse_evidence(row, prior_index) for row in collapsed]
         for rank, row in enumerate(sorted(collapsed, key=candidate_sort_key), start=1):
@@ -439,7 +455,8 @@ def main() -> None:
                 "target_name": target,
                 "raw_methylated_unique_candidates": len(all_target_rows),
                 "prior_handoff_exact_sequences_excluded": prior_exact_excluded,
-                "eligible_after_prior_exact_exclusion": len(target_rows),
+                "prior_handoff_naturalized_sequences_excluded": prior_naturalized_excluded,
+                "eligible_after_all_prior_handoff_exclusion": len(target_rows),
                 "unique_naturalized_candidates": len(collapsed),
                 "planned_structure_quota": quota,
                 "selected_structure_tasks": len(selected),
@@ -476,7 +493,7 @@ def main() -> None:
     write_structure_inputs(out_dir, tasks)
     manifest = {
         "quality_gate": quality_gate,
-        "protocol": "serine_qc_structure_first_handoff_v1",
+        "protocol": "all_expert_qc_structure_first_handoff_v2",
         "plan": str(plan_path),
         "plan_sha256": file_sha256(plan_path),
         "candidate_file": str(candidate_path),
@@ -485,6 +502,10 @@ def main() -> None:
         "prior_handoff_exact_sequences_excluded": sum(
             int(row["prior_handoff_exact_sequences_excluded"]) for row in summary_rows
         ),
+        "prior_handoff_naturalized_sequences_excluded": sum(
+            int(row["prior_handoff_naturalized_sequences_excluded"])
+            for row in summary_rows
+        ),
         "targets": len(target_plan),
         "frozen_targets_not_regenerated": plan["frozen_targets"],
         "planned_structure_tasks": sum(
@@ -492,14 +513,12 @@ def main() -> None:
         ),
         "selected_structure_tasks": len(tasks),
         "shortfall_targets": shortfalls,
-        "potential_structure_reuse_matches": sum(
-            int(task["prior_handoff_natural_sequence_match"]) for task in tasks
-        ),
+        "potential_structure_reuse_matches": 0,
         "prior_handoff": prior_manifest,
         "prior_handoff_policy": (
-            "exact target+design_seq repeats are excluded; naturalized-sequence "
-            "matches are never auto-reused and require an existing PDB that has "
-            "already passed the same frozen structure gate"
+            "both exact target+design_seq repeats and target+naturalized-sequence "
+            "repeats are excluded before ranking; every delivered task is new relative "
+            "to the prior 1,333-row handoff"
         ),
         "ranking_rule": (
             "descending clean-V28 base_log_probability_mean; descending corrected "

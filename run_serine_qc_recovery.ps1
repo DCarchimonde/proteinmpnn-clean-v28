@@ -3,7 +3,7 @@ param(
     [string]$CondaEnvironment = "wain",
     [string]$SourceRepo = "",
     [string]$PriorHandoffCsv = "",
-    [int]$Epochs = 40,
+    [int]$Epochs = 80,
     [int]$BatchSize = 32,
     [switch]$AllowCpu,
     [switch]$Force
@@ -16,15 +16,19 @@ $SourceUrl = "https://github.com/DCarchimonde/ProteinMPNN.git"
 $OutputRoot = Join-Path $RepoRoot "paper_clean_v28_outputs\serine_qc_retrain"
 $DataOut = Join-Path $OutputRoot "data"
 $ModelOut = Join-Path $OutputRoot "model"
+$TestEvalOut = Join-Path $ModelOut "full_corrected_test_eval"
+$BridgeOut = Join-Path $OutputRoot "bridge"
 $GenerationOut = Join-Path $OutputRoot "generation"
 $HandoffOut = Join-Path $OutputRoot "handoff"
 $Plan = Join-Path $RepoRoot "paper_clean_v28\serine_qc_retrain\target_plan_structure_failures.json"
 $LabelBuilder = Join-Path $RepoRoot "paper_clean_v28\serine_qc_retrain\01_rebuild_provenance_labels.py"
-$Trainer = Join-Path $RepoRoot "paper_clean_v28\serine_qc_retrain\02_retrain_canonical_serine_expert.py"
+$Trainer = Join-Path $RepoRoot "paper_clean_v28\serine_qc_retrain\02_retrain_canonical_expert_heads.py"
+$Evaluator = Join-Path $RepoRoot "paper_clean_v28\01_eval_clean_model.py"
+$Bridge = Join-Path $RepoRoot "paper_clean_v28\serine_qc_retrain\03_revalidate_frozen_structures.py"
 $Generator = Join-Path $RepoRoot "paper_clean_v28\rerun_t05\01_generate_t05_multiseed.py"
 $Selector = Join-Path $RepoRoot "paper_clean_v28\serine_qc_retrain\03_select_structure_first_handoff.py"
 $ParentCheckpoint = Join-Path $RepoRoot "frankenstein_v28.pt"
-$CorrectedCheckpoint = Join-Path $ModelOut "frankenstein_v28_serine_qc.pt"
+$CorrectedCheckpoint = Join-Path $ModelOut "frankenstein_v28_expert_heads_qc.pt"
 if ([string]::IsNullOrWhiteSpace($PriorHandoffCsv)) {
     $PriorHandoff = Join-Path $RepoRoot "paper_clean_v28_outputs\rerun_temperature_0.5_multiseed\methylated_new_candidates.csv"
 } elseif ([System.IO.Path]::IsPathRooted($PriorHandoffCsv)) {
@@ -139,7 +143,7 @@ function Prepare-PinnedSourceRepo {
 
 $ResolvedPython = Resolve-PythonExecutable
 Write-Host "============================================================"
-Write-Host "SERINE PROVENANCE QC + MINIMAL V28 RECOVERY"
+Write-Host "SERINE PROVENANCE QC + COMPLETE EXPERT-HEAD RECOVERY"
 Write-Host "Repository: $RepoRoot"
 Write-Host "Python:     $ResolvedPython"
 Write-Host "============================================================"
@@ -151,11 +155,17 @@ if (-not $AllowCpu) {
     Invoke-PythonProgram $ResolvedPython $ProbeCode "CUDA preflight"
 }
 
+& $ResolvedPython $Generator `
+    --plan $Plan `
+    --prior_designs_csv $PriorHandoff `
+    --validate-prior-designs-only
+Assert-LastExitCode "Prior 1,333-row handoff preflight"
+
 $PinnedSource = Prepare-PinnedSourceRepo
 $TrainJsonl = Join-Path $PinnedSource "nmethyl_data\training_set\train.jsonl"
 $TestJsonl = Join-Path $PinnedSource "nmethyl_data\test_set\test.jsonl"
 $RawPdbDir = Join-Path $PinnedSource "nmethyl_data\raw_pdb"
-foreach ($Required in @($TrainJsonl, $TestJsonl, $RawPdbDir, $ParentCheckpoint, $Plan)) {
+foreach ($Required in @($TrainJsonl, $TestJsonl, $RawPdbDir, $ParentCheckpoint, $Plan, $PriorHandoff)) {
     if (-not (Test-Path -LiteralPath $Required)) {
         throw "Required input is missing: $Required"
     }
@@ -182,7 +192,28 @@ try {
     )
     if ($AllowCpu) { $TrainArguments += "--allow-cpu" }
     & $ResolvedPython @TrainArguments
-    Assert-LastExitCode "Canonical Ser expert retraining"
+    Assert-LastExitCode "Canonical all-expert-head retraining"
+
+    & $ResolvedPython $Evaluator `
+        --model_path $CorrectedCheckpoint `
+        --data_jsonl (Join-Path $DataOut "test_serine_provenance_corrected.jsonl") `
+        --mode monomer `
+        --eval_chains masked `
+        --batch_size $BatchSize `
+        --thresholds "0.3,0.4,0.5,0.6,0.7,0.8,0.9,0.95,0.98,0.99" `
+        --out_dir $TestEvalOut
+    Assert-LastExitCode "Final checkpoint full corrected-test evaluation"
+
+    $BridgeArguments = @(
+        $Bridge,
+        "--model-path", $CorrectedCheckpoint,
+        "--plan", $Plan,
+        "--native-jsonl", (Join-Path $RepoRoot "17_complexes_native.jsonl"),
+        "--out-dir", $BridgeOut
+    )
+    if ($AllowCpu) { $BridgeArguments += "--allow-cpu" }
+    & $ResolvedPython @BridgeArguments
+    Assert-LastExitCode "Frozen passed-target final-model bridge"
 
     $GenerateArguments = @(
         $Generator,
@@ -190,6 +221,7 @@ try {
         "--model_path", $CorrectedCheckpoint,
         "--out_dir", $GenerationOut,
         "--batch_size", $BatchSize,
+        "--prior_designs_csv", $PriorHandoff,
         "--defer-permeability-until-structure"
     )
     if ($AllowCpu) { $GenerateArguments += @("--device", "auto", "--allow-cpu") }
@@ -204,11 +236,7 @@ try {
         "--plan", $Plan,
         "--out-dir", $HandoffOut
     )
-    if (Test-Path -LiteralPath $PriorHandoff -PathType Leaf) {
-        $SelectArguments += @("--prior-handoff-csv", $PriorHandoff)
-    } else {
-        $SelectArguments += @("--prior-handoff-csv", "")
-    }
+    $SelectArguments += @("--prior-handoff-csv", $PriorHandoff)
     & $ResolvedPython @SelectArguments
     Assert-LastExitCode "Structure-first shortlist"
 } finally {
@@ -218,6 +246,7 @@ try {
 Write-Host ""
 Write-Host "ALL QUALITY GATES PASSED" -ForegroundColor Green
 Write-Host "Corrected checkpoint: $CorrectedCheckpoint"
+Write-Host "Frozen-target bridge: $(Join-Path $BridgeOut 'frozen_target_final_model_bridge.csv')"
 Write-Host "Shang-ge handoff:     $(Join-Path $HandoffOut 'structure_tasks_for_shangge.csv')"
 Write-Host "Reuse audit:          $(Join-Path $HandoffOut 'selection_manifest.json')"
 Write-Host "Permeability:         DEFERRED until returned structures pass the structure gate"

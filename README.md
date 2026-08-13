@@ -28,8 +28,9 @@ paper_clean_v28_outputs/af3_manifest.csv
 powershell -ExecutionPolicy Bypass -File .\run_serine_qc_recovery.ps1
 ```
 
-该流程从固定旧提交的原始 PDB 重建 Ser 标签，只更新 canonical V28 的
-Ser expert，冻结 7 个已过结构门的 T=0.5 靶点，仅重跑 10 个未通过靶点，
+该流程从固定旧提交的原始 PDB 重建 Ser 标签，冻结共享主干和 base head、
+重训 canonical V28 的完整 20-expert 模块；7 个已过结构门的 T=0.5 靶点
+仅用最终 checkpoint 重评分并复用结构，只为 10 个未通过靶点生成新任务，
 并在结构返回前禁止生成透膜输入。完整证据、门槛和输出说明见：
 
 ```text

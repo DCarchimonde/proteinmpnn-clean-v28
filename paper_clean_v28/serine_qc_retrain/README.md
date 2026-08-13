@@ -1,7 +1,8 @@
-# Ser 来源质控后的最小恢复流程
+# Ser 来源质控后的完整专家头恢复流程
 
-本目录修复一个有明确 PDB 来源证据的标签问题，并把恢复范围限制在当前
-T=0.5 结构门未通过的复合物。它不是一次全模型重做。
+本目录修复一个有明确 PDB 来源证据的标签问题，重新训练生产网络中的
+完整专家模块，并把昂贵的结构补跑限制在当前 T=0.5 结构门未通过的
+复合物。最终只产出一个新的完整 checkpoint；它不重新训练共享主干。
 
 ## 已确认的问题
 
@@ -31,22 +32,34 @@ T=0.5 结构门未通过的复合物。它不是一次全模型重做。
 训练和测试 JSONL 的语义哈希、行数、标签变化类型及上述计数均为硬门槛。
 坐标和所有非序列字段保持不变。
 
-## 最小训练边界
+## 训练边界：完整专家模块，而不是只改 Ser
 
-`02_retrain_canonical_serine_expert.py` 使用生产推理相同的完整 clean-V28
-网络，只更新 `experts[15]`（Ser）的 weight 和 bias。主干、base head、
-其余 19 个专家和字母表全部冻结。训练与评估时先将标签 `s` 天然化为
-输入 `S`，避免把答案 token 泄漏给主干。
+`02_retrain_canonical_expert_heads.py` 使用生产推理相同的完整 clean-V28
+网络，同时更新 `experts[0]` 到 `experts[19]` 的 weight 和 bias。共享
+ProteinMPNN 主干、序列 embedding、decoder 和天然氨基酸 base head 全部
+逐字节冻结。
 
-保存前后的 state hash 必须证明只有以下两个 tensor 改变：
+600 条纠正训练记录先按记录级确定性拆分为 development-train 和 validation；
+原来的 151 条 test 不参与 epoch 选择或 early stopping，只在最终 checkpoint
+确定后用于质量门和固定报告，不把结果反馈给训练。每个 forward 前，所有
+小写甲基标签都转换成天然母体作为模型输入，避免答案通过 `W_s` 泄漏。
+
+19 个有正负训练支持的专家使用各自的 class weight；Pro 没有 `p` 正样本，
+其专家只学习天然 P 的负类 veto，且生成器仍没有 `P -> p` 映射。
+
+保存前后的 state hash 必须证明恰好 40 个 expert tensor 改变：
 
 ```text
-experts.15.weight
-experts.15.bias
+experts.0.weight / experts.0.bias
+...
+experts.19.weight / experts.19.bias
 ```
 
-同时要求非 Ser 测试概率逐位不变、保存后的 checkpoint 能被生产 loader
-严格回读，并通过固定的 Ser/总体测试门槛。任何门槛失败都会停止后续生成。
+任何非 expert tensor 改变都直接失败。保存后的 checkpoint 必须由生产 loader
+严格回读，并通过固定的 validation、Ser、macro-AUC、总体
+precision/recall/FPR 和无 `p` 假阳性门槛；失败时只保留 `.candidate.pt`
+诊断文件，后续生成自动停止。阈值类晋级指标使用与生产生成完全相同的
+`sigmoid(logit / 0.5) > 0.6`；随后旧的全套 evaluator 另行输出固定报告口径。
 
 ## 冻结与重跑范围
 
@@ -59,8 +72,14 @@ experts.15.bias
 1SFI  3AV9  3P8F  3WNE  3ZGC  4K1E  4KEL
 ```
 
-这 7 条已接受设计均不含小写 `s`，而且 Ser-only checkpoint 修改不会改变
-它们使用的任何专家。它们不会重新生成，也不会重新交结构。
+这 7 条已接受设计均不含小写 `s`。它们不会重新生成，也不会重新交结构；
+新 checkpoint 训练完成后先运行一次零成本 bridge，用最终专家模块统一
+重评分，但绝不覆盖这 7 条已经接受的序列或甲基位点；若最终模型不同意旧
+注释，bridge 会把不一致写入溯源，而不是静默换成另一个化合物。HighFold
+使用的天然化序列没有变化，所以既有 PDB 和结构门结果原样复用。
+这 7 条的候选来源必须如实记为“pre-QC generation, audited by the final
+checkpoint”，不能写成由新 checkpoint 重新采样；最终报告和后续生成只保留
+一个生产 checkpoint。
 
 仅重跑 10 个当前未通过结构门的靶点：
 
@@ -71,8 +90,14 @@ experts.15.bias
 
 固定 5 个 seed，共生成 11,500 条原始候选；按未改动的 base likelihood、
 纠正后的甲基位点置信度、跨 seed 稳定性和序列多样性，最多选 150 个结构
-任务。若本地还保留先前的 `methylated_new_candidates.csv`，完全相同的
-`target + design_seq` 会被排除，不重复交付。
+任务。旧 4,115 条和先前 1,333 条 `methylated_new_candidates.csv` 都作为
+强制输入执行两层硬去重：`target + design_seq` 精确重复、以及
+`target + naturalized_seq` 天然化重复均不允许进入新候选池或交接表。
+1,333 条文件缺失或行数不是 1,333 时，流程会在训练前停止，不能靠
+“新模型应该不会重复”来猜。
+
+生成时小写 token 只记录最终甲基化注释；后续自回归步骤只接收其天然母体，
+从而与训练时的无标签泄漏输入完全一致。
 
 旧 T=0.5 结构失败不能归因于这个 Ser 标签问题；本次修复只解释并纠正
 新批次异常集中的 `s` 输出。结构结果仍须重新计算后才能判断是否通过。
@@ -93,8 +118,8 @@ powershell -ExecutionPolicy Bypass -File .\run_serine_qc_recovery.ps1 `
   -Python "E:\path\to\wain\python.exe"
 ```
 
-若旧的 1,333 条交接表不在默认输出目录，可显式传入，完全相同的序列会被
-排除：
+旧的 1,333 条交接表是强制证据。默认路径不存在时必须显式传入；精确序列
+和天然化序列重复都会被排除：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\run_serine_qc_recovery.ps1 `
@@ -119,9 +144,11 @@ bash run_serine_qc_recovery.sh --python python
 一键脚本依次执行：
 
 1. 从固定旧提交和 751 个 PDB 重建 train/test 标签；
-2. 只重训 canonical Ser expert 并执行隔离质量门；
-3. 只为 10 个失败靶点生成新 T=0.5 候选；
-4. 生成给尚哥的结构任务表。
+2. 重训 canonical 全部 20 个 expert heads 并执行隔离质量门；
+3. 用唯一的新 checkpoint 完成 151 条独立 test 的全套旧口径指标；
+4. 对已通过的 7 个靶点做最终模型 bridge，复用既有结构；
+5. 只为 10 个失败靶点生成新 T=0.5 候选；
+6. 生成给尚哥的新结构任务表。
 
 交付文件：
 
@@ -129,6 +156,8 @@ bash run_serine_qc_recovery.sh --python python
 paper_clean_v28_outputs/serine_qc_retrain/handoff/structure_tasks_for_shangge.csv
 paper_clean_v28_outputs/serine_qc_retrain/handoff/structure_tasks_for_shangge.fasta
 paper_clean_v28_outputs/serine_qc_retrain/handoff/selection_manifest.json
+paper_clean_v28_outputs/serine_qc_retrain/model/frankenstein_v28_expert_heads_qc.pt
+paper_clean_v28_outputs/serine_qc_retrain/bridge/frozen_target_final_model_bridge.csv
 ```
 
 本流程强制 `STRUCTURE_FIRST_THEN_PERMEABILITY`。结构返回前不会生成

@@ -2,14 +2,19 @@
 # -*- coding: utf-8 -*-
 """Generate the fixed T=0.5 multiseed rerun.
 
-The sampler deliberately follows the historical V28 generation rule from
-``DCarchimonde/ProteinMPNN:nmethyl/generate_100_seqs_robust.py``:
+The sampler preserves the historical V28 base/expert decision rule from
+``DCarchimonde/ProteinMPNN:nmethyl/generate_100_seqs_robust.py`` while fixing
+one train/inference mismatch:
 
 1. randomly permute the designed peptide positions for every draw;
 2. sample the natural amino acid from the base head at the fixed temperature;
 3. query the sampled amino-acid expert at that same temperature;
 4. emit the lowercase N-methyl token when the expert probability is strictly
    greater than the frozen methylation threshold.
+
+The emitted lowercase annotation is stored separately from the autoregressive
+model context.  Only the sampled natural parent residue is fed into subsequent
+decoder steps, exactly matching the leakage-free expert-head training input.
 
 This version adds reproducible seeds, strict clean-V28 checkpoint loading,
 target-wise sampling budgets, complete provenance, exact old-pool exclusion,
@@ -32,7 +37,7 @@ import random
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, MutableMapping, Sequence, Tuple
 
 
 SCRIPT_PATH = Path(__file__).resolve()
@@ -52,6 +57,7 @@ DEFAULT_OLD = (
     / "generated_fasta_clean_auto_single"
     / "all_designs.csv"
 )
+EXPECTED_PRIOR_HANDOFF_ROWS = 1_333
 DEFAULT_OUT = (
     REPO_ROOT
     / "paper_clean_v28_outputs"
@@ -295,14 +301,40 @@ def prepare_target_records(
     return prepared, manifest
 
 
-def old_design_keys(path: Path) -> set[Tuple[str, str]]:
-    keys: set[Tuple[str, str]] = set()
+def old_design_keys(
+    path: Path,
+) -> Tuple[set[Tuple[str, str]], set[Tuple[str, str]]]:
+    exact_keys: set[Tuple[str, str]] = set()
+    natural_keys: set[Tuple[str, str]] = set()
     for row in read_csv(path):
         target = str(row.get("target_name", "")).strip().upper()
         sequence = str(row.get("design_seq", "")).strip()
         if target and sequence:
-            keys.add((target, sequence))
-    return keys
+            exact_keys.add((target, sequence))
+            natural_keys.add((target, naturalize(sequence)))
+    return exact_keys, natural_keys
+
+
+def validate_prior_handoff(
+    path: Path,
+) -> Tuple[List[Dict[str, str]], set[Tuple[str, str]], set[Tuple[str, str]]]:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    rows = read_csv(path)
+    if len(rows) != EXPECTED_PRIOR_HANDOFF_ROWS:
+        raise RuntimeError(
+            "Prior handoff row count changed: expected "
+            f"{EXPECTED_PRIOR_HANDOFF_ROWS}, observed {len(rows)}"
+        )
+    for row_number, row in enumerate(rows, start=2):
+        if not str(row.get("target_name", "")).strip() or not str(
+            row.get("design_seq", "")
+        ).strip():
+            raise RuntimeError(
+                f"Prior handoff has an empty target_name or design_seq at CSV row {row_number}"
+            )
+    exact_keys, natural_keys = old_design_keys(path)
+    return rows, exact_keys, natural_keys
 
 
 def ensure_output_scope(out_dir: Path, overwrite: bool) -> None:
@@ -348,7 +380,8 @@ def generate_batch(
 ) -> List[Dict[str, Any]]:
     X, S_true, mask, chain_M, residue_idx, chain_encoding_all = features[:6]
     X = repeat_batch(X, batch_size)
-    S_pred = repeat_batch(S_true, batch_size).clone()
+    S_context = repeat_batch(S_true, batch_size).clone()
+    S_output = S_context.clone()
     mask = repeat_batch(mask, batch_size)
     chain_M = repeat_batch(chain_M, batch_size)
     residue_idx = repeat_batch(residue_idx, batch_size)
@@ -360,7 +393,14 @@ def generate_batch(
     if masked_positions.numel() == 0:
         raise ValueError("The prepared record has no designed peptide positions")
 
-    S_pred[:, masked_positions] = x_index
+    # The model trunk never receives a methyl token. Naturalize any unusual
+    # receptor-side annotation too, then keep emitted annotations in a separate
+    # tensor used only for output serialization.
+    for natural_index, methyl_index in natural_to_methyl.items():
+        S_context[S_context == int(methyl_index)] = int(natural_index)
+    S_output.copy_(S_context)
+    S_context[:, masked_positions] = x_index
+    S_output[:, masked_positions] = x_index
     orders = torch_module.stack(
         [masked_positions[torch_module.randperm(masked_positions.numel(), device=X.device)] for _ in range(batch_size)],
         dim=0,
@@ -381,7 +421,7 @@ def generate_batch(
         for step in range(peptide_length):
             positions = orders[:, step]
             logits_base, logits_experts = model(
-                X, S_pred, mask, chain_M, residue_idx, chain_encoding_all
+                X, S_context, mask, chain_M, residue_idx, chain_encoding_all
             )
             current_logits = logits_base[row_indices, positions]
             scaled_log_probs = functional.log_softmax(current_logits / temperature, dim=-1)
@@ -404,7 +444,8 @@ def generate_batch(
                     torch_module.full_like(final_token, int(methyl_index)),
                     final_token,
                 )
-            S_pred[row_indices, positions] = final_token
+            S_context[row_indices, positions] = sampled_base
+            S_output[row_indices, positions] = final_token
 
             relative_positions = torch_module.tensor(
                 [position_to_relative[int(value)] for value in positions.detach().cpu().tolist()],
@@ -420,7 +461,7 @@ def generate_batch(
             methyl_probability[row_indices, relative_positions] = current_methyl_probability
 
     results: List[Dict[str, Any]] = []
-    peptide_tokens = S_pred[:, masked_positions].detach().cpu().tolist()
+    peptide_tokens = S_output[:, masked_positions].detach().cpu().tolist()
     base_lp = base_log_prob.detach().cpu().tolist()
     sampled_lp = sampled_log_prob.detach().cpu().tolist()
     methyl_p = methyl_probability.detach().cpu().tolist()
@@ -488,8 +529,19 @@ def write_seed_fasta(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
 
 
 def aggregate_unique_candidates(
-    rows: Sequence[Mapping[str, Any]], old_keys: set[Tuple[str, str]]
+    rows: Sequence[Mapping[str, Any]],
+    old_exact_keys: set[Tuple[str, str]],
+    old_natural_keys: set[Tuple[str, str]] | None = None,
+    prior_exact_keys: set[Tuple[str, str]] | None = None,
+    prior_natural_keys: set[Tuple[str, str]] | None = None,
 ) -> List[Dict[str, Any]]:
+    old_natural_keys = old_natural_keys or {
+        (target, naturalize(sequence)) for target, sequence in old_exact_keys
+    }
+    prior_exact_keys = prior_exact_keys or set()
+    prior_natural_keys = prior_natural_keys or {
+        (target, naturalize(sequence)) for target, sequence in prior_exact_keys
+    }
     grouped: MutableMapping[Tuple[str, str], List[Mapping[str, Any]]] = defaultdict(list)
     for row in rows:
         grouped[(str(row["target_name"]), str(row["design_seq"]))].append(row)
@@ -509,10 +561,23 @@ def aggregate_unique_candidates(
         row["seeds_observed"] = ";".join(
             str(value) for value in sorted({int(item["seed"]) for item in occurrences})
         )
-        row["seen_in_historical_4115"] = int((target, sequence) in old_keys)
+        exact_seen = (target, sequence) in old_exact_keys
+        natural_seen = (target, naturalize(sequence)) in old_natural_keys
+        prior_exact_seen = (target, sequence) in prior_exact_keys
+        prior_natural_seen = (target, naturalize(sequence)) in prior_natural_keys
+        row["seen_in_historical_4115_exact"] = int(exact_seen)
+        row["seen_in_historical_4115_naturalized"] = int(natural_seen)
+        row["seen_in_historical_4115"] = int(exact_seen or natural_seen)
+        row["seen_in_prior_1333_exact"] = int(prior_exact_seen)
+        row["seen_in_prior_1333_naturalized"] = int(prior_natural_seen)
+        row["seen_in_prior_1333"] = int(prior_exact_seen or prior_natural_seen)
         row["passes_methylation_hard_gate"] = int(int(row["design_methyl_count"]) > 0)
         row["eligible_for_new_permeability_screen"] = int(
-            int(row["design_methyl_count"]) > 0 and (target, sequence) not in old_keys
+            int(row["design_methyl_count"]) > 0
+            and not exact_seen
+            and not natural_seen
+            and not prior_exact_seen
+            and not prior_natural_seen
         )
         result.append(row)
     return result
@@ -623,10 +688,19 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
     native_path = Path(args.native_jsonl).resolve()
     best_path = Path(args.best_csv).resolve()
     old_path = Path(args.old_designs_csv).resolve()
+    prior_path = (
+        Path(args.prior_designs_csv).resolve() if args.prior_designs_csv else None
+    )
     out_dir = Path(args.out_dir).resolve()
     for required in (model_path, native_path, best_path, old_path):
         if not required.is_file():
             raise FileNotFoundError(required)
+    if "all_expert_qc" in str(plan.get("protocol", "")):
+        if prior_path is None or not prior_path.is_file():
+            raise FileNotFoundError(
+                "This recovery protocol requires the prior 1,333-row handoff CSV "
+                "for hard duplicate exclusion"
+            )
     ensure_output_scope(out_dir, args.overwrite)
     if args.defer_permeability_until_structure and args.overwrite:
         # ``--overwrite`` is an explicit request to replace this isolated run.
@@ -662,7 +736,13 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
         native_rows, selected_chains, validated["target_names"]
     )
     all_native = native_manifest_all_targets(native_rows, selected_chains)
-    old_keys = old_design_keys(old_path)
+    old_exact_keys, old_natural_keys = old_design_keys(old_path)
+    if prior_path is not None:
+        prior_rows, prior_exact_keys, prior_natural_keys = validate_prior_handoff(
+            prior_path
+        )
+    else:
+        prior_rows, prior_exact_keys, prior_natural_keys = [], set(), set()
     plan_by_target = {
         str(item["target_name"]).upper(): dict(item) for item in validated["targets"]
     }
@@ -779,7 +859,13 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
             seed_rows,
         )
 
-    unique_rows = aggregate_unique_candidates(raw_rows, old_keys)
+    unique_rows = aggregate_unique_candidates(
+        raw_rows,
+        old_exact_keys,
+        old_natural_keys,
+        prior_exact_keys,
+        prior_natural_keys,
+    )
     eligible_rows = [row for row in unique_rows if int(row["eligible_for_new_permeability_screen"])]
     permeability_input: List[Dict[str, Any]] = []
     permeability_manifest: List[Dict[str, Any]] = []
@@ -802,6 +888,11 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
         "occurrence_count",
         "seeds_observed",
         "seen_in_historical_4115",
+        "seen_in_historical_4115_exact",
+        "seen_in_historical_4115_naturalized",
+        "seen_in_prior_1333",
+        "seen_in_prior_1333_exact",
+        "seen_in_prior_1333_naturalized",
         "passes_methylation_hard_gate",
         "eligible_for_new_permeability_screen",
         "permeability_id",
@@ -856,8 +947,11 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
                 "unique_methylated": sum(
                     int(row["passes_methylation_hard_gate"]) for row in target_unique
                 ),
-                "historical_exact_hits": sum(
+                "historical_4115_hits": sum(
                     int(row["seen_in_historical_4115"]) for row in target_unique
+                ),
+                "prior_1333_hits": sum(
+                    int(row["seen_in_prior_1333"]) for row in target_unique
                 ),
                 "new_methylated_for_permeability": len(target_eligible),
                 "planned_structure_quota": int(target_plan["structure_quota"]),
@@ -888,7 +982,12 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
         "native_jsonl": str(native_path),
         "best_csv": str(best_path),
         "historical_design_csv": str(old_path),
-        "historical_design_keys": len(old_keys),
+        "historical_exact_design_keys": len(old_exact_keys),
+        "historical_naturalized_design_keys": len(old_natural_keys),
+        "prior_handoff_csv": str(prior_path) if prior_path is not None else None,
+        "prior_handoff_rows": len(prior_rows),
+        "prior_handoff_exact_design_keys": len(prior_exact_keys),
+        "prior_handoff_naturalized_design_keys": len(prior_natural_keys),
         "raw_candidates_expected": int(validated["expected_raw_candidates"]),
         "raw_candidates_generated": len(raw_rows),
         "unique_candidates": len(unique_rows),
@@ -916,7 +1015,11 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
         "frozen_targets_not_regenerated": plan["frozen_targets"],
         "sampler_definition": (
             "random peptide-position order; natural base sampled at T=0.5; "
-            "sampled-base expert sigmoid(logit/T)>0.6 emits lowercase methyl token"
+            "sampled-base expert sigmoid(logit/T)>0.6 emits lowercase methyl token; "
+            "only the natural parent is fed back into later decoder steps"
+        ),
+        "autoregressive_input_policy": (
+            "natural-only model context; lowercase expert annotations are output-only"
         ),
         "permeability_definition_pending": (
             "candidate prediction must be strictly greater than the same-model native-peptide prediction"
@@ -942,6 +1045,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--native_jsonl", default=str(DEFAULT_NATIVE))
     parser.add_argument("--best_csv", default=str(DEFAULT_BEST))
     parser.add_argument("--old_designs_csv", default=str(DEFAULT_OLD))
+    parser.add_argument("--prior_designs_csv")
     parser.add_argument("--out_dir", default=str(DEFAULT_OUT))
     parser.add_argument("--seeds", type=int, nargs="*")
     parser.add_argument("--batch_size", type=int, default=16)
@@ -949,6 +1053,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-cpu", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument("--validate-prior-designs-only", action="store_true")
     parser.add_argument(
         "--defer-permeability-until-structure",
         action="store_true",
@@ -966,6 +1071,25 @@ def main() -> None:
         raise ValueError("--batch_size must be positive")
     plan = read_json(Path(args.plan).resolve())
     validated = validate_plan(plan, args.seeds)
+    if args.validate_prior_designs_only:
+        if not args.prior_designs_csv:
+            raise ValueError("--prior_designs_csv is required for prior-only validation")
+        rows, exact_keys, natural_keys = validate_prior_handoff(
+            Path(args.prior_designs_csv).resolve()
+        )
+        print(
+            json.dumps(
+                {
+                    "quality_gate": "PASS",
+                    "rows": len(rows),
+                    "exact_target_sequence_keys": len(exact_keys),
+                    "naturalized_target_sequence_keys": len(natural_keys),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
     if args.plan_only:
         print(
             json.dumps(
