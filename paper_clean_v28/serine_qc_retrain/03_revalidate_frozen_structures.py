@@ -38,6 +38,7 @@ from nmethyl.utils.nmethyl_config import (  # noqa: E402
 )
 from paper_clean_v28.clean_v28_common import (  # noqa: E402
     NAT_TO_METHYL_ABS,
+    cyclic_known_sequence_methyl_probabilities,
     featurize_records,
     load_v28_model,
     naturalize_tensor_for_input,
@@ -49,12 +50,17 @@ DEFAULT_PLAN = SCRIPT_PATH.with_name("target_plan_structure_failures.json")
 DEFAULT_MODEL = (
     REPO_ROOT
     / "paper_clean_v28_outputs"
-    / "serine_qc_retrain"
+    / "serine_qc_order_balanced_v3"
     / "model"
     / "frankenstein_v28_expert_heads_qc.pt"
 )
 DEFAULT_NATIVE = REPO_ROOT / "17_complexes_native.jsonl"
-DEFAULT_OUT = REPO_ROOT / "paper_clean_v28_outputs" / "serine_qc_retrain" / "bridge"
+DEFAULT_OUT = (
+    REPO_ROOT / "paper_clean_v28_outputs" / "serine_qc_order_balanced_v3" / "bridge"
+)
+REQUIRED_ORDER_BALANCED_EXPERT_PROTOCOL = (
+    "canonical_clean_v28_all_expert_heads_corrected_labels_order_balanced_v3"
+)
 
 
 def file_sha256(path: Path) -> str:
@@ -162,8 +168,32 @@ def score_one(
     )
     S_forward = naturalize_tensor_for_input(S_label)
     with torch.no_grad():
-        base_logits, expert_logits = model(
+        base_logits, _expert_logits = model(
             X, S_forward, mask, chain_M, residue_idx, chain_encoding_all
+        )
+        raw_probability_full, raw_order_std_full = (
+            cyclic_known_sequence_methyl_probabilities(
+                model,
+                X,
+                S_forward,
+                mask,
+                chain_M,
+                residue_idx,
+                chain_encoding_all,
+                temperature=1.0,
+            )
+        )
+        scaled_probability_full, scaled_order_std_full = (
+            cyclic_known_sequence_methyl_probabilities(
+                model,
+                X,
+                S_forward,
+                mask,
+                chain_M,
+                residue_idx,
+                chain_encoding_all,
+                temperature=temperature,
+            )
         )
     positions = torch.where(valid[0])[0]
     if int(positions.numel()) != len(design_natural):
@@ -172,11 +202,10 @@ def score_one(
             f"{int(positions.numel())} != {len(design_natural)}"
         )
     base_indices = S_forward[0, positions]
-    expert_values = expert_logits[0, positions].gather(
-        1, base_indices.unsqueeze(-1)
-    ).squeeze(-1)
-    raw_probabilities = torch.sigmoid(expert_values)
-    scaled_probabilities = torch.sigmoid(expert_values / temperature)
+    raw_probabilities = raw_probability_full[0, positions]
+    scaled_probabilities = scaled_probability_full[0, positions]
+    raw_order_std = raw_order_std_full[0, positions]
+    scaled_order_std = scaled_order_std_full[0, positions]
     base_log_probabilities = F.log_softmax(base_logits[0, positions], dim=-1).gather(
         1, base_indices.unsqueeze(-1)
     ).squeeze(-1)
@@ -230,6 +259,14 @@ def score_one(
         "expert_probabilities_temperature_scaled": json.dumps(
             [round(float(value), 8) for value in scaled_probabilities.detach().cpu().tolist()]
         ),
+        "expert_probability_order_std_raw": json.dumps(
+            [round(float(value), 8) for value in raw_order_std.detach().cpu().tolist()]
+        ),
+        "expert_probability_order_std_temperature_scaled": json.dumps(
+            [round(float(value), 8) for value in scaled_order_std.detach().cpu().tolist()]
+        ),
+        "annotation_mode": "cyclic_order_ensemble_known_natural_sequence",
+        "annotation_order_ensemble_size": int(positions.numel()),
         "base_log_probability_mean": float(base_log_probabilities.mean().item()),
         "global_complex_ca_rmsd": float(evidence["global_rmsd"]),
         "cyclic_peptide_ca_rmsd": float(evidence["cyclic_rmsd"]),
@@ -271,6 +308,24 @@ def main() -> None:
     for required in (model_path, plan_path, native_path):
         if not required.is_file():
             raise FileNotFoundError(required)
+    checkpoint = torch.load(model_path, map_location="cpu")
+    metadata = (
+        dict(checkpoint.get("expert_head_qc_metadata", {}))
+        if isinstance(checkpoint, Mapping)
+        else {}
+    )
+    if not (
+        str(metadata.get("protocol", "")) == REQUIRED_ORDER_BALANCED_EXPERT_PROTOCOL
+        and int(metadata.get("minimum_order_coverage_epochs", 0)) >= 30
+        and str(metadata.get("training_decoding_order_policy", ""))
+        == "epoch_indexed_cyclic_designed_position_rotation"
+        and str(metadata.get("deployment_annotation_policy", ""))
+        == "complete_natural_sequence_all_cyclic_rotations_probability_mean"
+    ):
+        raise RuntimeError(
+            "Frozen-target bridge requires the order-balanced v3 expert checkpoint"
+        )
+    del checkpoint
     if not torch.cuda.is_available() and not args.allow_cpu:
         raise RuntimeError("CUDA is required unless --allow-cpu is explicit")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -321,7 +376,8 @@ def main() -> None:
     atomic_write_csv(out_dir / "frozen_target_final_model_bridge.csv", rows, list(rows[0]))
     manifest = {
         "quality_gate": quality_gate,
-        "protocol": "final_expert_checkpoint_frozen_structure_bridge_v1",
+        "protocol": "final_order_balanced_expert_checkpoint_frozen_structure_bridge_v2",
+        "model_expert_qc_protocol": metadata.get("protocol"),
         "model_path": str(model_path),
         "model_sha256": file_sha256(model_path),
         "plan_path": str(plan_path),

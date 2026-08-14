@@ -1,8 +1,9 @@
-# Ser 来源质控后的完整专家头恢复流程
+# Ser 来源质控 + 解码顺序平衡恢复流程（v3）
 
 本目录修复一个有明确 PDB 来源证据的标签问题，重新训练生产网络中的
-完整专家模块，并把昂贵的结构补跑限制在当前 T=0.5 结构门未通过的
-复合物。最终只产出一个新的完整 checkpoint；它不重新训练共享主干。
+完整专家模块，并修复训练、生成和最终甲基位点注释之间的解码顺序不一致。
+昂贵的结构补跑仍限制在当前 T=0.5 结构门未通过的复合物。最终只产出一个
+新的完整 checkpoint；共享主干和天然氨基酸 base head 仍逐字节冻结。
 
 ## 已确认的问题
 
@@ -32,6 +33,29 @@
 训练和测试 JSONL 的语义哈希、行数、标签变化类型及上述计数均为硬门槛。
 坐标和所有非序列字段保持不变。
 
+## 新确认的点位问题
+
+S 来源修复和点位异常是两个独立问题。旧 V28 训练在训练态使用随机解码顺序；
+此前的 Ser-QC 重训为了关闭 dropout 把模型保持在 `eval()`，却没有显式传入
+解码顺序，因此专家头只见过固定顺序。生成端又随机选择下一个肽位点，但
+模型内部仍使用固定因果掩码。外层采样顺序、模型可见上下文和专家头训练
+上下文三者不一致。
+
+这个错误在去掉小写 token 回灌后不再被旧泄漏掩盖，表现为新 872 条中
+873 个甲基位点有 833 个落在第 7 位（95.42%），并且 11,500 条原始生成中
+有 1,052 个重复天然序列组，其中 208 组得到不同甲基标注。该 872 条结果
+因此明确撤回，不能交结构；不能通过删除第 7 位或重排表格补救。
+
+v3 的闭环是：
+
+- 专家头训练使用 epoch-indexed 循环解码顺序；至少 30 个 epoch，覆盖冻结的
+  30-residue 肽长度上限内每一个相对解码深度；
+- 天然序列采样的外层随机顺序被原样传入模型因果掩码；
+- 完整天然序列生成后，用所有循环移位做确定性专家概率集成，每个位点恰好
+  在每个相对深度出现一次；
+- 同一 `target + naturalized sequence` 必须得到同一标注和同一概率；
+- 全局或单靶点的点位、残基、采样步异常集中会直接阻断交付。
+
 ## 训练边界：完整专家模块，而不是只改 Ser
 
 `02_retrain_canonical_expert_heads.py` 使用生产推理相同的完整 clean-V28
@@ -43,6 +67,9 @@ ProteinMPNN 主干、序列 embedding、decoder 和天然氨基酸 base head 全
 原来的 151 条 test 不参与 epoch 选择或 early stopping，只在最终 checkpoint
 确定后用于质量门和固定报告，不把结果反馈给训练。每个 forward 前，所有
 小写甲基标签都转换成天然母体作为模型输入，避免答案通过 `W_s` 泄漏。
+训练 forward 显式使用循环解码顺序；前 30 个 epoch 完成顺序覆盖之前，不允许
+选择 checkpoint 或 early stop。validation、独立 test 和生产注释均使用同一
+完整天然序列循环顺序集成口径。
 
 19 个有正负训练支持的专家使用各自的 class weight；Pro 没有 `p` 正样本，
 其专家只学习天然 P 的负类 veto，且生成器仍没有 `P -> p` 映射。
@@ -58,8 +85,9 @@ experts.19.weight / experts.19.bias
 任何非 expert tensor 改变都直接失败。保存后的 checkpoint 必须由生产 loader
 严格回读，并通过固定的 validation、Ser、macro-AUC、总体
 precision/recall/FPR 和无 `p` 假阳性门槛；失败时只保留 `.candidate.pt`
-诊断文件，后续生成自动停止。阈值类晋级指标使用与生产生成完全相同的
-`sigmoid(logit / 0.5) > 0.6`；随后旧的全套 evaluator 另行输出固定报告口径。
+诊断文件，后续生成自动停止。阈值类晋级指标使用与生产生成完全相同的口径：
+对每个循环解码顺序计算 `sigmoid(logit / 0.5)`，取确定性均值后执行严格
+`> 0.6`。旧的固定顺序 evaluator 不再作为 v3 checkpoint 的晋级证据。
 
 ## 冻结与重跑范围
 
@@ -97,10 +125,12 @@ checkpoint”，不能写成由新 checkpoint 重新采样；最终报告和后�
 “新模型应该不会重复”来猜。
 
 生成时小写 token 只记录最终甲基化注释；后续自回归步骤只接收其天然母体，
-从而与训练时的无标签泄漏输入完全一致。
+外层随机生成顺序同时传给模型因果掩码。天然序列完成后才进行循环顺序集成
+复评；生成路径上的临时专家概率只留作审计，不决定最终小写位点。
 
-旧 T=0.5 结构失败不能归因于这个 Ser 标签问题；本次修复只解释并纠正
-新批次异常集中的 `s` 输出。结构结果仍须重新计算后才能判断是否通过。
+旧 T=0.5 结构失败不能归因于 Ser 标签或解码顺序问题。新序列仍须重新生成、
+通过结果审计并重新计算结构，才能判断是否通过；现有 872 条不能复用或仅
+重新标注，因为它们的天然序列本身也是在不一致因果掩码下采样的。
 
 ## 一键运行
 
@@ -139,26 +169,41 @@ bash run_serine_qc_recovery.sh --python python
 输出目录若已有部分生成结果，脚本会停止；确认要重跑同一隔离目录时传
 `-Force` 或 `--force`。
 
+默认运行**不会**创建给尚哥的交接包。自动门通过后只生成：
+
+```text
+paper_clean_v28_outputs/serine_qc_order_balanced_v3/
+  serine_qc_order_balanced_v3_review_bundle.zip
+```
+
+必须把该 review bundle 做第三遍人工科学复核；只有明确放行后，才可再次传
+`-ReleaseHandoff`（Linux 为 `--release-handoff`）。不能为了提前拿到 CSV
+绕过这一停点。
+
 ## 输出与真实先后顺序
 
 一键脚本依次执行：
 
 1. 从固定旧提交和 751 个 PDB 重建 train/test 标签；
-2. 重训 canonical 全部 20 个 expert heads 并执行隔离质量门；
-3. 用唯一的新 checkpoint 完成 151 条独立 test 的全套旧口径指标；
-4. 对已通过的 7 个靶点做最终模型 bridge，复用既有结构；
-5. 只为 10 个失败靶点生成新 T=0.5 候选；
-6. 生成给尚哥的新结构任务表。
+2. 用顺序平衡协议重训 canonical 全部 20 个 expert heads；
+3. 用循环顺序集成完成 validation 和 151 条独立 test 晋级门；
+4. 对已通过的 7 个靶点做同口径 bridge，复用既有结构；
+5. 只为 10 个失败靶点生成 11,500 条新 T=0.5 原始候选；
+6. 生成器内执行第一轮结果门；
+7. `04_triple_audit_generation.py` 独立重算完整性、结果分布和去重/配额三遍审计；
+8. 停在人工复核，不自动生成给尚哥的表。
 
-交付文件：
+人工复核文件：
 
 ```text
-paper_clean_v28_outputs/serine_qc_retrain/handoff/structure_tasks_for_shangge.csv
-paper_clean_v28_outputs/serine_qc_retrain/handoff/structure_tasks_for_shangge.fasta
-paper_clean_v28_outputs/serine_qc_retrain/handoff/selection_manifest.json
-paper_clean_v28_outputs/serine_qc_retrain/model/frankenstein_v28_expert_heads_qc.pt
-paper_clean_v28_outputs/serine_qc_retrain/bridge/frozen_target_final_model_bridge.csv
+paper_clean_v28_outputs/serine_qc_order_balanced_v3/serine_qc_order_balanced_v3_review_bundle.zip
+paper_clean_v28_outputs/serine_qc_order_balanced_v3/model/expert_heads_retrain_manifest.json
+paper_clean_v28_outputs/serine_qc_order_balanced_v3/generation/generation_manifest.json
+paper_clean_v28_outputs/serine_qc_order_balanced_v3/triple_audit/three_pass_generation_audit.json
 ```
+
+最终条数由重跑和审计决定，不预设为 872，也不为了凑数降低阈值或删除异常
+位点。只有人工复核放行后才会在 `handoff/` 下生成简化结构任务表。
 
 本流程强制 `STRUCTURE_FIRST_THEN_PERMEABILITY`。结构返回前不会生成
 `permeability_input.csv`，也不会运行透膜模型。透膜性只能在返回结构通过

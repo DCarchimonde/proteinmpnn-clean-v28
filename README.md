@@ -20,7 +20,7 @@ paper_clean_v28_outputs/generated_fasta_clean_auto_single/all_designs.csv
 paper_clean_v28_outputs/af3_manifest.csv
 ```
 
-## 当前恢复流程：Ser 来源质控、结构先行
+## 当前恢复流程：Ser 来源质控、解码顺序平衡、结构先行
 
 当前应运行：
 
@@ -29,9 +29,11 @@ powershell -ExecutionPolicy Bypass -File .\run_serine_qc_recovery.ps1
 ```
 
 该流程从固定旧提交的原始 PDB 重建 Ser 标签，冻结共享主干和 base head、
-重训 canonical V28 的完整 20-expert 模块；7 个已过结构门的 T=0.5 靶点
-仅用最终 checkpoint 重评分并复用结构，只为 10 个未通过靶点生成新任务，
-并在结构返回前禁止生成透膜输入。完整证据、门槛和输出说明见：
+用循环顺序平衡协议重训 canonical V28 的完整 20-expert 模块；7 个已过
+结构门的 T=0.5 靶点仅用最终 checkpoint 重评分并复用结构，只为 10 个
+未通过靶点重新生成。生成后执行独立三遍结果审计，并默认停在人工复核，
+不会自动创建给尚哥的包；结构返回前也禁止生成透膜输入。完整证据、门槛
+和输出说明见：
 
 ```text
 paper_clean_v28/serine_qc_retrain/README.md

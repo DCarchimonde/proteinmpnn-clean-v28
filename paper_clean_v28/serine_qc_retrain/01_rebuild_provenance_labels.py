@@ -23,7 +23,9 @@ from paper_clean_v28.serine_qc_retrain.provenance import (  # noqa: E402
 )
 
 
-DEFAULT_OUT = REPO_ROOT / "paper_clean_v28_outputs" / "serine_qc_retrain" / "data"
+DEFAULT_OUT = (
+    REPO_ROOT / "paper_clean_v28_outputs" / "serine_qc_order_balanced_v3" / "data"
+)
 
 
 def parse_args() -> argparse.Namespace:

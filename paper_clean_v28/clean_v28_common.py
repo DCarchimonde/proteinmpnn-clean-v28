@@ -54,6 +54,192 @@ for m_abs, n_idx in METHYL_ABS_TO_NAT.items():
     NAT_TO_METHYL_ABS.setdefault(int(n_idx), int(m_abs))
 
 
+def complete_decoding_order(
+    chain_M: torch.Tensor,
+    mask: torch.Tensor,
+    selected_orders: Any,
+) -> torch.Tensor:
+    """Build a full decoder permutation from one order per designed chain.
+
+    Receptor and padding positions are always placed before designed peptide
+    positions so their known sequence remains visible.  ``selected_orders`` may
+    be a rank-2 tensor when every row has the same peptide length, or a sequence
+    of rank-1 tensors for variable-length training batches.
+    """
+
+    if chain_M.ndim != 2 or mask.ndim != 2 or chain_M.shape != mask.shape:
+        raise ValueError("chain_M and mask must be same-shaped rank-2 tensors")
+    if torch.is_tensor(selected_orders):
+        if selected_orders.ndim != 2 or selected_orders.shape[0] != chain_M.shape[0]:
+            raise ValueError("selected_orders tensor has an incompatible shape")
+        order_rows = [selected_orders[index] for index in range(chain_M.shape[0])]
+    else:
+        order_rows = list(selected_orders)
+        if len(order_rows) != chain_M.shape[0]:
+            raise ValueError("selected_orders row count does not match chain_M")
+
+    selected_mask = (chain_M * mask) > 0.0
+    full_orders: List[torch.Tensor] = []
+    for row_index, requested in enumerate(order_rows):
+        expected_selected = torch.nonzero(
+            selected_mask[row_index], as_tuple=False
+        ).squeeze(-1)
+        requested = requested.to(device=chain_M.device, dtype=torch.long).reshape(-1)
+        if requested.numel() != expected_selected.numel() or not torch.equal(
+            torch.sort(requested).values,
+            expected_selected,
+        ):
+            raise ValueError(
+                f"Selected decoding order is not the designed-position permutation "
+                f"for batch row {row_index}"
+            )
+        prefix = torch.nonzero(
+            ~selected_mask[row_index], as_tuple=False
+        ).squeeze(-1)
+        full = torch.cat([prefix, requested], dim=0)
+        expected_full = torch.arange(
+            chain_M.shape[1], device=chain_M.device, dtype=torch.long
+        )
+        if full.numel() != expected_full.numel() or not torch.equal(
+            torch.sort(full).values,
+            expected_full,
+        ):
+            raise RuntimeError("Constructed decoding order is not a full permutation")
+        full_orders.append(full)
+    return torch.stack(full_orders, dim=0)
+
+
+def random_designed_decoding_order(
+    chain_M: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Return one explicit random designed-position order per batch row."""
+
+    selected_mask = (chain_M * mask) > 0.0
+    requested = []
+    for row_index in range(chain_M.shape[0]):
+        positions = torch.nonzero(
+            selected_mask[row_index], as_tuple=False
+        ).squeeze(-1)
+        if positions.numel() <= 0:
+            raise ValueError(f"Batch row {row_index} has no designed positions")
+        requested.append(
+            positions[torch.randperm(positions.numel(), device=chain_M.device)]
+        )
+    return complete_decoding_order(chain_M, mask, requested)
+
+
+def cyclic_designed_decoding_order(
+    chain_M: torch.Tensor,
+    mask: torch.Tensor,
+    shift: int,
+) -> torch.Tensor:
+    """Return the requested cyclic rotation for every designed chain."""
+
+    if shift < 0:
+        raise ValueError("shift must be non-negative")
+    selected_mask = (chain_M * mask) > 0.0
+    requested = []
+    for row_index in range(chain_M.shape[0]):
+        positions = torch.nonzero(
+            selected_mask[row_index], as_tuple=False
+        ).squeeze(-1)
+        if positions.numel() <= 0:
+            raise ValueError(f"Batch row {row_index} has no designed positions")
+        requested.append(torch.roll(positions, shifts=-(shift % len(positions))))
+    return complete_decoding_order(chain_M, mask, requested)
+
+
+def cyclic_known_sequence_methyl_probabilities(
+    model: nn.Module,
+    X: torch.Tensor,
+    S_natural: torch.Tensor,
+    mask: torch.Tensor,
+    chain_M: torch.Tensor,
+    residue_idx: torch.Tensor,
+    chain_encoding_all: torch.Tensor,
+    temperature: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Score a complete natural sequence with a depth-balanced order ensemble.
+
+    For a peptide of length ``L``, all ``L`` cyclic rotations are evaluated.
+    Every site therefore appears exactly once at every relative decoder depth.
+    The returned mean is the only probability used for methyl annotation; the
+    standard deviation is an order-sensitivity diagnostic.
+    """
+
+    if temperature <= 0.0:
+        raise ValueError("temperature must be positive")
+    if S_natural.shape != chain_M.shape or mask.shape != chain_M.shape:
+        raise ValueError("S_natural, chain_M, and mask shapes must match")
+    selected_mask = (chain_M * mask) > 0.0
+    selected_rows = [
+        torch.nonzero(selected_mask[index], as_tuple=False).squeeze(-1)
+        for index in range(chain_M.shape[0])
+    ]
+    lengths = [int(value.numel()) for value in selected_rows]
+    if not lengths or min(lengths) <= 0:
+        raise ValueError("Every batch row must contain at least one designed position")
+
+    safe_base = S_natural.clone()
+    invalid_base = (safe_base < 0) | (safe_base >= N_NATURAL)
+    if bool((invalid_base & selected_mask).any()):
+        raise RuntimeError("Designed sequence contains a noncanonical natural token")
+    safe_base[invalid_base] = 0
+
+    probability_sum = torch.zeros_like(S_natural, dtype=torch.float32)
+    probability_square_sum = torch.zeros_like(S_natural, dtype=torch.float32)
+    probability_count = torch.zeros_like(S_natural, dtype=torch.float32)
+    for shift in range(max(lengths)):
+        active_rows = torch.tensor(
+            [shift < length for length in lengths],
+            device=chain_M.device,
+            dtype=torch.bool,
+        )
+        requested = [
+            torch.roll(positions, shifts=-shift) if shift < len(positions) else positions
+            for positions in selected_rows
+        ]
+        decoding_order = complete_decoding_order(
+            chain_M,
+            mask,
+            requested,
+        )
+        _base_logits, expert_logits = model(
+            X,
+            S_natural,
+            mask,
+            chain_M,
+            residue_idx,
+            chain_encoding_all,
+            decoding_order=decoding_order,
+        )
+        selected_logits = torch.gather(
+            expert_logits,
+            -1,
+            safe_base.unsqueeze(-1),
+        ).squeeze(-1)
+        probabilities = torch.sigmoid(selected_logits / temperature)
+        contribution = selected_mask & active_rows.unsqueeze(-1)
+        contribution_float = contribution.to(dtype=probabilities.dtype)
+        probability_sum += probabilities * contribution_float
+        probability_square_sum += probabilities.square() * contribution_float
+        probability_count += contribution_float
+
+    expected_count = torch.tensor(
+        lengths, device=chain_M.device, dtype=probability_count.dtype
+    ).unsqueeze(-1).expand_as(probability_count)
+    if not torch.equal(
+        probability_count[selected_mask],
+        expected_count[selected_mask],
+    ):
+        raise RuntimeError("Cyclic order ensemble did not balance decoder depth")
+    safe_count = probability_count.clamp_min(1.0)
+    mean = probability_sum / safe_count
+    variance = (probability_square_sum / safe_count - mean.square()).clamp_min(0.0)
+    return mean, torch.sqrt(variance)
+
+
 class RobustHierarchicalProteinMPNN(ProteinMPNN):
     """与 v28 / frankenstein_v28.pt 对齐的模型结构。"""
 
@@ -77,7 +263,16 @@ class RobustHierarchicalProteinMPNN(ProteinMPNN):
             nn.Linear(hidden_dim, 1) for _ in range(len(NATURAL_AA_ALPHABET))
         ])
 
-    def forward(self, X, S, mask, chain_M, residue_idx, chain_encoding_all):
+    def forward(
+        self,
+        X,
+        S,
+        mask,
+        chain_M,
+        residue_idx,
+        chain_encoding_all,
+        decoding_order=None,
+    ):
         E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all)
         h_V = torch.zeros((E.shape[0], E.shape[1], E.shape[-1]), device=E.device)
         h_E = self.W_e(E)
@@ -95,7 +290,20 @@ class RobustHierarchicalProteinMPNN(ProteinMPNN):
         h_EXV_encoder = cat_neighbors_nodes(h_V, h_EX_encoder, E_idx)
 
         chain_M = chain_M * mask
-        decoding_order = torch.argsort(chain_M + 0.0001)
+        if decoding_order is None:
+            decoding_order = torch.argsort(chain_M + 0.0001)
+        else:
+            decoding_order = decoding_order.to(device=X.device, dtype=torch.long)
+            if decoding_order.shape != chain_M.shape:
+                raise ValueError(
+                    "decoding_order shape must match chain_M: "
+                    f"{tuple(decoding_order.shape)} != {tuple(chain_M.shape)}"
+                )
+            expected = torch.arange(
+                chain_M.shape[1], device=X.device, dtype=torch.long
+            ).unsqueeze(0).expand_as(decoding_order)
+            if not torch.equal(torch.sort(decoding_order, dim=1).values, expected):
+                raise ValueError("Every decoding_order row must be a full permutation")
 
         mask_size = E_idx.shape[1]
         permutation_matrix_reverse = F.one_hot(decoding_order, num_classes=mask_size).float()

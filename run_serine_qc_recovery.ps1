@@ -6,26 +6,28 @@ param(
     [int]$Epochs = 80,
     [int]$BatchSize = 32,
     [switch]$AllowCpu,
-    [switch]$Force
+    [switch]$Force,
+    [switch]$ReleaseHandoff
 )
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $SourceCommit = "28dff152d83623dfb322480413b7dc889f8537a4"
 $SourceUrl = "https://github.com/DCarchimonde/ProteinMPNN.git"
-$OutputRoot = Join-Path $RepoRoot "paper_clean_v28_outputs\serine_qc_retrain"
+$OutputRoot = Join-Path $RepoRoot "paper_clean_v28_outputs\serine_qc_order_balanced_v3"
 $DataOut = Join-Path $OutputRoot "data"
 $ModelOut = Join-Path $OutputRoot "model"
-$TestEvalOut = Join-Path $ModelOut "full_corrected_test_eval"
 $BridgeOut = Join-Path $OutputRoot "bridge"
 $GenerationOut = Join-Path $OutputRoot "generation"
+$AuditOut = Join-Path $OutputRoot "triple_audit"
 $HandoffOut = Join-Path $OutputRoot "handoff"
+$AuditBundle = Join-Path $OutputRoot "serine_qc_order_balanced_v3_review_bundle.zip"
 $Plan = Join-Path $RepoRoot "paper_clean_v28\serine_qc_retrain\target_plan_structure_failures.json"
 $LabelBuilder = Join-Path $RepoRoot "paper_clean_v28\serine_qc_retrain\01_rebuild_provenance_labels.py"
 $Trainer = Join-Path $RepoRoot "paper_clean_v28\serine_qc_retrain\02_retrain_canonical_expert_heads.py"
-$Evaluator = Join-Path $RepoRoot "paper_clean_v28\01_eval_clean_model.py"
 $Bridge = Join-Path $RepoRoot "paper_clean_v28\serine_qc_retrain\03_revalidate_frozen_structures.py"
 $Generator = Join-Path $RepoRoot "paper_clean_v28\rerun_t05\01_generate_t05_multiseed.py"
+$Auditor = Join-Path $RepoRoot "paper_clean_v28\serine_qc_retrain\04_triple_audit_generation.py"
 $Selector = Join-Path $RepoRoot "paper_clean_v28\serine_qc_retrain\03_select_structure_first_handoff.py"
 $ParentCheckpoint = Join-Path $RepoRoot "frankenstein_v28.pt"
 $CorrectedCheckpoint = Join-Path $ModelOut "frankenstein_v28_expert_heads_qc.pt"
@@ -143,7 +145,7 @@ function Prepare-PinnedSourceRepo {
 
 $ResolvedPython = Resolve-PythonExecutable
 Write-Host "============================================================"
-Write-Host "SERINE PROVENANCE QC + COMPLETE EXPERT-HEAD RECOVERY"
+Write-Host "SERINE QC + ORDER-BALANCED EXPERT/GENERATION RECOVERY V3"
 Write-Host "Repository: $RepoRoot"
 Write-Host "Python:     $ResolvedPython"
 Write-Host "============================================================"
@@ -194,16 +196,6 @@ try {
     & $ResolvedPython @TrainArguments
     Assert-LastExitCode "Canonical all-expert-head retraining"
 
-    & $ResolvedPython $Evaluator `
-        --model_path $CorrectedCheckpoint `
-        --data_jsonl (Join-Path $DataOut "test_serine_provenance_corrected.jsonl") `
-        --mode monomer `
-        --eval_chains masked `
-        --batch_size $BatchSize `
-        --thresholds "0.3,0.4,0.5,0.6,0.7,0.8,0.9,0.95,0.98,0.99" `
-        --out_dir $TestEvalOut
-    Assert-LastExitCode "Final checkpoint full corrected-test evaluation"
-
     $BridgeArguments = @(
         $Bridge,
         "--model-path", $CorrectedCheckpoint,
@@ -228,25 +220,67 @@ try {
     else { $GenerateArguments += @("--device", "cuda") }
     if ($Force) { $GenerateArguments += "--overwrite" }
     & $ResolvedPython @GenerateArguments
-    Assert-LastExitCode "Failed-target T=0.5 generation"
+    $GenerationExitCode = $LASTEXITCODE
 
-    $SelectArguments = @(
-        $Selector,
-        "--run-dir", $GenerationOut,
-        "--plan", $Plan,
-        "--out-dir", $HandoffOut
-    )
-    $SelectArguments += @("--prior-handoff-csv", $PriorHandoff)
-    & $ResolvedPython @SelectArguments
-    Assert-LastExitCode "Structure-first shortlist"
+    $AuditExitCode = 1
+    if (Test-Path -LiteralPath (Join-Path $GenerationOut "generation_manifest.json") -PathType Leaf) {
+        & $ResolvedPython $Auditor `
+            --run-dir $GenerationOut `
+            --plan $Plan `
+            --prior-handoff-csv $PriorHandoff `
+            --out-dir $AuditOut
+        $AuditExitCode = $LASTEXITCODE
+    }
+
+    $BundleSources = @(
+        (Join-Path $ModelOut "expert_heads_retrain_manifest.json"),
+        (Join-Path $ModelOut "training_history.csv"),
+        (Join-Path $ModelOut "test_metrics_by_residue.csv"),
+        (Join-Path $ModelOut "test_position_probabilities.csv"),
+        (Join-Path $BridgeOut "frozen_target_bridge_manifest.json"),
+        (Join-Path $BridgeOut "frozen_target_final_model_bridge.csv"),
+        (Join-Path $GenerationOut "generation_manifest.json"),
+        (Join-Path $GenerationOut "generation_summary_by_target.csv"),
+        (Join-Path $GenerationOut "all_candidates.csv"),
+        (Join-Path $GenerationOut "unique_candidates.csv"),
+        (Join-Path $GenerationOut "methylated_new_candidates.csv"),
+        (Join-Path $AuditOut "three_pass_generation_audit.json"),
+        (Join-Path $AuditOut "three_pass_concentration_by_target.csv")
+    ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }
+    if ($BundleSources.Count -gt 0) {
+        Compress-Archive -LiteralPath $BundleSources -DestinationPath $AuditBundle -Force
+    }
+
+    if ($GenerationExitCode -ne 0) {
+        throw "Failed-target T=0.5 generation was blocked with exit code $GenerationExitCode; upload the review bundle, do not release a handoff"
+    }
+    if ($AuditExitCode -ne 0) {
+        throw "Independent three-pass audit was blocked with exit code $AuditExitCode; upload the review bundle, do not release a handoff"
+    }
+
+    if ($ReleaseHandoff) {
+        $SelectArguments = @(
+            $Selector,
+            "--run-dir", $GenerationOut,
+            "--plan", $Plan,
+            "--out-dir", $HandoffOut,
+            "--prior-handoff-csv", $PriorHandoff
+        )
+        & $ResolvedPython @SelectArguments
+        Assert-LastExitCode "Structure-first shortlist"
+    }
 } finally {
     Pop-Location
 }
 
 Write-Host ""
-Write-Host "ALL QUALITY GATES PASSED" -ForegroundColor Green
+Write-Host "AUTOMATED V3 QUALITY GATES PASSED" -ForegroundColor Green
 Write-Host "Corrected checkpoint: $CorrectedCheckpoint"
 Write-Host "Frozen-target bridge: $(Join-Path $BridgeOut 'frozen_target_final_model_bridge.csv')"
-Write-Host "Shang-ge handoff:     $(Join-Path $HandoffOut 'structure_tasks_for_shangge.csv')"
-Write-Host "Reuse audit:          $(Join-Path $HandoffOut 'selection_manifest.json')"
+Write-Host "Manual-review bundle: $AuditBundle"
+if ($ReleaseHandoff) {
+    Write-Host "Shang-ge handoff:     $(Join-Path $HandoffOut 'structure_tasks_for_shangge.csv')"
+} else {
+    Write-Host "Release status:       HOLD FOR MANUAL REVIEW; no Shang-ge handoff was created" -ForegroundColor Yellow
+}
 Write-Host "Permeability:         DEFERRED until returned structures pass the structure gate"

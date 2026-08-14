@@ -24,8 +24,18 @@ from typing import Any, Dict, List, Mapping, MutableMapping, Sequence, Tuple
 
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[2]
-DEFAULT_RUN_DIR = REPO_ROOT / "paper_clean_v28_outputs" / "serine_qc_retrain" / "generation"
-DEFAULT_OUT = REPO_ROOT / "paper_clean_v28_outputs" / "serine_qc_retrain" / "handoff"
+DEFAULT_RUN_DIR = (
+    REPO_ROOT
+    / "paper_clean_v28_outputs"
+    / "serine_qc_order_balanced_v3"
+    / "generation"
+)
+DEFAULT_OUT = (
+    REPO_ROOT
+    / "paper_clean_v28_outputs"
+    / "serine_qc_order_balanced_v3"
+    / "handoff"
+)
 DEFAULT_PLAN = SCRIPT_PATH.with_name("target_plan_structure_failures.json")
 DEFAULT_PRIOR_HANDOFF = (
     REPO_ROOT
@@ -34,6 +44,9 @@ DEFAULT_PRIOR_HANDOFF = (
     / "methylated_new_candidates.csv"
 )
 EXPECTED_PRIOR_HANDOFF_ROWS = 1_333
+REQUIRED_ORDER_BALANCED_EXPERT_PROTOCOL = (
+    "canonical_clean_v28_all_expert_heads_corrected_labels_order_balanced_v3"
+)
 
 
 def read_csv(path: Path) -> List[Dict[str, str]]:
@@ -379,6 +392,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plan", default=str(DEFAULT_PLAN))
     parser.add_argument("--candidates-csv")
     parser.add_argument("--target-manifest-csv")
+    parser.add_argument("--triple-audit-json")
     parser.add_argument("--prior-handoff-csv", default=str(DEFAULT_PRIOR_HANDOFF))
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT))
     parser.add_argument("--allow-shortfall", action="store_true")
@@ -390,16 +404,49 @@ def main() -> None:
     run_dir = Path(args.run_dir).resolve()
     plan_path = Path(args.plan).resolve()
     candidate_path = Path(args.candidates_csv or run_dir / "methylated_new_candidates.csv").resolve()
+    generation_manifest_path = (run_dir / "generation_manifest.json").resolve()
+    triple_audit_path = Path(
+        args.triple_audit_json
+        or run_dir.parent / "triple_audit" / "three_pass_generation_audit.json"
+    ).resolve()
     target_manifest_path = Path(
         args.target_manifest_csv or run_dir / "target_manifest.csv"
     ).resolve()
     prior_path = Path(args.prior_handoff_csv).resolve() if args.prior_handoff_csv else None
     out_dir = Path(args.out_dir).resolve()
-    for required in (plan_path, candidate_path, target_manifest_path):
+    for required in (
+        plan_path,
+        candidate_path,
+        target_manifest_path,
+        generation_manifest_path,
+        triple_audit_path,
+    ):
         if not required.is_file():
             raise FileNotFoundError(required)
 
     plan = read_json(plan_path)
+    generation_manifest = read_json(generation_manifest_path)
+    triple_audit = read_json(triple_audit_path)
+    if str(generation_manifest.get("quality_gate", "")) != "PASS":
+        raise RuntimeError(
+            "Structure handoff is blocked because generation_manifest.json did not PASS"
+        )
+    if (
+        str(generation_manifest.get("model_expert_qc_protocol", ""))
+        != REQUIRED_ORDER_BALANCED_EXPERT_PROTOCOL
+    ):
+        raise RuntimeError(
+            "Structure handoff requires the order-balanced v3 expert checkpoint"
+        )
+    if (
+        str(triple_audit.get("quality_gate", "")) != "PASS"
+        or str(triple_audit.get("release_status", ""))
+        != "READY_FOR_MANUAL_SCIENTIFIC_REVIEW"
+    ):
+        raise RuntimeError(
+            "Structure handoff is blocked because the independent three-pass "
+            "generation audit did not PASS"
+        )
     target_plan = {
         str(item["target_name"]).upper(): dict(item) for item in plan["targets"]
     }
@@ -410,6 +457,14 @@ def main() -> None:
         )
     identity_ceiling = float(plan["sequence_identity_ceiling"])
     candidates = [add_methyl_site_statistics(row) for row in read_csv(candidate_path)]
+    if any(
+        str(row.get("annotation_mode", ""))
+        != "cyclic_order_ensemble_known_natural_sequence"
+        for row in candidates
+    ):
+        raise RuntimeError(
+            "Structure handoff contains a candidate without cyclic-ensemble annotation"
+        )
     unexpected_targets = sorted(
         {str(row["target_name"]).upper() for row in candidates} - set(target_plan)
     )
@@ -493,7 +548,16 @@ def main() -> None:
     write_structure_inputs(out_dir, tasks)
     manifest = {
         "quality_gate": quality_gate,
-        "protocol": "all_expert_qc_structure_first_handoff_v2",
+        "protocol": "all_expert_qc_order_balanced_structure_first_handoff_v3",
+        "generation_manifest": str(generation_manifest_path),
+        "generation_manifest_sha256": file_sha256(generation_manifest_path),
+        "generation_quality_gate": generation_manifest["quality_gate"],
+        "triple_audit": str(triple_audit_path),
+        "triple_audit_sha256": file_sha256(triple_audit_path),
+        "triple_audit_quality_gate": triple_audit["quality_gate"],
+        "model_expert_qc_protocol": generation_manifest[
+            "model_expert_qc_protocol"
+        ],
         "plan": str(plan_path),
         "plan_sha256": file_sha256(plan_path),
         "candidate_file": str(candidate_path),

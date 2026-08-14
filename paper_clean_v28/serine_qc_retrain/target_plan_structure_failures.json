@@ -1,5 +1,5 @@
 {
-  "protocol": "temperature_0.5_all_expert_qc_structure_failure_recovery_v2",
+  "protocol": "temperature_0.5_all_expert_qc_order_balanced_structure_failure_recovery_v3",
   "temperature": 0.5,
   "methyl_threshold": 0.6,
   "seeds": [101, 202, 303, 404, 505],

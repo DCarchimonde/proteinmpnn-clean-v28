@@ -8,6 +8,12 @@ there is no surrogate network and no post-hoc weight splicing.  Lowercase target
 tokens are naturalized before every model forward so the methylation answer can
 never leak through the sequence embedding.
 
+Every training epoch receives an explicit cyclic designed-position rotation;
+the 30-epoch minimum covers every possible relative depth allowed by the frozen
+30-residue peptide cap. Validation, test promotion, and downstream annotation
+use the same deterministic cyclic-order ensemble, so no absolute point is
+favored merely because it was decoded late.
+
 The corrected 600-record training split is divided deterministically into a
 development-train and record-disjoint validation partition.  The original 151
 records are not accessed until epoch selection has finished.  Checkpoint
@@ -48,6 +54,8 @@ from paper_clean_v28.clean_v28_common import (  # noqa: E402
     N_NATURAL,
     X_INDEX,
     binary_metrics,
+    cyclic_designed_decoding_order,
+    cyclic_known_sequence_methyl_probabilities,
     featurize_records,
     load_v28_model,
     naturalize_tensor_for_input,
@@ -56,8 +64,12 @@ from paper_clean_v28.clean_v28_common import (  # noqa: E402
 )
 
 
-DEFAULT_DATA_DIR = REPO_ROOT / "paper_clean_v28_outputs" / "serine_qc_retrain" / "data"
-DEFAULT_OUT = REPO_ROOT / "paper_clean_v28_outputs" / "serine_qc_retrain" / "model"
+DEFAULT_DATA_DIR = (
+    REPO_ROOT / "paper_clean_v28_outputs" / "serine_qc_order_balanced_v3" / "data"
+)
+DEFAULT_OUT = (
+    REPO_ROOT / "paper_clean_v28_outputs" / "serine_qc_order_balanced_v3" / "model"
+)
 EXPECTED_TRAIN_COUNTS = {"S": 242, "s": 50, "P": 307, "p": 0}
 EXPECTED_TEST_COUNTS = {"S": 62, "s": 12, "P": 83, "p": 0}
 SUPPORTED_METHYL_BASES = {token.upper() for token in METHYL_AA_ALPHABET}
@@ -66,6 +78,11 @@ ALL_EXPERT_STATE_KEYS = {
     for index in range(len(NATURAL_AA_ALPHABET))
     for suffix in ("weight", "bias")
 }
+ORDER_BALANCED_PROTOCOL = (
+    "canonical_clean_v28_all_expert_heads_corrected_labels_order_balanced_v3"
+)
+MINIMUM_ORDER_COVERAGE_EPOCHS = 30
+VALIDATION_INTERVAL_EPOCHS = 5
 
 
 def file_sha256(path: Path) -> str:
@@ -304,6 +321,34 @@ def expert_head_loss(
     return torch.stack(losses).mean(), coverage
 
 
+def expert_probability_loss(
+    probabilities: torch.Tensor,
+    S_label: torch.Tensor,
+    valid: torch.Tensor,
+    positive_weights: Mapping[int, float],
+) -> torch.Tensor:
+    """Balanced BCE on deterministic deployment-ensemble probabilities."""
+
+    true_base = naturalize_tensor_for_input(S_label)
+    losses: List[torch.Tensor] = []
+    for base_index in range(len(NATURAL_AA_ALPHABET)):
+        selected = valid & (true_base == base_index)
+        if not bool(selected.any()):
+            continue
+        labels = (S_label[selected] >= N_NATURAL).to(dtype=torch.float32)
+        probability = probabilities[selected].clamp(1e-7, 1.0 - 1e-7)
+        positive_weight = float(positive_weights[base_index])
+        losses.append(
+            -(
+                positive_weight * labels * torch.log(probability)
+                + (1.0 - labels) * torch.log1p(-probability)
+            ).mean()
+        )
+    if not losses:
+        raise RuntimeError("No valid ensemble expert-head positions in batch")
+    return torch.stack(losses).mean()
+
+
 def validation_balanced_bce(
     model: torch.nn.Module,
     records: Sequence[Mapping[str, Any]],
@@ -327,11 +372,21 @@ def validation_balanced_bce(
                 & (S_label != X_INDEX)
             )
             S_forward = naturalize_tensor_for_input(S_label)
-            _base_logits, expert_logits = model(
-                X, S_forward, mask, chain_M, residue_idx, chain_encoding_all
+            probabilities, _order_std = cyclic_known_sequence_methyl_probabilities(
+                model,
+                X,
+                S_forward,
+                mask,
+                chain_M,
+                residue_idx,
+                chain_encoding_all,
+                temperature=1.0,
             )
-            loss, _coverage = expert_head_loss(
-                expert_logits, S_label, valid, positive_weights
+            loss = expert_probability_loss(
+                probabilities,
+                S_label,
+                valid,
+                positive_weights,
             )
             losses.append(float(loss.item()))
     if not losses:
@@ -386,8 +441,19 @@ def train_all_expert_heads(
             )
             optimizer.zero_grad(set_to_none=True)
             S_forward = naturalize_tensor_for_input(S_label)
+            decoding_order = cyclic_designed_decoding_order(
+                chain_M,
+                mask,
+                shift=epoch - 1,
+            )
             _base_logits, expert_logits = model(
-                X, S_forward, mask, chain_M, residue_idx, chain_encoding_all
+                X,
+                S_forward,
+                mask,
+                chain_M,
+                residue_idx,
+                chain_encoding_all,
+                decoding_order=decoding_order,
             )
             loss, coverage = expert_head_loss(
                 expert_logits, S_label, valid, positive_weights
@@ -413,11 +479,28 @@ def train_all_expert_heads(
                     f"expected {expected}, observed {observed}"
                 )
 
-        validation_loss = validation_balanced_bce(
-            model, validation_records, device, batch_size, positive_weights
-        )
         mean_train_loss = float(sum(batch_losses) / len(batch_losses))
-        improved = validation_loss < best_validation - 1e-6
+        order_coverage_complete = epoch >= MINIMUM_ORDER_COVERAGE_EPOCHS
+        should_validate = order_coverage_complete and (
+            epoch == MINIMUM_ORDER_COVERAGE_EPOCHS
+            or epoch % VALIDATION_INTERVAL_EPOCHS == 0
+            or epoch == epochs
+        )
+        validation_loss = (
+            validation_balanced_bce(
+                model,
+                validation_records,
+                device,
+                batch_size,
+                positive_weights,
+            )
+            if should_validate
+            else None
+        )
+        improved = (
+            validation_loss is not None
+            and validation_loss < best_validation - 1e-6
+        )
         if improved:
             best_validation = validation_loss
             best_epoch = epoch
@@ -427,24 +510,35 @@ def train_all_expert_heads(
                 if key in ALL_EXPERT_STATE_KEYS
             }
             epochs_without_improvement = 0
-        else:
-            epochs_without_improvement += 1
+        elif should_validate:
+            epochs_without_improvement += VALIDATION_INTERVAL_EPOCHS
 
         row = {
             "epoch": epoch,
             "mean_balanced_train_bce": mean_train_loss,
-            "validation_balanced_bce": validation_loss,
+            "validation_balanced_bce": (
+                validation_loss if validation_loss is not None else ""
+            ),
+            "validation_evaluated": int(should_validate),
             "is_best_epoch": int(improved),
+            "order_coverage_complete": int(order_coverage_complete),
             "epochs_without_improvement": epochs_without_improvement,
             "learning_rate": learning_rate,
         }
         history.append(row)
+        validation_text = (
+            f"{validation_loss:.6f}" if validation_loss is not None else "DEFERRED"
+        )
+        best_text = f"{best_validation:.6f}" if math.isfinite(best_validation) else "PENDING"
         print(
             f"Epoch {epoch:03d}/{epochs}: train={mean_train_loss:.6f} "
-            f"validation={validation_loss:.6f} best={best_validation:.6f}",
+            f"validation={validation_text} best={best_text}",
             flush=True,
         )
-        if epochs_without_improvement >= patience:
+        if (
+            epoch >= MINIMUM_ORDER_COVERAGE_EPOCHS
+            and epochs_without_improvement >= patience
+        ):
             print(f"Early stopping after epoch {epoch}", flush=True)
             break
 
@@ -458,6 +552,7 @@ def train_all_expert_heads(
         "best_validation_balanced_bce": best_validation,
         "epochs_ran": len(history),
         "early_stopping_patience": patience,
+        "validation_interval_epochs": VALIDATION_INTERVAL_EPOCHS,
         "positive_weights_by_base": {
             NATURAL_AA_ALPHABET[index]: value
             for index, value in positive_weights.items()
@@ -492,30 +587,20 @@ def evaluate(
             # Prevent target leakage: lowercase methyl labels are evaluation
             # targets only, never inputs to the canonical model trunk.
             S_forward = naturalize_tensor_for_input(S_label)
-            _base_logits, expert_logits = model(
+            probability, order_std = cyclic_known_sequence_methyl_probabilities(
+                model,
                 X,
                 S_forward,
                 mask,
                 chain_M,
                 residue_idx,
                 chain_encoding_all,
+                temperature=deployment_temperature,
             )
             true_base = naturalize_tensor_for_input(S_label)
-            # Padding/X uses index 39 while the expert tensor has only 20
-            # columns.  Clamp only for the gather; ``valid`` still excludes all
-            # such positions from every metric.
-            safe_true_base = true_base.clone()
-            safe_true_base[
-                (safe_true_base < 0) | (safe_true_base >= N_NATURAL)
-            ] = 0
-            known_logits = torch.gather(
-                expert_logits, -1, safe_true_base.unsqueeze(-1)
-            ).squeeze(-1)
-            # The production T=0.5 sampler scales the expert logit before the
-            # 0.6 decision, so promotion gates use that exact deployment rule.
-            probability = torch.sigmoid(known_logits / deployment_temperature)
 
             for row_index, meta in enumerate(metas):
+                ensemble_size = int(valid[row_index].sum().item())
                 for position in torch.where(valid[row_index])[0].cpu().tolist():
                     base_index = int(true_base[row_index, position].item())
                     target_index = int(S_label[row_index, position].item())
@@ -531,12 +616,23 @@ def evaluate(
                             "probability_methyl_deployment_scaled": float(
                                 probability[row_index, position].item()
                             ),
+                            "probability_order_std": float(
+                                order_std[row_index, position].item()
+                            ),
+                            "annotation_mode": (
+                                "cyclic_order_ensemble_known_natural_sequence"
+                            ),
+                            "annotation_order_ensemble_size": ensemble_size,
                         }
                     )
 
     y_all = np.asarray([row["is_methyl_true"] for row in position_rows], dtype=np.int64)
     p_all = np.asarray(
         [row["probability_methyl_deployment_scaled"] for row in position_rows],
+        dtype=np.float64,
+    )
+    order_std_all = np.asarray(
+        [row["probability_order_std"] for row in position_rows],
         dtype=np.float64,
     )
     grouped_indices: Dict[str, List[int]] = defaultdict(list)
@@ -592,6 +688,8 @@ def evaluate(
         "supported_macro_f1_at_threshold": float(
             np.mean([float(row["f1"]) for row in supported_rows])
         ) if supported_rows else None,
+        "maximum_probability_order_std": float(np.max(order_std_all)),
+        "mean_probability_order_std": float(np.mean(order_std_all)),
         "serine": serine,
         "proline": proline,
     }
@@ -626,14 +724,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if (
-        args.epochs <= 0
+        args.epochs < MINIMUM_ORDER_COVERAGE_EPOCHS
         or args.batch_size <= 0
         or args.learning_rate <= 0
         or args.early_stopping_patience <= 0
     ):
         raise ValueError(
-            "epochs, batch-size, learning-rate, and early-stopping-patience "
-            "must be positive"
+            f"epochs must be at least {MINIMUM_ORDER_COVERAGE_EPOCHS}; batch-size, "
+            "learning-rate, and early-stopping-patience must be positive"
         )
     if not 0.0 < args.threshold < 1.0 or args.deployment_temperature <= 0.0:
         raise ValueError(
@@ -717,7 +815,7 @@ def main() -> None:
             key: value.detach().cpu().clone() for key, value in model.state_dict().items()
         },
         "expert_head_qc_metadata": {
-            "protocol": "canonical_clean_v28_all_expert_heads_corrected_labels_v2",
+            "protocol": ORDER_BALANCED_PROTOCOL,
             "parent_checkpoint_sha256": file_sha256(model_path),
             "train_jsonl_sha256": file_sha256(train_path),
             "test_jsonl_sha256": file_sha256(test_path),
@@ -728,6 +826,13 @@ def main() -> None:
             "validation_fraction": args.validation_fraction,
             "early_stopping_patience": args.early_stopping_patience,
             "best_epoch": training_selection["best_epoch"],
+            "minimum_order_coverage_epochs": MINIMUM_ORDER_COVERAGE_EPOCHS,
+            "training_decoding_order_policy": (
+                "epoch_indexed_cyclic_designed_position_rotation"
+            ),
+            "deployment_annotation_policy": (
+                "complete_natural_sequence_all_cyclic_rotations_probability_mean"
+            ),
             "threshold": args.threshold,
             "deployment_temperature": args.deployment_temperature,
             "seed": args.seed,
@@ -760,6 +865,10 @@ def main() -> None:
         "validation_bce_improved_over_parent": (
             float(training_selection["best_validation_balanced_bce"])
             < float(baseline_validation_loss)
+        ),
+        "selected_epoch_has_complete_cyclic_order_coverage": (
+            int(training_selection["best_epoch"])
+            >= MINIMUM_ORDER_COVERAGE_EPOCHS
         ),
         "all_19_supported_experts_present_in_test": (
             int(corrected_summary["supported_expert_count"]) == 19
@@ -804,7 +913,7 @@ def main() -> None:
         checkpoint_artifact_path = candidate_checkpoint_path
     manifest = {
         "quality_gate": quality_gate,
-        "protocol": "canonical_clean_v28_all_expert_heads_corrected_labels_v2",
+        "protocol": ORDER_BALANCED_PROTOCOL,
         "device": str(device),
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
@@ -832,12 +941,24 @@ def main() -> None:
             "all methyl target tokens are converted to their natural parent before "
             "every forward pass; labels never enter W_s"
         ),
+        "training_decoding_order_policy": (
+            "epoch-indexed cyclic designed-position rotation per batch row; "
+            "receptor/padding positions are prefixed, every relative depth is "
+            "covered within the 30-epoch minimum, and the exact full order is "
+            "passed into the causal decoder"
+        ),
+        "validation_test_annotation_policy": (
+            "complete natural sequence scored over every cyclic rotation; each "
+            "peptide site appears once at every relative decoder depth"
+        ),
         "deployment_gate_policy": (
-            f"expert probability is sigmoid(logit / {args.deployment_temperature}), "
-            f"followed by the exact strict >{args.threshold} generation decision"
+            f"expert probabilities are sigmoid(logit / {args.deployment_temperature}) "
+            "for every cyclic order, then averaged, followed by the exact strict "
+            f">{args.threshold} generation decision"
         ),
         "training": {
             "maximum_epochs": args.epochs,
+            "minimum_order_coverage_epochs": MINIMUM_ORDER_COVERAGE_EPOCHS,
             "epochs_ran": training_selection["epochs_ran"],
             "best_epoch": training_selection["best_epoch"],
             "batch_size": args.batch_size,

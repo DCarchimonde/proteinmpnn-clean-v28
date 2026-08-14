@@ -4,17 +4,20 @@
 
 The sampler preserves the historical V28 base/expert decision rule from
 ``DCarchimonde/ProteinMPNN:nmethyl/generate_100_seqs_robust.py`` while fixing
-one train/inference mismatch:
+both known train/inference mismatches:
 
 1. randomly permute the designed peptide positions for every draw;
 2. sample the natural amino acid from the base head at the fixed temperature;
-3. query the sampled amino-acid expert at that same temperature;
-4. emit the lowercase N-methyl token when the expert probability is strictly
-   greater than the frozen methylation threshold.
+3. pass that exact random order into the model's causal decoder mask;
+4. after the complete natural sequence has been sampled, annotate every site
+   from a deterministic cyclic-order ensemble at the same temperature;
+5. emit the lowercase N-methyl token when the ensemble expert probability is
+   strictly greater than the frozen methylation threshold.
 
 The emitted lowercase annotation is stored separately from the autoregressive
 model context.  Only the sampled natural parent residue is fed into subsequent
-decoder steps, exactly matching the leakage-free expert-head training input.
+decoder steps.  A complete natural sequence therefore has one deterministic
+annotation regardless of which random path generated it.
 
 This version adds reproducible seeds, strict clean-V28 checkpoint loading,
 target-wise sampling budgets, complete provenance, exact old-pool exclusion,
@@ -58,6 +61,9 @@ DEFAULT_OLD = (
     / "all_designs.csv"
 )
 EXPECTED_PRIOR_HANDOFF_ROWS = 1_333
+REQUIRED_ORDER_BALANCED_EXPERT_PROTOCOL = (
+    "canonical_clean_v28_all_expert_heads_corrected_labels_order_balanced_v3"
+)
 DEFAULT_OUT = (
     REPO_ROOT
     / "paper_clean_v28_outputs"
@@ -377,11 +383,12 @@ def generate_batch(
     extended_alphabet: str,
     x_index: int,
     natural_to_methyl: Mapping[int, int],
+    complete_order_fn: Any,
+    ensemble_probability_fn: Any,
 ) -> List[Dict[str, Any]]:
     X, S_true, mask, chain_M, residue_idx, chain_encoding_all = features[:6]
     X = repeat_batch(X, batch_size)
     S_context = repeat_batch(S_true, batch_size).clone()
-    S_output = S_context.clone()
     mask = repeat_batch(mask, batch_size)
     chain_M = repeat_batch(chain_M, batch_size)
     residue_idx = repeat_batch(residue_idx, batch_size)
@@ -398,9 +405,7 @@ def generate_batch(
     # tensor used only for output serialization.
     for natural_index, methyl_index in natural_to_methyl.items():
         S_context[S_context == int(methyl_index)] = int(natural_index)
-    S_output.copy_(S_context)
     S_context[:, masked_positions] = x_index
-    S_output[:, masked_positions] = x_index
     orders = torch_module.stack(
         [masked_positions[torch_module.randperm(masked_positions.numel(), device=X.device)] for _ in range(batch_size)],
         dim=0,
@@ -412,7 +417,10 @@ def generate_batch(
     peptide_length = int(masked_positions.numel())
     base_log_prob = torch_module.zeros((batch_size, peptide_length), device=X.device)
     sampled_log_prob = torch_module.zeros((batch_size, peptide_length), device=X.device)
-    methyl_probability = torch_module.zeros((batch_size, peptide_length), device=X.device)
+    sampling_path_methyl_probability = torch_module.zeros(
+        (batch_size, peptide_length), device=X.device
+    )
+    full_orders = complete_order_fn(chain_M, mask, orders)
 
     # clean_v28_common still uses torch.utils.checkpoint in forward. no_grad is
     # compatible with that implementation and matches the historical sampler;
@@ -421,7 +429,13 @@ def generate_batch(
         for step in range(peptide_length):
             positions = orders[:, step]
             logits_base, logits_experts = model(
-                X, S_context, mask, chain_M, residue_idx, chain_encoding_all
+                X,
+                S_context,
+                mask,
+                chain_M,
+                residue_idx,
+                chain_encoding_all,
+                decoding_order=full_orders,
             )
             current_logits = logits_base[row_indices, positions]
             scaled_log_probs = functional.log_softmax(current_logits / temperature, dim=-1)
@@ -434,18 +448,7 @@ def generate_batch(
                 expert_logits / temperature
             )
 
-            final_token = sampled_base.clone()
-            for natural_index, methyl_index in natural_to_methyl.items():
-                use_methyl = sampled_base.eq(int(natural_index)) & current_methyl_probability.gt(
-                    methyl_threshold
-                )
-                final_token = torch_module.where(
-                    use_methyl,
-                    torch_module.full_like(final_token, int(methyl_index)),
-                    final_token,
-                )
             S_context[row_indices, positions] = sampled_base
-            S_output[row_indices, positions] = final_token
 
             relative_positions = torch_module.tensor(
                 [position_to_relative[int(value)] for value in positions.detach().cpu().tolist()],
@@ -458,13 +461,46 @@ def generate_batch(
             sampled_log_prob[row_indices, relative_positions] = scaled_log_probs.gather(
                 1, sampled_base.unsqueeze(-1)
             ).squeeze(-1)
-            methyl_probability[row_indices, relative_positions] = current_methyl_probability
+            sampling_path_methyl_probability[
+                row_indices, relative_positions
+            ] = current_methyl_probability
+
+        final_probability_full, order_probability_std_full = (
+            ensemble_probability_fn(
+                model=model,
+                X=X,
+                S_natural=S_context,
+                mask=mask,
+                chain_M=chain_M,
+                residue_idx=residue_idx,
+                chain_encoding_all=chain_encoding_all,
+                temperature=temperature,
+            )
+        )
+        final_methyl_probability = final_probability_full[:, masked_positions]
+        order_probability_std = order_probability_std_full[:, masked_positions]
+
+    S_output = S_context.clone()
+    final_natural_tokens = S_context[:, masked_positions]
+    final_output_tokens = final_natural_tokens.clone()
+    for natural_index, methyl_index in natural_to_methyl.items():
+        use_methyl = final_natural_tokens.eq(int(natural_index)) & final_methyl_probability.gt(
+            methyl_threshold
+        )
+        final_output_tokens = torch_module.where(
+            use_methyl,
+            torch_module.full_like(final_output_tokens, int(methyl_index)),
+            final_output_tokens,
+        )
+    S_output[:, masked_positions] = final_output_tokens
 
     results: List[Dict[str, Any]] = []
     peptide_tokens = S_output[:, masked_positions].detach().cpu().tolist()
     base_lp = base_log_prob.detach().cpu().tolist()
     sampled_lp = sampled_log_prob.detach().cpu().tolist()
-    methyl_p = methyl_probability.detach().cpu().tolist()
+    methyl_p = final_methyl_probability.detach().cpu().tolist()
+    methyl_order_std = order_probability_std.detach().cpu().tolist()
+    sampling_path_p = sampling_path_methyl_probability.detach().cpu().tolist()
     orders_cpu = orders.detach().cpu().tolist()
     for index in range(batch_size):
         sequence = "".join(extended_alphabet[int(token)] for token in peptide_tokens[index])
@@ -501,6 +537,17 @@ def generate_batch(
                 "methyl_probabilities": json.dumps(
                     [round(float(value), 8) for value in methyl_p[index]]
                 ),
+                "methyl_probability_order_std": json.dumps(
+                    [round(float(value), 8) for value in methyl_order_std[index]]
+                ),
+                "methyl_probability_order_std_max": float(
+                    max(methyl_order_std[index])
+                ),
+                "sampling_path_methyl_probabilities": json.dumps(
+                    [round(float(value), 8) for value in sampling_path_p[index]]
+                ),
+                "annotation_mode": "cyclic_order_ensemble_known_natural_sequence",
+                "annotation_order_ensemble_size": peptide_length,
                 "decoding_order_absolute": json.dumps([int(value) for value in orders_cpu[index]]),
             }
         )
@@ -663,6 +710,144 @@ def native_manifest_all_targets(
     return rows
 
 
+def audit_annotation_stability(
+    raw_rows: Sequence[Mapping[str, Any]],
+    eligible_rows: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Detect the two failure signatures that invalidated earlier reruns."""
+    repeated: MutableMapping[Tuple[str, str], List[Mapping[str, Any]]] = defaultdict(list)
+    for row in raw_rows:
+        repeated[
+            (str(row["target_name"]), str(row["design_natural_seq"]))
+        ].append(row)
+
+    repeated_groups = [rows for rows in repeated.values() if len(rows) > 1]
+    inconsistent_groups = []
+    probability_disagreement_groups = []
+    for rows in repeated_groups:
+        annotations = {str(row["design_seq"]) for row in rows}
+        if len(annotations) != 1:
+            inconsistent_groups.append(rows)
+        try:
+            probability_rows = [
+                [float(value) for value in json.loads(str(row["methyl_probabilities"]))]
+                for row in rows
+            ]
+            reference = probability_rows[0]
+            disagree = any(
+                len(values) != len(reference)
+                or any(abs(left - right) > 1e-6 for left, right in zip(reference, values))
+                for values in probability_rows[1:]
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            disagree = True
+        if disagree:
+            probability_disagreement_groups.append(rows)
+
+    site_positions: Counter[int] = Counter()
+    site_residues: Counter[str] = Counter()
+    target_site_positions: MutableMapping[str, Counter[int]] = defaultdict(Counter)
+    target_site_residues: MutableMapping[str, Counter[str]] = defaultdict(Counter)
+    order_std_maxima: List[float] = []
+    for row in eligible_rows:
+        target = str(row["target_name"])
+        sequence = str(row["design_seq"])
+        for position, token in enumerate(sequence, start=1):
+            if token.islower():
+                site_positions[position] += 1
+                site_residues[token.upper()] += 1
+                target_site_positions[target][position] += 1
+                target_site_residues[target][token.upper()] += 1
+        order_std_maxima.append(float(row["methyl_probability_order_std_max"]))
+
+    total_sites = int(sum(site_positions.values()))
+    max_position_share = (
+        max(site_positions.values()) / total_sites if total_sites else 0.0
+    )
+    max_residue_share = (
+        max(site_residues.values()) / total_sites if total_sites else 0.0
+    )
+    per_target_concentration = []
+    for target in sorted(set(target_site_positions) | set(target_site_residues)):
+        target_total = int(sum(target_site_positions[target].values()))
+        target_position_share = (
+            max(target_site_positions[target].values()) / target_total
+            if target_total
+            else 0.0
+        )
+        target_residue_share = (
+            max(target_site_residues[target].values()) / target_total
+            if target_total
+            else 0.0
+        )
+        per_target_concentration.append(
+            {
+                "target_name": target,
+                "methyl_sites": target_total,
+                "site_position_counts": dict(sorted(target_site_positions[target].items())),
+                "site_residue_counts": dict(sorted(target_site_residues[target].items())),
+                "maximum_single_position_share": target_position_share,
+                "maximum_single_residue_share": target_residue_share,
+                "concentration_gate_applies": target_total >= 30,
+                "position_gate_pass": target_total < 30 or target_position_share <= 0.80,
+                "residue_gate_pass": target_total < 30 or target_residue_share <= 0.80,
+            }
+        )
+
+    # These are anomaly-stop rules, not biological priors. Both earlier
+    # reference generations were far below 80%; the invalid 872 run was 95.42%
+    # at one site. A failure stops handoff for investigation rather than
+    # silently reshaping or deleting candidates.
+    concentration_gate_applies = total_sites >= 100
+    quality_checks = {
+        "cyclic_ensemble_annotation_recorded_for_every_raw_row": all(
+            str(row.get("annotation_mode", ""))
+            == "cyclic_order_ensemble_known_natural_sequence"
+            for row in raw_rows
+        ),
+        "repeated_final_natural_sequences_have_identical_annotations": (
+            len(inconsistent_groups) == 0
+        ),
+        "repeated_final_natural_sequences_have_matching_probabilities": (
+            len(probability_disagreement_groups) == 0
+        ),
+        "no_single_position_exceeds_80_percent_of_sites": (
+            not concentration_gate_applies or max_position_share <= 0.80
+        ),
+        "no_single_residue_exceeds_80_percent_of_sites": (
+            not concentration_gate_applies or max_residue_share <= 0.80
+        ),
+        "no_target_has_single_position_above_80_percent_when_n_ge_30": all(
+            bool(row["position_gate_pass"]) for row in per_target_concentration
+        ),
+        "no_target_has_single_residue_above_80_percent_when_n_ge_30": all(
+            bool(row["residue_gate_pass"]) for row in per_target_concentration
+        ),
+    }
+    return {
+        "quality_gate": "PASS" if all(quality_checks.values()) else "FAIL",
+        "quality_checks": quality_checks,
+        "raw_repeated_target_natural_sequence_groups": len(repeated_groups),
+        "raw_inconsistent_annotation_groups": len(inconsistent_groups),
+        "raw_probability_disagreement_groups": len(probability_disagreement_groups),
+        "eligible_methyl_sites": total_sites,
+        "eligible_site_position_counts": dict(sorted(site_positions.items())),
+        "eligible_site_residue_counts": dict(sorted(site_residues.items())),
+        "maximum_single_position_share": max_position_share,
+        "maximum_single_residue_share": max_residue_share,
+        "concentration_gate_applies": concentration_gate_applies,
+        "per_target_concentration": per_target_concentration,
+        "maximum_candidate_order_probability_std": (
+            max(order_std_maxima) if order_std_maxima else 0.0
+        ),
+        "mean_candidate_order_probability_std_max": (
+            sum(order_std_maxima) / len(order_std_maxima)
+            if order_std_maxima
+            else 0.0
+        ),
+    }
+
+
 def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Dict[str, Any]) -> None:
     try:
         import numpy as np
@@ -680,6 +865,8 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
         EXTENDED_AA_ALPHABET,
         EXTENDED_AA_TO_INDEX,
         NAT_TO_METHYL_ABS,
+        complete_decoding_order,
+        cyclic_known_sequence_methyl_probabilities,
         featurize_records,
         load_v28_model,
     )
@@ -701,6 +888,32 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
                 "This recovery protocol requires the prior 1,333-row handoff CSV "
                 "for hard duplicate exclusion"
             )
+    checkpoint_metadata: Dict[str, Any] = {}
+    if "all_expert_qc" in str(plan.get("protocol", "")):
+        checkpoint_payload = torch.load(model_path, map_location="cpu")
+        if isinstance(checkpoint_payload, Mapping):
+            checkpoint_metadata = dict(
+                checkpoint_payload.get("expert_head_qc_metadata", {})
+            )
+        observed_protocol = str(checkpoint_metadata.get("protocol", ""))
+        metadata_is_complete = (
+            observed_protocol == REQUIRED_ORDER_BALANCED_EXPERT_PROTOCOL
+            and int(checkpoint_metadata.get("minimum_order_coverage_epochs", 0)) >= 30
+            and str(checkpoint_metadata.get("training_decoding_order_policy", ""))
+            == "epoch_indexed_cyclic_designed_position_rotation"
+            and str(checkpoint_metadata.get("deployment_annotation_policy", ""))
+            == "complete_natural_sequence_all_cyclic_rotations_probability_mean"
+        )
+        if not metadata_is_complete:
+            raise RuntimeError(
+                "Generation is blocked because the expert checkpoint was not "
+                "trained and promoted with the complete order-balanced v3 "
+                "protocol metadata. Expected "
+                f"{REQUIRED_ORDER_BALANCED_EXPERT_PROTOCOL!r}, observed "
+                f"{observed_protocol or '<missing>'!r}. Rerun expert-head "
+                "retraining before generation."
+            )
+        del checkpoint_payload
     ensure_output_scope(out_dir, args.overwrite)
     if args.defer_permeability_until_structure and args.overwrite:
         # ``--overwrite`` is an explicit request to replace this isolated run.
@@ -793,6 +1006,10 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
                         extended_alphabet=EXTENDED_AA_ALPHABET,
                         x_index=int(EXTENDED_AA_TO_INDEX["X"]),
                         natural_to_methyl=NAT_TO_METHYL_ABS,
+                        complete_order_fn=complete_decoding_order,
+                        ensemble_probability_fn=(
+                            cyclic_known_sequence_methyl_probabilities
+                        ),
                     )
                 except RuntimeError as exc:
                     if "out of memory" in str(exc).lower():
@@ -966,8 +1183,23 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
         list(summary_rows[0].keys()),
     )
 
+    annotation_audit = audit_annotation_stability(raw_rows, eligible_rows)
+    targets_below_quota = [
+        row["target_name"]
+        for row in summary_rows
+        if not int(row["enough_candidates_before_permeability"])
+    ]
+    generation_quality_checks = {
+        **dict(annotation_audit["quality_checks"]),
+        "every_target_meets_pre_structure_candidate_quota": not targets_below_quota,
+    }
+    generation_quality_gate = (
+        "PASS" if all(generation_quality_checks.values()) else "FAIL"
+    )
+
     manifest_payload = {
-        "quality_gate": "PASS",
+        "quality_gate": generation_quality_gate,
+        "quality_checks": generation_quality_checks,
         "protocol": plan["protocol"],
         "temperature": temperature,
         "methyl_threshold": methyl_threshold,
@@ -979,6 +1211,7 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
         "numpy_version": str(np.__version__),
         "model_path": str(model_path),
         "model_sha256": sha256_file(model_path),
+        "model_expert_qc_protocol": checkpoint_metadata.get("protocol"),
         "native_jsonl": str(native_path),
         "best_csv": str(best_path),
         "historical_design_csv": str(old_path),
@@ -1007,17 +1240,24 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
         ),
         "permeability_input_rows": len(permeability_input),
         "planned_structure_handoff": int(validated["planned_structure_handoff"]),
-        "targets_below_pre_permeability_quota": [
-            row["target_name"]
-            for row in summary_rows
-            if not int(row["enough_candidates_before_permeability"])
-        ],
+        "targets_below_pre_permeability_quota": targets_below_quota,
         "frozen_targets_not_regenerated": plan["frozen_targets"],
         "sampler_definition": (
-            "random peptide-position order; natural base sampled at T=0.5; "
-            "sampled-base expert sigmoid(logit/T)>0.6 emits lowercase methyl token; "
-            "only the natural parent is fed back into later decoder steps"
+            "one explicit random peptide-position order is shared by the outer "
+            "sampling loop and causal decoder mask; natural base sampled at T=0.5; "
+            "after the complete natural sequence is available, expert probabilities "
+            "are averaged over every cyclic rotation; ensemble mean >0.6 emits the "
+            "lowercase methyl token; only natural parents enter model context"
         ),
+        "generation_decoding_order_policy": (
+            "explicit random designed-position permutation, receptor/padding prefix; "
+            "the exact same full permutation is passed to every model forward"
+        ),
+        "annotation_order_policy": (
+            "complete-natural-sequence cyclic ensemble; every peptide site occurs "
+            "once at every relative decoder depth"
+        ),
+        "annotation_stability_audit": annotation_audit,
         "autoregressive_input_policy": (
             "natural-only model context; lowercase expert annotations are output-only"
         ),
@@ -1036,6 +1276,14 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
     else:
         print(f"Permeability input: {out_dir / 'permeability_input.csv'}", flush=True)
     print(f"Quality gate: {manifest_payload['quality_gate']}", flush=True)
+    if generation_quality_gate != "PASS":
+        failed = [
+            name for name, passed in generation_quality_checks.items() if not passed
+        ]
+        raise RuntimeError(
+            "Generation annotation/coverage quality gate failed; handoff is blocked: "
+            + ", ".join(failed)
+        )
 
 
 def parse_args() -> argparse.Namespace:

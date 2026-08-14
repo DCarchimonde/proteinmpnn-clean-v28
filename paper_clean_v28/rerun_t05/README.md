@@ -4,6 +4,11 @@
 > 13-target 批次，只用于复现，不用于当前交付。当前实际顺序必须是
 > 结构先行、透膜后置；请改用 `run_serine_qc_recovery.ps1` 和
 > `paper_clean_v28/serine_qc_retrain/README.md`。
+>
+> 旧结果还存在外层随机采样顺序与模型内部固定因果顺序不一致的问题；
+> 现有 872 条第 7 位集中结果已撤回。当前生成器只能与带有
+> `corrected_labels_order_balanced_v3` 元数据的新 checkpoint 配套用于
+> Ser-QC 恢复计划，并在结果门通过后停在人工复核。
 
 ## 目的
 

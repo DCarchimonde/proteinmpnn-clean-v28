@@ -146,15 +146,16 @@ Checks whether any files are too large for normal GitHub upload.
 ### `.gitignore`
 Clean-repository ignore rules.
 
-## Ser provenance recovery
+## Ser provenance and decoding-order recovery
 
 ### `paper_clean_v28/serine_qc_retrain/README.md`
-Evidence, frozen scope, quality gates, and exact commands for the Ser
-provenance correction and structure-first recovery.
+Evidence, frozen scope, decoding-order root cause, quality gates, and exact
+commands for the Ser correction plus order-balanced v3 recovery.
 
 ### `run_serine_qc_recovery.ps1` / `run_serine_qc_recovery.sh`
 One-command Windows and AutoDL/Linux launchers. They rebuild labels from the
 pinned raw PDB source, retrain all 20 canonical expert heads while freezing the
-trunk/base head, bridge the seven already-passed structures to the final
-checkpoint, regenerate only the ten failed T=0.5 targets, and create the
-structure handoff. Permeability is deliberately deferred until structures return.
+trunk/base head, bridge the seven already-passed structures, regenerate only the
+ten failed T=0.5 targets, and run an independent three-pass result audit. The
+default stops at a manual-review bundle and does not create the structure
+handoff. Permeability is deliberately deferred until structures return.

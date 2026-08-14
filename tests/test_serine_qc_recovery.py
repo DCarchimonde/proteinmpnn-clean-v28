@@ -193,14 +193,19 @@ class CompleteExpertRetrainIsolationTests(unittest.TestCase):
         self.assertNotIn("splice", self.trainer_text.lower())
 
     def test_padding_is_made_safe_before_20_expert_gather(self):
-        self.assertIn("safe_true_base", self.trainer_text)
-        self.assertIn("safe_true_base >= N_NATURAL", self.trainer_text)
-        self.assertNotIn(
-            "expert_logits, -1, true_base.unsqueeze(-1)", self.trainer_text
-        )
+        common_text = (
+            ROOT / "paper_clean_v28" / "clean_v28_common.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("safe_base", common_text)
+        self.assertIn("safe_base >= N_NATURAL", common_text)
+        self.assertIn("invalid_base & selected_mask", common_text)
+        self.assertIn("safe_base.unsqueeze(-1)", common_text)
 
     def test_promotion_metrics_match_t05_generation_temperature(self):
-        self.assertIn("known_logits / deployment_temperature", self.trainer_text)
+        self.assertIn("temperature=deployment_temperature", self.trainer_text)
+        self.assertIn(
+            "cyclic_known_sequence_methyl_probabilities", self.trainer_text
+        )
         self.assertIn('default=0.5', self.trainer_text)
         self.assertIn("probability_methyl_deployment_scaled", self.trainer_text)
 
@@ -240,12 +245,14 @@ class StructureFirstHandoffTests(unittest.TestCase):
             text = (ROOT / filename).read_text(encoding="utf-8")
             self.assertIn("--defer-permeability-until-structure", text)
             self.assertNotIn("02_select_after_permeability.py", text)
+            self.assertIn("04_triple_audit_generation.py", text)
+            self.assertIn("HOLD FOR MANUAL REVIEW", text)
             positions = [
                 text.index("01_rebuild_provenance_labels.py"),
                 text.index("02_retrain_canonical_expert_heads.py"),
-                text.index("01_eval_clean_model.py"),
                 text.index("03_revalidate_frozen_structures.py"),
                 text.rindex("01_generate_t05_multiseed.py"),
+                text.index("04_triple_audit_generation.py"),
                 text.index("03_select_structure_first_handoff.py"),
             ]
             self.assertEqual(positions, sorted(positions))
@@ -264,10 +271,12 @@ class StructureFirstHandoffTests(unittest.TestCase):
         text = (
             ROOT / "paper_clean_v28" / "rerun_t05" / "01_generate_t05_multiseed.py"
         ).read_text(encoding="utf-8")
-        self.assertIn("X, S_context, mask", text)
+        self.assertIn("S_context,\n                mask,", text)
         self.assertIn("S_context[row_indices, positions] = sampled_base", text)
-        self.assertIn("S_output[row_indices, positions] = final_token", text)
+        self.assertIn("S_output = S_context.clone()", text)
+        self.assertIn("S_output[:, masked_positions] = final_output_tokens", text)
         self.assertNotIn("S_context[row_indices, positions] = final_token", text)
+        self.assertNotIn("S_context[row_indices, positions] = final_output_tokens", text)
 
     def test_prior_exact_sequences_are_identified_for_exclusion(self):
         with tempfile.TemporaryDirectory() as temporary_name:
