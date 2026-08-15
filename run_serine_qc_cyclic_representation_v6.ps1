@@ -6,7 +6,8 @@ param(
     [int]$GenerationBatchSize = 8,
     [switch]$AllowCpu,
     [switch]$Force,
-    [switch]$ReviewOnly
+    [switch]$ReviewOnly,
+    [switch]$ResumeQuota
 )
 
 $ErrorActionPreference = "Stop"
@@ -31,6 +32,7 @@ $PriorHandoff = Join-Path $RepoRoot "paper_clean_v28_outputs\rerun_temperature_0
 $Plan = Join-Path $RepoRoot "paper_clean_v28\serine_qc_retrain\target_plan_cyclic_representation_v6.json"
 $Trainer = Join-Path $RepoRoot "paper_clean_v28\serine_qc_retrain\02_retrain_canonical_expert_heads.py"
 $RepresentationAuditor = Join-Path $RepoRoot "paper_clean_v28\serine_qc_retrain\07_audit_cyclic_representation_equivariance.py"
+$QuotaResumer = Join-Path $RepoRoot "paper_clean_v28\serine_qc_retrain\08_resume_cyclic_representation_v6_quota.py"
 $Generator = Join-Path $RepoRoot "paper_clean_v28\rerun_t05\01_generate_t05_multiseed.py"
 $TripleAuditor = Join-Path $RepoRoot "paper_clean_v28\serine_qc_retrain\04_triple_audit_generation.py"
 $RepresentationAuditReport = Join-Path $RepresentationAuditOut "cyclic_representation_audit.json"
@@ -139,6 +141,12 @@ with zipfile.ZipFile(destination, "r") as archive:
 if ($TrainingBatchSize -le 0 -or $AuditBatchSize -le 0 -or $GenerationBatchSize -le 0) {
     throw "TrainingBatchSize, AuditBatchSize, and GenerationBatchSize must all be positive"
 }
+if ($ReviewOnly -and $ResumeQuota) {
+    throw "Choose exactly one recovery mode: -ReviewOnly or -ResumeQuota"
+}
+if ($ResumeQuota -and $Force) {
+    throw "Do not combine -ResumeQuota with -Force; quota resume must preserve V6 outputs"
+}
 
 $RequiredInputs = @(
     $TrainJsonl,
@@ -150,6 +158,7 @@ $RequiredInputs = @(
     $Plan,
     $Trainer,
     $RepresentationAuditor,
+    $QuotaResumer,
     $Generator,
     $TripleAuditor
 )
@@ -158,20 +167,20 @@ foreach ($Required in $RequiredInputs) {
         throw "Required V6 input is missing: $Required"
     }
 }
-if (-not $ReviewOnly -and -not (Test-Path -LiteralPath $ParentCheckpoint -PathType Leaf)) {
+if ((-not $ReviewOnly) -and (-not $ResumeQuota) -and -not (Test-Path -LiteralPath $ParentCheckpoint -PathType Leaf)) {
     throw "Canonical parent checkpoint is missing: $ParentCheckpoint"
 }
-if ($ReviewOnly) {
+if ($ReviewOnly -or $ResumeQuota) {
     foreach ($RequiredReviewInput in @($Checkpoint, $ExpertManifest, $RepresentationAuditReport)) {
         if (-not (Test-Path -LiteralPath $RequiredReviewInput -PathType Leaf)) {
-            throw "ReviewOnly requires a completed V6 artifact: $RequiredReviewInput"
+            throw "Existing-artifact mode requires a completed V6 artifact: $RequiredReviewInput"
         }
     }
 }
-if ($ReviewOnly -and -not (Test-Path -LiteralPath $GenerationManifest -PathType Leaf)) {
-    throw "ReviewOnly requires an existing completed V6 generation: $GenerationManifest"
+if (($ReviewOnly -or $ResumeQuota) -and -not (Test-Path -LiteralPath $GenerationManifest -PathType Leaf)) {
+    throw "Existing-artifact mode requires an existing V6 generation: $GenerationManifest"
 }
-if ((-not $ReviewOnly) -and (Test-Path -LiteralPath $V6Root)) {
+if ((-not $ReviewOnly) -and (-not $ResumeQuota) -and (Test-Path -LiteralPath $V6Root)) {
     $ExistingV6Files = @(Get-ChildItem -LiteralPath $V6Root -Force -ErrorAction SilentlyContinue)
     if ($ExistingV6Files.Count -gt 0 -and -not $Force) {
         throw "V6 output already exists. Use -ReviewOnly, or rerun intentionally with -Force: $V6Root"
@@ -194,6 +203,8 @@ Write-Host "Mapping:    every probability is mapped back to the original physica
 Write-Host "Release:    review bundle only; structure handoff remains blocked"
 if ($ReviewOnly) {
     Write-Host "Mode:       re-audit/package existing V6; no GPU scoring or sampling"
+} elseif ($ResumeQuota) {
+    Write-Host "Mode:       preserve trained V6 + 19,500 draws; top up quota-shortfall targets only"
 } else {
     Write-Host "Mode:       representation-augmented retraining, held-out gate, then full regeneration"
 }
@@ -201,7 +212,7 @@ Write-Host "============================================================"
 
 Push-Location $RepoRoot
 try {
-    if (-not $ReviewOnly) {
+    if ((-not $ReviewOnly) -and (-not $ResumeQuota)) {
         $ProbeCode = 'import json, torch; print(json.dumps({"torch": torch.__version__, "cuda": bool(torch.cuda.is_available()), "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None}))'
         Invoke-PythonProgram $ResolvedPython $ProbeCode "Python/PyTorch preflight"
         if (-not $AllowCpu) {
@@ -266,6 +277,29 @@ try {
         else { $GenerationArguments += @("--device", "cuda") }
         & $ResolvedPython @GenerationArguments
         Assert-LastExitCode "Full 17-target V6 regeneration"
+    } elseif ($ResumeQuota) {
+        $ProbeCode = 'import json, torch; print(json.dumps({"torch": torch.__version__, "cuda": bool(torch.cuda.is_available()), "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None}))'
+        Invoke-PythonProgram $ResolvedPython $ProbeCode "Python/PyTorch quota-resume preflight"
+        if (-not $AllowCpu) {
+            $CudaCode = 'import sys, torch; sys.exit(0 if torch.cuda.is_available() else 3)'
+            Invoke-PythonProgram $ResolvedPython $CudaCode "CUDA quota-resume preflight"
+        }
+        $ResumeArguments = @(
+            $QuotaResumer,
+            "--plan", $Plan,
+            "--model-path", $Checkpoint,
+            "--source-run-dir", $GenerationOut,
+            "--out-dir", $GenerationOut,
+            "--representation-audit-json", $RepresentationAuditReport,
+            "--native-jsonl", $NativeJsonl,
+            "--old-designs-csv", $HistoricalCsv,
+            "--prior-designs-csv", $PriorHandoff,
+            "--batch-size", $GenerationBatchSize
+        )
+        if ($AllowCpu) { $ResumeArguments += @("--device", "auto", "--allow-cpu") }
+        else { $ResumeArguments += @("--device", "cuda") }
+        & $ResolvedPython @ResumeArguments
+        Assert-LastExitCode "V6 shortfall-target quota resume"
     } else {
         Write-Host "GPU step:   skipped; reusing existing V6 rows"
     }

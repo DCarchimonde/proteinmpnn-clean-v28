@@ -157,4 +157,11 @@ Current Windows launcher. It retrains all 20 expert heads with every equivalent
 cyclic sequence/coordinate start, runs the held-out test gate, regenerates all
 17 targets, and performs the independent three-pass result audit. It stops at a
 manual-review bundle and never creates a structure handoff. The older V5
-handoff path is withdrawn and release-blocked.
+handoff path is withdrawn and release-blocked. `-ResumeQuota` preserves a
+completed V6 checkpoint and original 19,500 draws, samples only quota-shortfall
+targets, and then continues the same three-pass review packaging.
+
+### `paper_clean_v28/serine_qc_retrain/08_resume_cyclic_representation_v6_quota.py`
+In-place, hash-pinned V6 quota recovery. It retains every pre-resume candidate,
+uses disjoint reserve seeds only for targets below the frozen structure quota,
+and records exact initial/top-up row accounting for the independent audit.

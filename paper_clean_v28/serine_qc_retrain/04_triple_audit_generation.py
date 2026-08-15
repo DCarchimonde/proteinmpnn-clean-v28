@@ -237,9 +237,71 @@ def audit(
         str(manifest.get("protocol", ""))
         == "temperature_0.5_structural_support_adaptive_quota_recovery_v5"
     )
+    is_adaptive_v6 = (
+        str(manifest.get("recovery_mode", ""))
+        == "RETAIN_COMPLETE_V6_RUN_AND_ADAPTIVELY_SAMPLE_ONLY_QUOTA_SHORTFALL_TARGETS"
+    )
+    v6_backup_diagnostics: Dict[str, Any] = {"applicable": is_adaptive_v6}
+    v6_backup_preservation_pass = True
+    if is_adaptive_v6:
+        backup_dir = run_dir / "pre_quota_resume_backup"
+        backup_manifest_path = backup_dir / "generation_manifest.json"
+        backup_all_path = backup_dir / "all_candidates.csv"
+        backup_files_exist = (
+            backup_manifest_path.is_file() and backup_all_path.is_file()
+        )
+        backup_rows: List[Dict[str, str]] = (
+            read_csv(backup_all_path) if backup_files_exist else []
+        )
+        final_by_id = {
+            str(row.get("candidate_id", "")): row for row in raw_rows
+        }
+        backup_ids = [str(row.get("candidate_id", "")) for row in backup_rows]
+        payload_preserved = backup_files_exist and all(
+            candidate_id in final_by_id
+            and all(
+                str(final_by_id[candidate_id].get(field, "")) == str(value)
+                for field, value in backup_row.items()
+            )
+            for candidate_id, backup_row in zip(backup_ids, backup_rows)
+        )
+        backup_manifest_hash_matches = (
+            backup_files_exist
+            and sha256_file(backup_manifest_path)
+            == str(manifest.get("source_v6_initial_backup_manifest_sha256", ""))
+        )
+        backup_all_hash_matches = (
+            backup_files_exist
+            and sha256_file(backup_all_path)
+            == str(
+                manifest.get("source_v6_initial_backup_all_candidates_sha256", "")
+            )
+        )
+        v6_backup_preservation_pass = bool(
+            backup_files_exist
+            and len(backup_rows) == plan_raw
+            and all(backup_ids)
+            and len(backup_ids) == len(set(backup_ids))
+            and payload_preserved
+            and backup_manifest_hash_matches
+            and backup_all_hash_matches
+        )
+        v6_backup_diagnostics.update(
+            {
+                "backup_dir": str(backup_dir),
+                "backup_files_exist": backup_files_exist,
+                "backup_raw_rows": len(backup_rows),
+                "backup_candidate_ids_unique": (
+                    bool(backup_ids) and len(backup_ids) == len(set(backup_ids))
+                ),
+                "every_backup_payload_field_is_in_final_rows": payload_preserved,
+                "backup_manifest_hash_matches": backup_manifest_hash_matches,
+                "backup_all_candidates_hash_matches": backup_all_hash_matches,
+            }
+        )
     expected_raw = (
         int(manifest.get("raw_candidates_expected", -1))
-        if is_adaptive_v5
+        if is_adaptive_v5 or is_adaptive_v6
         else plan_raw
     )
     recovery_stage_counts = Counter(
@@ -600,6 +662,23 @@ def audit(
                 == int(manifest.get("adaptive_topup_raw_candidates", -1))
             )
         ),
+        "adaptive_v6_source_plus_topup_accounting": (
+            not is_adaptive_v6
+            or (
+                int(manifest.get("source_v6_raw_candidates_retained", -1))
+                + int(manifest.get("adaptive_topup_raw_candidates", -1))
+                == len(raw_rows)
+                and int(manifest.get("source_v6_raw_candidates_retained", -1))
+                == plan_raw
+                and recovery_stage_counts["V6_INITIAL_FULL_REGENERATION"]
+                == int(manifest.get("source_v6_raw_candidates_retained", -1))
+                and recovery_stage_counts["V6_ADAPTIVE_QUOTA_TOPUP"]
+                == int(manifest.get("adaptive_topup_raw_candidates", -1))
+            )
+        ),
+        "adaptive_v6_initial_backup_is_hash_pinned_and_fully_retained": (
+            v6_backup_preservation_pass
+        ),
         "generation_manifest_counts_match_files": (
             int(manifest.get("raw_candidates_generated", -1)) == len(raw_rows)
             and int(manifest.get("unique_candidates", -1)) == len(unique_rows)
@@ -825,6 +904,7 @@ def audit(
             "row_error_examples": row_errors[:25],
             "aggregation_errors": aggregation_errors[:25],
             "eligible_row_errors": eligible_row_errors[:25],
+            "adaptive_v6_backup_preservation": v6_backup_diagnostics,
         },
         "pass_2_result_annotation": {
             "quality_gate": pass_2,

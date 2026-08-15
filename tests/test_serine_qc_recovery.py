@@ -37,6 +37,13 @@ provenance = load_module(
     "serine_qc_provenance",
     ROOT / "paper_clean_v28" / "serine_qc_retrain" / "provenance.py",
 )
+v6_quota_resumer = load_module(
+    "serine_qc_v6_quota_resumer",
+    ROOT
+    / "paper_clean_v28"
+    / "serine_qc_retrain"
+    / "08_resume_cyclic_representation_v6_quota.py",
+)
 
 from nmethyl.utils import nmethyl_config  # noqa: E402
 
@@ -241,6 +248,128 @@ class FrozenRecoveryPlanTests(unittest.TestCase):
         self.assertIn("row_residue_idx[positions] = canonical_residue_idx", trainer)
         self.assertIn("CYCLIC_REPRESENTATION_PROTOCOL", trainer)
         self.assertIn("cyclic_representation_augmentation=args.", trainer)
+
+    def test_v6_quota_resume_reuses_completed_artifacts_and_never_forces_restart(self):
+        launcher = (
+            ROOT / "run_serine_qc_cyclic_representation_v6.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn("[switch]$ResumeQuota", launcher)
+        self.assertIn("Do not combine -ResumeQuota with -Force", launcher)
+        self.assertIn("08_resume_cyclic_representation_v6_quota.py", launcher)
+        self.assertIn("& $ResolvedPython @ResumeArguments", launcher)
+        self.assertLess(
+            launcher.index("& $ResolvedPython @ResumeArguments"),
+            launcher.index("& $ResolvedPython $TripleAuditor"),
+        )
+
+    def test_v6_quota_resume_retains_rows_and_uses_representation_ensemble(self):
+        resumer = (
+            ROOT
+            / "paper_clean_v28"
+            / "serine_qc_retrain"
+            / "08_resume_cyclic_representation_v6_quota.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("source_ids <= set(candidate_ids)", resumer)
+        self.assertIn("every_pre_resume_v6_payload_field_is_retained", resumer)
+        self.assertIn(
+            "cyclic_representation_known_sequence_methyl_probabilities", resumer
+        )
+        self.assertIn('TOPUP_STAGE = "V6_ADAPTIVE_QUOTA_TOPUP"', resumer)
+        self.assertIn('threshold = float(plan["methyl_threshold"])', resumer)
+        self.assertNotIn("threshold = 0.5", resumer)
+        self.assertEqual(
+            v6_quota_resumer.false_checks(
+                {"ok": True, "quota": False, "also_ok": 1}
+            ),
+            ["quota"],
+        )
+
+    def test_v6_quota_resume_validates_complete_source_rows_before_sampling(self):
+        validated = {
+            "target_names": ["A", "B"],
+            "seeds": [101, 202],
+            "targets": [
+                {"target_name": "A", "sequences_per_seed": 1},
+                {"target_name": "B", "sequences_per_seed": 1},
+            ],
+        }
+        plan = {"methyl_threshold": 0.6}
+
+        def row(candidate_id, target):
+            return {
+                "candidate_id": candidate_id,
+                "target_name": target,
+                "length_match": "1",
+                "valid_token_gate": "1",
+                "annotation_mode": v6_quota_resumer.ANNOTATION_MODE,
+                "annotation_context_policy": v6_quota_resumer.ANNOTATION_CONTEXT,
+                "annotation_visible_receptor_chains": "0",
+                "annotation_representation_ensemble_size": "3",
+                "design_length": "3",
+                "methyl_threshold": "0.6",
+            }
+
+        initial_rows = [
+            row("a101", "A"),
+            row("a202", "A"),
+            row("b101", "B"),
+            row("b202", "B"),
+        ]
+        result = v6_quota_resumer.validate_source_rows(
+            initial_rows, {}, plan, validated
+        )
+        self.assertTrue(result["source_candidate_ids_unique"])
+        self.assertEqual(result["source_initial_rows_by_target"], {"A": 2, "B": 2})
+
+        duplicated = [dict(item) for item in initial_rows]
+        duplicated[-1]["candidate_id"] = duplicated[0]["candidate_id"]
+        with self.assertRaisesRegex(RuntimeError, "duplicated"):
+            v6_quota_resumer.validate_source_rows(duplicated, {}, plan, validated)
+
+        mixed_policy = [dict(item) for item in initial_rows]
+        mixed_policy[0]["methyl_threshold"] = "0.5"
+        with self.assertRaisesRegex(RuntimeError, "mixed-policy"):
+            v6_quota_resumer.validate_source_rows(
+                mixed_policy, {}, plan, validated
+            )
+
+        resumed_rows = [dict(item) for item in initial_rows]
+        for item in resumed_rows:
+            item["source_recovery_stage"] = v6_quota_resumer.INITIAL_STAGE
+        topup = row("a606", "A")
+        topup["source_recovery_stage"] = v6_quota_resumer.TOPUP_STAGE
+        resumed_rows.append(topup)
+        resumed_manifest = {
+            "recovery_mode": v6_quota_resumer.RECOVERY_MODE,
+            "source_v6_raw_candidates_retained": 4,
+            "adaptive_topup_raw_candidates": 1,
+        }
+        resumed_result = v6_quota_resumer.validate_source_rows(
+            resumed_rows, resumed_manifest, plan, validated
+        )
+        self.assertEqual(
+            resumed_result["source_stage_counts"],
+            {
+                v6_quota_resumer.INITIAL_STAGE: 4,
+                v6_quota_resumer.TOPUP_STAGE: 1,
+            },
+        )
+
+    def test_triple_audit_accounts_for_initial_v6_and_topup_rows(self):
+        auditor = (
+            ROOT
+            / "paper_clean_v28"
+            / "serine_qc_retrain"
+            / "04_triple_audit_generation.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("adaptive_v6_source_plus_topup_accounting", auditor)
+        self.assertIn(
+            "adaptive_v6_initial_backup_is_hash_pinned_and_fully_retained",
+            auditor,
+        )
+        self.assertIn('recovery_stage_counts["V6_INITIAL_FULL_REGENERATION"]', auditor)
+        self.assertIn('recovery_stage_counts["V6_ADAPTIVE_QUOTA_TOPUP"]', auditor)
+        self.assertIn("== plan_raw", auditor)
 
 
 class CompleteExpertRetrainIsolationTests(unittest.TestCase):

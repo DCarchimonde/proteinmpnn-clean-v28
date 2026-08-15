@@ -175,6 +175,20 @@ triple_audit/three_pass_generation_audit.json
 如果流程报错，不要继续运行 V5 的 `-ReviewOnly -ReleaseHandoff`，也不要手工挑
 CSV。把完整终端日志和当时已有的 V6 review ZIP（若已生成）发回来定位。
 
+如果训练、151 条 test、循环表示审计和 19,500 条生成都已完成，唯一失败项是
+`every_target_meets_pre_structure_candidate_quota`，不要再次使用 `-Force`。保留
+现有 V6 模型与全部候选，只对缺额靶点使用独立 reserve seeds 补采样：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_serine_qc_cyclic_representation_v6.ps1 -ResumeQuota
+```
+
+该模式会先核对 checkpoint、plan、representation audit 和原始生成 SHA/协议，
+自动读取缺额靶点，每 200 条重新计算一次冻结配额；阈值仍严格为 `>0.6`。原始
+19,500 行会备份并逐行保留。补齐后才继续三遍独立审计和打人工复核 ZIP，不会
+重训、重跑已完成的 17 靶点，也不会创建尚哥 handoff。`-ResumeQuota` 与
+`-Force` 禁止同时使用。
+
 已经完成一次 V6 后，仅重新审计和打包可运行：
 
 ```powershell
