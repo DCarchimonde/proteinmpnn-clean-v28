@@ -503,12 +503,16 @@ def audit(
             reported_annotation_audit.get("eligible_site_residue_counts", {})
         ).items()
     }
-    concentrated_target_rows = [
+    # The n>=30 flag remains useful as a descriptive concentration diagnostic,
+    # but structural support depends on the frozen backbone rather than sample
+    # count.  Audit every target whose eligible calls have a dominant absolute
+    # position, including quota-sized targets with fewer than 30 calls.
+    structural_target_rows = [
         row
         for row in concentration_rows
         if str(row["target_name"]) != "ALL"
-        and bool(row["concentration_gate_applies"])
-        and not bool(row["position_gate_pass"])
+        and int(row["methyl_sites"]) > 0
+        and float(row["maximum_single_position_share"]) > 0.80
     ]
     global_position_concentration = any(
         str(row["target_name"]) == "ALL"
@@ -516,7 +520,7 @@ def audit(
         and not bool(row["position_gate_pass"])
         for row in concentration_rows
     )
-    if concentrated_target_rows:
+    if structural_target_rows or global_position_concentration:
         missing_support_inputs = [
             str(path)
             for path in (train_path, test_path, native_path)
@@ -528,7 +532,7 @@ def audit(
                 "method": "forward_cyclic_ca_distance_matrix_heldout_provenance_support_v1",
                 "reason": "missing structural-support inputs",
                 "missing_inputs": missing_support_inputs,
-                "concentrated_target_count": len(concentrated_target_rows),
+                "concentrated_target_count": len(structural_target_rows),
             }
         else:
             structural_support = audit_dominant_position_structural_support(
@@ -537,17 +541,8 @@ def audit(
                 target_manifest_rows=target_manifest_rows,
                 train_records=read_structural_jsonl(train_path),
                 test_records=read_structural_jsonl(test_path),
+                minimum_sites=1,
             )
-    elif global_position_concentration:
-        structural_support = {
-            "quality_gate": "FAIL",
-            "method": "forward_cyclic_ca_distance_matrix_heldout_provenance_support_v1",
-            "reason": (
-                "global position concentration was present without a concentrated "
-                "target that could be validated structurally"
-            ),
-            "concentrated_target_count": 0,
-        }
     else:
         structural_support = {
             "quality_gate": "PASS",
@@ -574,6 +569,16 @@ def audit(
         ),
         "dominant_position_concentration_has_heldout_provenance_support": (
             str(structural_support.get("quality_gate", "")) == "PASS"
+        ),
+        "every_concentrated_target_was_structurally_audited": (
+            {
+                str(row["target_name"])
+                for row in structural_target_rows
+            }
+            == {
+                str(row.get("target_name", ""))
+                for row in structural_support.get("concentrated_targets", [])
+            }
         ),
         "absolute_position_and_residue_concentration_are_reported_not_filtered": True,
         "generation_manifest_annotation_audit_recomputes": (

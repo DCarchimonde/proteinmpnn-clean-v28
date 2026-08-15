@@ -299,6 +299,14 @@ class StructureFirstHandoffTests(unittest.TestCase):
         self.assertIn("06_top_up_quota_and_finalize_v5.py", launcher)
         self.assertIn("structural_position_support.json", launcher)
         self.assertIn("serine_qc_structural_support_v5", launcher)
+        self.assertIn("[switch]$ReviewOnly", launcher)
+        self.assertIn("no retraining, rescoring, or sampling", launcher)
+        self.assertIn('"v4_generation_manifest.json"', launcher)
+        self.assertIn('"v5_generation_manifest.json"', launcher)
+        self.assertIn('"v5_target_manifest.csv"', launcher)
+        self.assertIn('"review_bundle_manifest.json"', launcher)
+        self.assertIn("serine_qc_structural_support_v5_shangge_handoff.zip", launcher)
+        self.assertIn('"review_evidence"', launcher)
         self.assertNotIn("02_retrain_canonical_expert_heads.py", launcher)
         self.assertLess(
             launcher.index("$V5Topup"),

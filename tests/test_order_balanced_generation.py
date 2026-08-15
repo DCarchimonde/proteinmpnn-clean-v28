@@ -174,7 +174,9 @@ class StructuralConcentrationSupportTests(unittest.TestCase):
             [float(index) * 2.0, float(index % 3), float(index % 2)]
             for index in range(8)
         ]
-        eligible = [audit_row("T1", "AAAAAASA", 7, "S") for _ in range(120)]
+        # A frozen quota can legitimately be below the old n>=30 diagnostic
+        # threshold. Structural evidence must still cover that target.
+        eligible = [audit_row("T1", "AAAAAASA", 7, "S") for _ in range(21)]
         report = structural_support.audit_dominant_position_structural_support(
             eligible_rows=eligible,
             native_rows=[self.record("T1", "AAAAAAAA", target_coordinates)],
@@ -186,6 +188,8 @@ class StructuralConcentrationSupportTests(unittest.TestCase):
             ],
         )
         self.assertEqual(report["quality_gate"], "PASS")
+        self.assertEqual(report["minimum_sites"], 1)
+        self.assertEqual(report["concentrated_target_count"], 1)
         evidence = report["concentrated_targets"][0]
         self.assertEqual(evidence["dominant_position_1based"], 7)
         self.assertEqual(

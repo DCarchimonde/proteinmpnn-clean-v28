@@ -26,7 +26,12 @@ from typing import Any, Dict, List, Mapping, MutableMapping, Sequence, Tuple
 
 
 DEFAULT_CONCENTRATION_SHARE = 0.80
-DEFAULT_MINIMUM_SITES = 30
+# Structural support is a property of the frozen target backbone, not of the
+# number of sampled candidates.  Audit every target with at least one eligible
+# methyl site so a quota-sized target such as 3AVB cannot escape the evidence
+# check merely because its frozen structure quota is below the old n>=30
+# concentration-reporting threshold.
+DEFAULT_MINIMUM_SITES = 1
 DEFAULT_MAXIMUM_POSITIVE_RMSE_ANGSTROM = 0.35
 DEFAULT_MINIMUM_POSITIVE_VS_NEGATIVE_MARGIN_ANGSTROM = 0.05
 
@@ -333,9 +338,11 @@ def audit_dominant_position_structural_support(
         "method": "forward_cyclic_ca_distance_matrix_heldout_provenance_support_v1",
         "interpretation": (
             "Absolute target position is a diagnostic, not a decoder-order proxy. "
-            "A concentrated position is accepted only when a held-out, provenance-"
-            "confirmed methyl-positive backbone match is close and is separated from "
-            "the nearest held-out natural-negative match."
+            "Every target with an eligible concentrated position is audited, including "
+            "targets below the legacy n>=30 reporting threshold. A concentrated "
+            "position is accepted only when a held-out, provenance-confirmed methyl-"
+            "positive backbone match is close and is separated from the nearest "
+            "held-out natural-negative match."
         ),
         "concentration_share_threshold": concentration_share,
         "minimum_sites": minimum_sites,

@@ -30,8 +30,9 @@ V5 因此把模型用途和质量门明确分开：
 - 每个 `target + naturalized sequence` 只复算一次，然后把同一份序列化概率
   回填到所有重复 draw，彻底消除 batch 浮点尾差；
 - 绝对点位和单靶点残基集中继续完整报告，但不删候选；独立审计只在集中点位
-  有 held-out provenance-confirmed 骨架支持时放行；全局单一残基超过 80%
-  仍作为旧 Ser 错标签特征硬拦；
+  有 held-out provenance-confirmed 骨架支持时放行；结构证据覆盖每个有合格
+  甲基位点的集中靶点，不再让候选数少于旧 `n>=30` 报告阈值的靶点跳过；
+  全局单一残基超过 80% 仍作为旧 Ser 错标签特征硬拦；
 - 外部 sampling-step 集中仍是硬门，因为它才直接对应解码顺序错误；
 - 配额不降低。V5 保留全部 V4 行，只对仍低于原定结构配额的靶点使用预先固定
   的 reserve seeds 自动补采样，达到 `quota + 5` 后立即停止；最多 10,000 draw，
@@ -189,6 +190,28 @@ powershell -ExecutionPolicy Bypass -File .\resume_serine_qc_structural_support_v
 脚本会直接复用你刚刚完整算出的 V4 3,379 条候选及其 11,500 条 raw rows；
 只对实际配额短缺靶点补采样，然后执行 held-out 骨架支持门和三遍独立审计。
 `-Force` 只允许覆盖隔离的 V5 输出，不会删除 V3 checkpoint 或 V4 原始结果。
+
+如果 V5 已经成功生成，只需重新做更严格的人工复核包、且不允许再次训练、
+重打分或 GPU 补采样，运行：
+
+```powershell
+git pull --ff-only origin fix/serine-provenance-retrain-2026
+powershell -ExecutionPolicy Bypass -File .\resume_serine_qc_structural_support_v5.ps1 -ReviewOnly
+```
+
+人工已经明确放行后，才可在同一个无 GPU 重算模式中增加
+`-ReleaseHandoff`：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\resume_serine_qc_structural_support_v5.ps1 -ReviewOnly -ReleaseHandoff
+```
+
+该命令自动生成 150 条结构任务和
+`serine_qc_structural_support_v5_shangge_handoff.zip`。新的 review bundle 使用
+`v3_`/`v4_`/`v5_` 前缀避免
+同名清单覆盖，补齐 `v5_target_manifest.csv`、校正后的 train/test、17 个天然
+复合物、历史 4,115 条和先前 1,333 条，并在
+`review_bundle_manifest.json` 中记录每个文件的 SHA-256。
 
 ## 从头完整重跑（通常不需要）
 
