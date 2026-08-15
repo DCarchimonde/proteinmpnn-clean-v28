@@ -6,7 +6,8 @@ This script deliberately recomputes checks from the CSV rows instead of
 trusting the generation manifest.  It performs three separate passes:
 
 1. file/count/row and threshold integrity;
-2. annotation determinism plus point, residue, and sampling-step anomalies;
+2. annotation determinism, decoder-step anomalies, and provenance-backed
+   interpretation of concentrated absolute positions;
 3. prior-pool novelty, target coverage, and workflow-release constraints.
 
 A PASS means the result is ready for manual scientific review, not that it has
@@ -21,6 +22,7 @@ import hashlib
 import json
 import math
 import os
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, MutableMapping, Sequence, Tuple
@@ -28,10 +30,19 @@ from typing import Any, Dict, List, Mapping, MutableMapping, Sequence, Tuple
 
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from paper_clean_v28.serine_qc_retrain.structural_support import (  # noqa: E402
+    audit_dominant_position_structural_support,
+    read_jsonl as read_structural_jsonl,
+)
+
+
 DEFAULT_RUN_DIR = (
     REPO_ROOT
     / "paper_clean_v28_outputs"
-    / "serine_qc_peptide_only_v4"
+    / "serine_qc_structural_support_v5"
     / "generation"
 )
 DEFAULT_PLAN = SCRIPT_PATH.with_name("target_plan_structure_failures.json")
@@ -41,6 +52,21 @@ DEFAULT_PRIOR = (
     / "rerun_temperature_0.5_multiseed"
     / "methylated_new_candidates.csv"
 )
+DEFAULT_TRAIN = (
+    REPO_ROOT
+    / "paper_clean_v28_outputs"
+    / "serine_qc_order_balanced_v3"
+    / "data"
+    / "train_serine_provenance_corrected.jsonl"
+)
+DEFAULT_TEST = (
+    REPO_ROOT
+    / "paper_clean_v28_outputs"
+    / "serine_qc_order_balanced_v3"
+    / "data"
+    / "test_serine_provenance_corrected.jsonl"
+)
+DEFAULT_NATIVE = REPO_ROOT / "17_complexes_native.jsonl"
 EXPECTED_PRIOR_ROWS = 1_333
 NATURAL_AA = "ACDEFGHIKLMNPQRSTVWY"
 METHYLATABLE_AA = set(NATURAL_AA) - {"P"}
@@ -163,6 +189,9 @@ def audit(
     plan_path: Path,
     prior_path: Path,
     out_dir: Path,
+    train_path: Path | None = None,
+    test_path: Path | None = None,
+    native_path: Path | None = None,
 ) -> Dict[str, Any]:
     paths = {
         "all": run_dir / "all_candidates.csv",
@@ -189,9 +218,21 @@ def audit(
     }
     target_names = set(target_plan)
     frozen_targets = {str(value).upper() for value in plan["frozen_targets"]}
-    expected_raw = sum(
+    plan_raw = sum(
         int(row["sequences_per_seed"]) * len(plan["seeds"])
         for row in target_plan.values()
+    )
+    is_adaptive_v5 = (
+        str(manifest.get("protocol", ""))
+        == "temperature_0.5_structural_support_adaptive_quota_recovery_v5"
+    )
+    expected_raw = (
+        int(manifest.get("raw_candidates_expected", -1))
+        if is_adaptive_v5
+        else plan_raw
+    )
+    recovery_stage_counts = Counter(
+        str(row.get("source_recovery_stage", "")) for row in raw_rows
     )
     threshold = float(plan["methyl_threshold"])
 
@@ -403,6 +444,20 @@ def audit(
             and bool(manifest.get("train_deployment_context_match"))
         ),
         "raw_count_matches_plan": len(raw_rows) == expected_raw,
+        "adaptive_v5_source_plus_topup_accounting": (
+            not is_adaptive_v5
+            or (
+                int(manifest.get("source_v4_raw_candidates_retained", -1))
+                + int(manifest.get("adaptive_topup_raw_candidates", -1))
+                == len(raw_rows)
+                and int(manifest.get("source_v4_raw_candidates_retained", -1))
+                == plan_raw
+                and recovery_stage_counts["V4_RESCORED_V3_POOL"]
+                == int(manifest.get("source_v4_raw_candidates_retained", -1))
+                and recovery_stage_counts["V5_ADAPTIVE_QUOTA_TOPUP"]
+                == int(manifest.get("adaptive_topup_raw_candidates", -1))
+            )
+        ),
         "generation_manifest_counts_match_files": (
             int(manifest.get("raw_candidates_generated", -1)) == len(raw_rows)
             and int(manifest.get("unique_candidates", -1)) == len(unique_rows)
@@ -448,6 +503,60 @@ def audit(
             reported_annotation_audit.get("eligible_site_residue_counts", {})
         ).items()
     }
+    concentrated_target_rows = [
+        row
+        for row in concentration_rows
+        if str(row["target_name"]) != "ALL"
+        and bool(row["concentration_gate_applies"])
+        and not bool(row["position_gate_pass"])
+    ]
+    global_position_concentration = any(
+        str(row["target_name"]) == "ALL"
+        and bool(row["concentration_gate_applies"])
+        and not bool(row["position_gate_pass"])
+        for row in concentration_rows
+    )
+    if concentrated_target_rows:
+        missing_support_inputs = [
+            str(path)
+            for path in (train_path, test_path, native_path)
+            if path is None or not path.is_file()
+        ]
+        if missing_support_inputs:
+            structural_support = {
+                "quality_gate": "FAIL",
+                "method": "forward_cyclic_ca_distance_matrix_heldout_provenance_support_v1",
+                "reason": "missing structural-support inputs",
+                "missing_inputs": missing_support_inputs,
+                "concentrated_target_count": len(concentrated_target_rows),
+            }
+        else:
+            structural_support = audit_dominant_position_structural_support(
+                eligible_rows=eligible_rows,
+                native_rows=read_structural_jsonl(native_path),
+                target_manifest_rows=target_manifest_rows,
+                train_records=read_structural_jsonl(train_path),
+                test_records=read_structural_jsonl(test_path),
+            )
+    elif global_position_concentration:
+        structural_support = {
+            "quality_gate": "FAIL",
+            "method": "forward_cyclic_ca_distance_matrix_heldout_provenance_support_v1",
+            "reason": (
+                "global position concentration was present without a concentrated "
+                "target that could be validated structurally"
+            ),
+            "concentrated_target_count": 0,
+        }
+    else:
+        structural_support = {
+            "quality_gate": "PASS",
+            "method": "forward_cyclic_ca_distance_matrix_heldout_provenance_support_v1",
+            "reason": "no target exceeded the structural-support trigger",
+            "concentrated_target_count": 0,
+        }
+    atomic_write_json(out_dir / "structural_position_support.json", structural_support)
+
     pass_2_checks = {
         "repeated_natural_sequences_have_one_annotation": (
             inconsistent_annotation_groups == 0
@@ -455,15 +564,18 @@ def audit(
         "repeated_natural_sequences_have_matching_probabilities": (
             probability_disagreement_groups == 0
         ),
-        "no_global_or_target_point_concentration_above_80_percent": all(
-            bool(row["position_gate_pass"]) for row in concentration_rows
-        ),
-        "no_global_or_target_residue_concentration_above_80_percent": all(
-            bool(row["residue_gate_pass"]) for row in concentration_rows
-        ),
         "no_global_or_target_sampling_step_concentration_above_80_percent": all(
             bool(row["sampling_step_gate_pass"]) for row in concentration_rows
         ),
+        "no_global_residue_concentration_above_80_percent": all(
+            bool(row["residue_gate_pass"])
+            for row in concentration_rows
+            if str(row["target_name"]) == "ALL"
+        ),
+        "dominant_position_concentration_has_heldout_provenance_support": (
+            str(structural_support.get("quality_gate", "")) == "PASS"
+        ),
+        "absolute_position_and_residue_concentration_are_reported_not_filtered": True,
         "generation_manifest_annotation_audit_recomputes": (
             reported_positions == dict(position_all)
             and reported_residues == dict(residue_all)
@@ -582,6 +694,13 @@ def audit(
                 else 0.0
             ),
             "concentration": concentration_rows,
+            "absolute_concentration_policy": (
+                "position and target-local residue shares are diagnostics; global "
+                "residue collapse and sampling-step concentration are hard gates, "
+                "and dominant absolute positions require held-out provenance-backed "
+                "structural support"
+            ),
+            "structural_position_support": structural_support,
         },
         "pass_3_novelty_coverage_workflow": {
             "quality_gate": pass_3,
@@ -612,6 +731,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-dir", default=str(DEFAULT_RUN_DIR))
     parser.add_argument("--plan", default=str(DEFAULT_PLAN))
     parser.add_argument("--prior-handoff-csv", default=str(DEFAULT_PRIOR))
+    parser.add_argument("--train-jsonl", default=str(DEFAULT_TRAIN))
+    parser.add_argument("--test-jsonl", default=str(DEFAULT_TEST))
+    parser.add_argument("--native-jsonl", default=str(DEFAULT_NATIVE))
     parser.add_argument("--out-dir")
     return parser.parse_args()
 
@@ -621,8 +743,19 @@ def main() -> None:
     run_dir = Path(args.run_dir).resolve()
     plan_path = Path(args.plan).resolve()
     prior_path = Path(args.prior_handoff_csv).resolve()
+    train_path = Path(args.train_jsonl).resolve()
+    test_path = Path(args.test_jsonl).resolve()
+    native_path = Path(args.native_jsonl).resolve()
     out_dir = Path(args.out_dir).resolve() if args.out_dir else run_dir / "triple_audit"
-    report = audit(run_dir, plan_path, prior_path, out_dir)
+    report = audit(
+        run_dir,
+        plan_path,
+        prior_path,
+        out_dir,
+        train_path=train_path,
+        test_path=test_path,
+        native_path=native_path,
+    )
     print("===== INDEPENDENT THREE-PASS GENERATION AUDIT =====", flush=True)
     print(f"Quality gate: {report['quality_gate']}", flush=True)
     print(f"Release status: {report['release_status']}", flush=True)

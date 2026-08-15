@@ -27,13 +27,13 @@ REPO_ROOT = SCRIPT_PATH.parents[2]
 DEFAULT_RUN_DIR = (
     REPO_ROOT
     / "paper_clean_v28_outputs"
-    / "serine_qc_peptide_only_v4"
+    / "serine_qc_structural_support_v5"
     / "generation"
 )
 DEFAULT_OUT = (
     REPO_ROOT
     / "paper_clean_v28_outputs"
-    / "serine_qc_peptide_only_v4"
+    / "serine_qc_structural_support_v5"
     / "handoff"
 )
 DEFAULT_PLAN = SCRIPT_PATH.with_name("target_plan_structure_failures.json")
@@ -453,7 +453,7 @@ def main() -> None:
         and bool(generation_manifest.get("train_deployment_context_match"))
     ):
         raise RuntimeError(
-            "Structure handoff requires training-matched peptide-only V4 annotation"
+            "Structure handoff requires training-matched peptide-only annotation"
         )
     if (
         str(triple_audit.get("quality_gate", "")) != "PASS"
@@ -567,7 +567,7 @@ def main() -> None:
     write_structure_inputs(out_dir, tasks)
     manifest = {
         "quality_gate": quality_gate,
-        "protocol": "all_expert_qc_peptide_only_annotation_structure_first_handoff_v4",
+        "protocol": "all_expert_qc_structural_support_structure_first_handoff_v5",
         "generation_manifest": str(generation_manifest_path),
         "generation_manifest_sha256": file_sha256(generation_manifest_path),
         "generation_quality_gate": generation_manifest["quality_gate"],

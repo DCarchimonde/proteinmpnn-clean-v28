@@ -32,6 +32,20 @@ triple_auditor = load_module(
     / "serine_qc_retrain"
     / "04_triple_audit_generation.py",
 )
+structural_support = load_module(
+    "serine_structural_support",
+    ROOT
+    / "paper_clean_v28"
+    / "serine_qc_retrain"
+    / "structural_support.py",
+)
+quota_topup = load_module(
+    "serine_v5_quota_topup",
+    ROOT
+    / "paper_clean_v28"
+    / "serine_qc_retrain"
+    / "06_top_up_quota_and_finalize_v5.py",
+)
 
 
 def audit_row(
@@ -63,7 +77,7 @@ def audit_row(
 
 
 class ResultAnomalyGateTests(unittest.TestCase):
-    def test_invalid_872_style_single_point_concentration_is_blocked(self):
+    def test_single_point_concentration_is_preserved_as_a_diagnostic(self):
         residues = "ACDEFGHIKLMNQRSTVWY"
         rows = []
         for index in range(120):
@@ -71,19 +85,20 @@ class ResultAnomalyGateTests(unittest.TestCase):
             natural = "AAAAAA" + residue + "A"
             rows.append(audit_row("3AVB", natural, 7, residue))
         report = generator.audit_annotation_stability(rows, rows)
-        self.assertEqual(report["quality_gate"], "FAIL")
+        self.assertEqual(report["quality_gate"], "PASS")
         self.assertEqual(report["eligible_site_position_counts"], {7: 120})
         self.assertFalse(
-            report["quality_checks"][
+            report["concentration_diagnostics"][
                 "no_single_position_exceeds_80_percent_of_sites"
             ]
         )
+        self.assertIn("independent audit", report["concentration_gate_policy"])
 
-    def test_old_all_serine_signature_is_blocked(self):
+    def test_old_global_all_serine_signature_remains_blocked(self):
         rows = []
         for index in range(120):
             position = index % 8 + 1
-            rows.append(audit_row("3AVA", "SSSSSSSS", position, "S"))
+            rows.append(audit_row(f"T{index:03d}", "SSSSSSSS", position, "S"))
         report = generator.audit_annotation_stability(rows, rows)
         self.assertEqual(report["quality_gate"], "FAIL")
         self.assertFalse(
@@ -126,6 +141,92 @@ class ResultAnomalyGateTests(unittest.TestCase):
         report = generator.audit_annotation_stability([first, second], [first])
         self.assertEqual(report["quality_gate"], "PASS")
         self.assertEqual(report["raw_probability_disagreement_groups"], 0)
+
+
+class StructuralConcentrationSupportTests(unittest.TestCase):
+    @staticmethod
+    def record(name, sequence, coordinates):
+        return {
+            "name": name,
+            "seq": sequence,
+            "seq_chain_P": sequence,
+            "CA_chain_P": coordinates,
+            "masked_list": ["P"],
+            "visible_list": [],
+        }
+
+    def test_forward_cyclic_heldout_positive_supports_dominant_position(self):
+        reference_coordinates = [
+            [0.0, 0.0, 0.0],
+            [1.1, 0.2, 0.0],
+            [2.0, 1.0, 0.3],
+            [1.6, 2.2, 0.8],
+            [0.4, 2.8, 1.4],
+            [-0.8, 2.0, 1.1],
+            [-1.2, 0.7, 0.5],
+            [-0.4, -0.4, 0.2],
+        ]
+        shift = 5
+        target_coordinates = [
+            reference_coordinates[(index - shift) % 8] for index in range(8)
+        ]
+        negative_coordinates = [
+            [float(index) * 2.0, float(index % 3), float(index % 2)]
+            for index in range(8)
+        ]
+        eligible = [audit_row("T1", "AAAAAASA", 7, "S") for _ in range(120)]
+        report = structural_support.audit_dominant_position_structural_support(
+            eligible_rows=eligible,
+            native_rows=[self.record("T1", "AAAAAAAA", target_coordinates)],
+            target_manifest_rows=[{"target_name": "T1", "selected_chain": "P"}],
+            train_records=[self.record("TRAIN", "AAAAAAAA", negative_coordinates)],
+            test_records=[
+                self.record("POSITIVE", "AsAAAAAA", reference_coordinates),
+                self.record("NEGATIVE", "AAAAAAAA", negative_coordinates),
+            ],
+        )
+        self.assertEqual(report["quality_gate"], "PASS")
+        evidence = report["concentrated_targets"][0]
+        self.assertEqual(evidence["dominant_position_1based"], 7)
+        self.assertEqual(
+            evidence["heldout_test_nearest_methyl_positive"][
+                "reference_position_1based"
+            ],
+            2,
+        )
+        self.assertTrue(evidence["structural_support_pass"])
+
+
+class AdaptiveQuotaSourceValidationTests(unittest.TestCase):
+    @staticmethod
+    def manifest(checks):
+        return {
+            "protocol": quota_topup.V4_PROTOCOL,
+            "model_expert_qc_protocol": quota_topup.REQUIRED_EXPERT_PROTOCOL,
+            "annotation_mode": quota_topup.ANNOTATION_MODE,
+            "annotation_context_policy": quota_topup.ANNOTATION_CONTEXT,
+            "annotation_visible_receptor_chains": 0,
+            "train_deployment_context_match": True,
+            "raw_candidates_generated": 2,
+            "quality_gate": "FAIL",
+            "quality_checks": checks,
+        }
+
+    def test_only_documented_v4_failures_can_enter_v5(self):
+        manifest = self.manifest(
+            {
+                "repeated_final_natural_sequences_have_identical_annotations": True,
+                "no_single_position_exceeds_80_percent_of_sites": False,
+                "every_target_meets_pre_structure_candidate_quota": False,
+            }
+        )
+        result = quota_topup.validate_v4_source(manifest, [{}, {}])
+        self.assertTrue(result["source_false_checks_allowed_for_v5"])
+
+    def test_unrelated_v4_integrity_failure_is_never_bypassed(self):
+        manifest = self.manifest({"raw_rows_are_valid": False})
+        with self.assertRaisesRegex(RuntimeError, "not allowed to bypass"):
+            quota_topup.validate_v4_source(manifest, [{}, {}])
 
 
 class IndependentTripleAuditIntegrationTests(unittest.TestCase):

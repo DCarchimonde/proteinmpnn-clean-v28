@@ -292,6 +292,27 @@ class StructureFirstHandoffTests(unittest.TestCase):
             launcher.index("04_triple_audit_generation.py"),
         )
 
+    def test_v5_launcher_reuses_v4_then_tops_up_before_structural_audit(self):
+        launcher = (
+            ROOT / "resume_serine_qc_structural_support_v5.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn("06_top_up_quota_and_finalize_v5.py", launcher)
+        self.assertIn("structural_position_support.json", launcher)
+        self.assertIn("serine_qc_structural_support_v5", launcher)
+        self.assertNotIn("02_retrain_canonical_expert_heads.py", launcher)
+        self.assertLess(
+            launcher.index("$V5Topup"),
+            launcher.index("$Auditor"),
+        )
+        self.assertLess(
+            launcher.rindex("& $ResolvedPython @TopupArguments"),
+            launcher.rindex("& $ResolvedPython $Auditor"),
+        )
+        programs = re.findall(r"\$ProbeCode = '([^'\r\n]+)'", launcher)
+        self.assertEqual(len(programs), 2)
+        for program in programs:
+            compile(program, "<Ser V5 PowerShell Python probe>", "exec")
+
     def test_generator_has_no_deferred_permeability_write_path(self):
         text = (
             ROOT / "paper_clean_v28" / "rerun_t05" / "01_generate_t05_multiseed.py"
