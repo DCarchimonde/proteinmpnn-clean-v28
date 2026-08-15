@@ -73,14 +73,15 @@ function Invoke-PythonProgram {
     param(
         [string]$PythonPath,
         [string]$Program,
-        [string]$Stage
+        [string]$Stage,
+        [string[]]$Arguments = @()
     )
     $Stem = "proteinmpnn_serine_v5_$([Guid]::NewGuid().ToString('N'))"
     $ProgramPath = Join-Path ([System.IO.Path]::GetTempPath()) ($Stem + ".py")
     try {
         $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
         [System.IO.File]::WriteAllText($ProgramPath, $Program, $Utf8NoBom)
-        & $PythonPath $ProgramPath
+        & $PythonPath $ProgramPath @Arguments
         if ($LASTEXITCODE -ne 0) {
             throw "$Stage failed with exit code $LASTEXITCODE"
         }
@@ -89,6 +90,57 @@ function Invoke-PythonProgram {
             Remove-Item -LiteralPath $ProgramPath -Force -ErrorAction SilentlyContinue
         }
     }
+}
+
+function Compress-PortableArchive {
+    param(
+        [string]$PythonPath,
+        [string]$SourceDirectory,
+        [string]$DestinationPath,
+        [string]$Stage
+    )
+    # Windows Compress-Archive records directory separators as backslashes.
+    # Info-ZIP extracts those entries but returns warning status 1, which can
+    # stop a Linux/HPC handoff script running with `set -e`.  Python zipfile
+    # plus as_posix() writes canonical ZIP member paths on every platform.
+    $PortableArchiveProgram = @'
+import sys
+import zipfile
+from pathlib import Path
+
+source = Path(sys.argv[1]).resolve()
+destination = Path(sys.argv[2]).resolve()
+if not source.is_dir():
+    raise SystemExit(f"archive source is not a directory: {source}")
+destination.parent.mkdir(parents=True, exist_ok=True)
+if destination.exists():
+    destination.unlink()
+
+files = sorted(path for path in source.rglob("*") if path.is_file())
+with zipfile.ZipFile(
+    destination,
+    mode="w",
+    compression=zipfile.ZIP_DEFLATED,
+    compresslevel=9,
+) as archive:
+    for path in files:
+        archive.write(path, arcname=path.relative_to(source).as_posix())
+
+with zipfile.ZipFile(destination, mode="r") as archive:
+    names = archive.namelist()
+    if len(names) != len(set(names)):
+        raise SystemExit("portable archive contains duplicate member names")
+    if any("\\" in name for name in names):
+        raise SystemExit("portable archive contains a backslash member path")
+    bad_member = archive.testzip()
+    if bad_member is not None:
+        raise SystemExit(f"portable archive CRC failure: {bad_member}")
+'@
+    Invoke-PythonProgram `
+        -PythonPath $PythonPath `
+        -Program $PortableArchiveProgram `
+        -Stage $Stage `
+        -Arguments @($SourceDirectory, $DestinationPath)
 }
 
 $RequiredInputs = @(
@@ -209,9 +261,9 @@ try {
         --out-dir $AuditOut
     Assert-LastExitCode "Independent V5 three-pass audit"
 
-    # Stage explicitly named files before compression. Compress-Archive flattens
-    # individual input paths, so the old bundle contained two indistinguishable
-    # generation_manifest.json entries and omitted target_manifest.csv.
+    # Stage explicitly named files before compression. The old flat bundle
+    # contained two indistinguishable generation_manifest.json entries and
+    # omitted target_manifest.csv.
     $ReviewStaging = Join-Path $V5Root "review_bundle_staging"
     if (Test-Path -LiteralPath $ReviewStaging) {
         Remove-Item -LiteralPath $ReviewStaging -Recurse -Force
@@ -272,7 +324,11 @@ try {
             (($ReviewManifest | ConvertTo-Json -Depth 8) + [Environment]::NewLine),
             $Utf8NoBom
         )
-        Compress-Archive -Path (Join-Path $ReviewStaging "*") -DestinationPath $ReviewBundle -Force
+        Compress-PortableArchive `
+            -PythonPath $ResolvedPython `
+            -SourceDirectory $ReviewStaging `
+            -DestinationPath $ReviewBundle `
+            -Stage "Portable manual-review ZIP packaging"
         Write-Host "Review bundle: $($ReviewContents.Count + 1) uniquely named, hash-recorded files"
     } finally {
         if (Test-Path -LiteralPath $ReviewStaging) {
@@ -297,7 +353,11 @@ try {
         Copy-Item -LiteralPath (Join-Path $AuditOut "three_pass_generation_audit.json") -Destination (Join-Path $HandoffEvidence "v5_three_pass_generation_audit.json") -Force
         Copy-Item -LiteralPath (Join-Path $AuditOut "structural_position_support.json") -Destination (Join-Path $HandoffEvidence "v5_structural_position_support.json") -Force
         Copy-Item -LiteralPath $Plan -Destination (Join-Path $HandoffEvidence "target_plan_structure_failures.json") -Force
-        Compress-Archive -Path (Join-Path $HandoffOut "*") -DestinationPath $HandoffBundle -Force
+        Compress-PortableArchive `
+            -PythonPath $ResolvedPython `
+            -SourceDirectory $HandoffOut `
+            -DestinationPath $HandoffBundle `
+            -Stage "Portable Shang-ge handoff ZIP packaging"
     }
 } finally {
     Pop-Location

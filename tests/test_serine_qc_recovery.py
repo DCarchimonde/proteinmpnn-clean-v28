@@ -307,6 +307,10 @@ class StructureFirstHandoffTests(unittest.TestCase):
         self.assertIn('"review_bundle_manifest.json"', launcher)
         self.assertIn("serine_qc_structural_support_v5_shangge_handoff.zip", launcher)
         self.assertIn('"review_evidence"', launcher)
+        self.assertIn("function Compress-PortableArchive", launcher)
+        self.assertIn("path.relative_to(source).as_posix()", launcher)
+        self.assertIn("archive.testzip()", launcher)
+        self.assertNotRegex(launcher, r"(?m)^\s*Compress-Archive\b")
         self.assertNotIn("02_retrain_canonical_expert_heads.py", launcher)
         self.assertLess(
             launcher.index("$V5Topup"),
@@ -320,6 +324,17 @@ class StructureFirstHandoffTests(unittest.TestCase):
         self.assertEqual(len(programs), 2)
         for program in programs:
             compile(program, "<Ser V5 PowerShell Python probe>", "exec")
+        portable_program = re.search(
+            r"\$PortableArchiveProgram = @'\r?\n(.*?)\r?\n'@",
+            launcher,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(portable_program)
+        compile(
+            portable_program.group(1),
+            "<Ser V5 portable ZIP packager>",
+            "exec",
+        )
 
     def test_generator_has_no_deferred_permeability_write_path(self):
         text = (
