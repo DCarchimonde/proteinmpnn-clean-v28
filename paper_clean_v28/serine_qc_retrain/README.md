@@ -1,296 +1,184 @@
-# Ser 来源质控 + 结构证据恢复流程（v5）
+# Ser 来源质控与循环起点不变性恢复（V6）
 
-本目录修复一个有明确 PDB 来源证据的标签问题，重新训练生产网络中的
-完整专家模块，并修复训练、生成和最终甲基位点注释之间的解码顺序不一致。
-昂贵的结构补跑仍限制在当前 T=0.5 结构门未通过的复合物。最终只产出一个
-新的完整 checkpoint；共享主干和天然氨基酸 base head 仍逐字节冻结。
+## 先说结论
 
-## V4 为什么仍被拦住，以及 V5 修了什么
+V5 已撤回。不要发送下面任何旧文件：
 
-V3 已经真实完成一次来源修复、80 轮 expert-head 重训和 11,500 条新天然序列
-生成。V4 又把最终 expert 标注改成训练一致的 peptide-only 上下文，并且把每个
-`target + naturalized sequence` 只算一次。V4 日志中的
-`Raw natural sequences retained: 11500`、`Unique ... rescored: 7404` 和
-`New methylated candidates: 3379` 说明模型和数据流程都完整跑完；最后红字来自
-科学质量门，不是 CUDA、文件路径或 Python 崩溃。
+- V5 的 3,389 条 `methylated_new_candidates.csv`；
+- V5 选出的 150 条结构任务；
+- 两个 V5 尚哥交接 ZIP。
 
-V4 证明“受体链上下文不一致”不是第 7 位集中的完整根因。进一步对固定数据做
-循环骨架比对后发现：10 个 3AV* 靶点是高度同源的 8 肽骨架。它们的第 7 位经
-正向循环平移后，最近的独立 test 结构都是
-`Me_1283AAAsresult_proc0010_0019` 的第 2 位 N-甲基 Ser；C-alpha 距离矩阵
-RMSE 为约 `0.14–0.23 Å`。最近的 test 天然阴性位置为约 `0.41–0.47 Å`，
-正负间隔为约 `0.24–0.31 Å`。所以同一绝对位点集中在这个同源固定骨架家族中
-有独立 PDB 来源标签支持，不能再把“超过 80%”本身当作解码卡死。
+这不是说 3,389 条已经逐条证明“化学上都错”，而是它们共用的上游甲基位点
+判定存在未排除的固定数组位置偏差，整批因而没有达到可交付证据标准。V6 会
+重新训练、重新判分并重新生成全部 17 个靶点；不会直接删除第 7 位，也不会把
+旧结果重新排个表冒充修复。
 
-V5 因此把模型用途和质量门明确分开：
+## 3AV9 到底错在哪里
 
-- 天然 base 序列采样继续使用受体可见的复合物上下文；
-- 最终 expert 甲基标注删除所有受体链，只保留肽链坐标、肽链天然序列、
-  从 0 开始的单链 residue index 和单一 chain encoding，与训练完全相同；
-- 每个 `target + naturalized sequence` 只复算一次，然后把同一份序列化概率
-  回填到所有重复 draw，彻底消除 batch 浮点尾差；
-- 绝对点位和单靶点残基集中继续完整报告，但不删候选；独立审计只在集中点位
-  有 held-out provenance-confirmed 骨架支持时放行；结构证据覆盖每个有合格
-  甲基位点的集中靶点，不再让候选数少于旧 `n>=30` 报告阈值的靶点跳过；
-  全局单一残基超过 80% 仍作为旧 Ser 错标签特征硬拦；
-- 外部 sampling-step 集中仍是硬门，因为它才直接对应解码顺序错误；
-- 配额不降低。V5 保留全部 V4 行，只对仍低于原定结构配额的靶点使用预先固定
-  的 reserve seeds 自动补采样，达到 `quota + 5` 后立即停止；最多 10,000 draw，
-  超限仍未达到配额就明确失败；
-- 历史 4,115 条、先前 1,333 条、重复天然序列和三遍独立审计仍全部是硬门。
-
-注意：这里可复用的是**已经修好因果顺序后生成的 V3 11,500 条天然序列**，
-以及已经推广的 V3 重训 checkpoint。V5 不假装“再次训练”同一个 checkpoint；
-它只为真实配额短缺补采样新天然序列。
-更早被撤回的 872 条仍不能复用，因为那一批连天然序列的采样因果掩码都不一致。
-
-## 已确认的问题
-
-旧预处理把天然残基表和 N-甲基残基表按 `residue_name` 直接合并。两张表
-都曾包含 `SER`，导致普通 `ATOM-SER` 被静默覆盖成小写 `s`。固定来源为
-`DCarchimonde/ProteinMPNN` 提交：
+旧冻结表把 3AV9 的 `QICGRGRG` 算进了“已通过 7 条”，因为它的两项结构指标
+都小于 3 Å。但该序列：
 
 ```text
-28dff152d83623dfb322480413b7dc889f8537a4
+design_seq = QICGRGRG
+old_methyl_positions_1based = []
 ```
 
-按 PDB 的 record type 和 `CN` 原子重建后：
+也就是一个甲基 token 都没有。它只满足“天然序列结构相似”，不满足“甲基化
+候选化合物”这个前提。旧 bridge 只检查两项 RMSD，没有检查
+`design_methyl_count > 0`，所以把两个不同问题混在了一起。
 
-| split | rows | `s -> S` | natural `S` | methyl `s` | natural `P` | methyl `p` |
-|---|---:|---:|---:|---:|---:|---:|
-| train | 600 | 242 | 242 | 50 | 307 | 0 |
-| test | 151 | 62 | 62 | 12 | 83 | 0 |
+正确的逐级门是：
 
-解析规则是：
+1. 候选必须至少含一个由最终模型判定的甲基位点；
+2. 必须通过历史 4,115 条、先前 1,333 条及天然化序列去重；
+3. 之后才送结构；
+4. 返回结构必须同时满足 global complex CA RMSD `< 3 Å` 和完整环肽 cyclic
+   CA RMSD `< 3 Å`；
+5. 结构通过后才进入透膜性比较。
 
-- `ATOM-SER` 始终是天然 `S`；
-- 带 `CN` 的 `HETATM-5JP` 是甲基 `s`；
-- 历史数据中一个带 `CN` 的 `HETATM-SER` 也确认为甲基 `s`；
-- 模糊的 `HETATM-SER` 或缺少 `CN` 的甲基组分直接报错；
-- `p` 没有正样本，因此不新增 token、不改变 40 字符字母表或 checkpoint 维度。
+因此 3AV9 必须重新生成。旧 7 条也不再被 grandfather：另外 6 条的 pre-QC
+甲基注释与校正后 checkpoint 不一致，所以 V6 对 17 个靶点统一重训、重算，
+不保留任何旧甲基位点。
 
-训练和测试 JSONL 的语义哈希、行数、标签变化类型及上述计数均为硬门槛。
-坐标和所有非序列字段保持不变。
+## 为什么 V5 的 3,389 条全在第 7 位
 
-## 新确认的点位问题
+S 标签错误和第 7 位问题是两层独立错误。
 
-S 来源修复和点位异常是两个独立问题。旧 V28 训练在训练态使用随机解码顺序；
-此前的 Ser-QC 重训为了关闭 dropout 把模型保持在 `eval()`，却没有显式传入
-解码顺序，因此专家头只见过固定顺序。生成端又随机选择下一个肽位点，但
-模型内部仍使用固定因果掩码。外层采样顺序、模型可见上下文和专家头训练
-上下文三者不一致。
+### 第一层：S 来源标签
 
-这个错误在去掉小写 token 回灌后不再被旧泄漏掩盖，表现为新 872 条中
-873 个甲基位点有 833 个落在第 7 位（95.42%），并且 11,500 条原始生成中
-有 1,052 个重复天然序列组，其中 208 组得到不同甲基标注。该 872 条结果
-因此明确撤回，不能交结构；不能通过删除第 7 位或重排表格补救。
+旧预处理把天然残基表和 N-甲基残基表按 `residue_name` 直接合并，两张表都含
+`SER`，导致普通 `ATOM-SER` 被覆盖成小写 `s`。现在按 PDB record type 和
+`CN` 原子重建：
 
-v3 的闭环是：
+- `ATOM-SER` 一定是天然 `S`；
+- 带 `CN` 的 `HETATM-5JP` 是 N-甲基 `s`；
+- 历史中一个带 `CN` 的 `HETATM-SER` 也确认为 `s`；
+- 模糊记录直接报错，不能猜。
 
-- 专家头训练使用 epoch-indexed 循环解码顺序；至少 30 个 epoch，覆盖冻结的
-  30-residue 肽长度上限内每一个相对解码深度；
-- 天然序列采样的外层随机顺序被原样传入模型因果掩码；
-- 完整天然序列生成后，用所有循环移位做确定性专家概率集成，每个位点恰好
-  在每个相对深度出现一次；
-- 同一 `target + naturalized sequence` 必须得到同一标注和同一概率；
-- 采样步异常集中会直接阻断交付；绝对点位集中必须通过 held-out PDB 来源骨架
-  支持门，无法得到结构支持时同样阻断交付。
+固定计数为：train 600 条，其中 `S=242, s=50`；独立 test 151 条，其中
+`S=62, s=12`。小写标签在模型 forward 前全部转回天然母体，避免答案从序列
+embedding 泄漏。
 
-## 训练边界：完整专家模块，而不是只改 Ser
+### 第二层：环肽数组起点
 
-`02_retrain_canonical_expert_heads.py` 使用生产推理相同的完整 clean-V28
-网络，同时更新 `experts[0]` 到 `experts[19]` 的 weight 和 bias。共享
-ProteinMPNN 主干、序列 embedding、decoder 和天然氨基酸 base head 全部
-逐字节冻结。
+V3 的确重训了全部 20 个 expert heads，也把采样顺序传进了因果 mask；但它的
+“cyclic order ensemble”只改变**解码先后顺序**。它没有一起轮换：
 
-600 条纠正训练记录先按记录级确定性拆分为 development-train 和 validation；
-原来的 151 条 test 不参与 epoch 选择或 early stopping，只在最终 checkpoint
-确定后用于质量门和固定报告，不把结果反馈给训练。每个 forward 前，所有
-小写甲基标签都转换成天然母体作为模型输入，避免答案通过 `W_s` 泄漏。
-训练 forward 显式使用循环解码顺序；前 30 个 epoch 完成顺序覆盖之前，不允许
-选择 checkpoint 或 early stop。validation、独立 test 和生产注释均使用同一
-完整天然序列循环顺序集成口径。
+- 环肽天然序列；
+- 每个残基的 N/CA/C/O 坐标；
+- 从 0 开始的 `residue_idx`。
 
-19 个有正负训练支持的专家使用各自的 class weight；Pro 没有 `p` 正样本，
-其专家只学习天然 P 的负类 veto，且生成器仍没有 `P -> p` 映射。
+ProteinMPNN 看到的仍是一个有首尾边界的线性数组。因此，“每个位点都经历过
+各种解码深度”并不等于“每个物理残基都经历过各种数组位置”。V5 的 7,791
+条唯一天然序列中，4,347 条没有甲基，3,444 条有甲基且全部落在数组第 7 位；
+再排除历史/先前重复后剩 3,389 条。这种整批结果必须按上游表示偏差处理，后面
+再做三遍 CSV 审计或结构来源解释都不能把它变成有效结果。
 
-保存前后的 state hash 必须证明恰好 40 个 expert tensor 改变：
+“以前通过的化合物不全在第 7 位”并不反驳这一点：那些序列来自不同的 pre-QC
+模型、标签和生成口径，其中 3AV9 甚至根本没有甲基。旧位点不能拿来证明 V5
+这次全第 7 位是正常的；同样，也不能仅凭旧位点不同就认定旧位点正确。
+
+## V6 具体怎样修
+
+V6 从仓库根目录的 canonical `frankenstein_v28.pt` 重新训练全部 20 个 expert
+heads，共享 ProteinMPNN trunk、sequence embedding、decoder 和天然氨基酸
+base head 保持逐字节冻结。
+
+训练时，对每条环肽枚举所有等价循环起点；序列、甲基标签和 N/CA/C/O 坐标
+一起平移，并把 `residue_idx` 重置为 `0..L-1`。训练 epoch 仍轮换因果解码
+顺序，所以每个真实物理残基会覆盖所有数组位置和相对解码深度。验证、独立
+test 和最终生成都使用同一口径：
 
 ```text
-experts.0.weight / experts.0.bias
-...
-experts.19.weight / experts.19.bias
+每个循环起点 × 每个解码顺序
+        ↓
+把概率逆映射回原始物理残基
+        ↓
+对同一物理残基求平均
+        ↓
+严格 probability > 0.6 才写小写甲基 token
 ```
 
-任何非 expert tensor 改变都直接失败。保存后的 checkpoint 必须由生产 loader
-严格回读，并通过固定的 validation、Ser、macro-AUC、总体
-precision/recall/FPR 和无 `p` 假阳性门槛；失败时只保留 `.candidate.pt`
-诊断文件，后续生成自动停止。阈值类晋级指标使用与生产生成完全相同的口径：
-对每个循环解码顺序计算 `sigmoid(logit / 0.5)`，取确定性均值后执行严格
-`> 0.6`。旧的固定顺序 evaluator 不再作为 v3 checkpoint 的晋级证据。
+生成前有独立 test 硬门：151 条 test 未参与 train/validation 拆分和 epoch
+选择；AUC、precision、recall、FPR、Ser 和 Pro 门任一失败，流程立即停止，不会
+开始 17 靶点生成。checkpoint、test、计划文件的 SHA-256 会绑定在审计报告中，
+不能拿别的模型报告冒充。
 
-## 冻结与重跑范围
+V6 对全部 17 个靶点计划生成 19,500 条 raw draws。最终
+`methylated_new_candidates.csv` 保存**所有**满足甲基硬门且去重后的新候选，
+不是只保留 150 条；最终多少条由新模型真实结果决定，不能预先承诺仍为 3,389。
+计划里的 245 只是将来人工放行后用于检查每个靶点是否有足够结构覆盖的最低
+配额总和，本次命令不会生成尚哥交接包，也不会把候选截成 245 条。
 
-结构门定义固定为：一次全复合物对齐后，global complex CA RMSD `< 3 Å`，
-并且完整末链环肽在最佳正向循环移位下 CA RMSD `< 3 Å`；不允许肽链二次拟合。
+## Windows 一键运行
 
-已通过并冻结 7 个 T=0.5 靶点：
-
-```text
-1SFI  3AV9  3P8F  3WNE  3ZGC  4K1E  4KEL
-```
-
-这 7 条已接受设计均不含小写 `s`。它们不会重新生成，也不会重新交结构；
-新 checkpoint 训练完成后先运行一次零成本 bridge，用最终专家模块统一
-重评分，但绝不覆盖这 7 条已经接受的序列或甲基位点；若最终模型不同意旧
-注释，bridge 会把不一致写入溯源，而不是静默换成另一个化合物。HighFold
-使用的天然化序列没有变化，所以既有 PDB 和结构门结果原样复用。
-这 7 条的候选来源必须如实记为“pre-QC generation, audited by the final
-checkpoint”，不能写成由新 checkpoint 重新采样；最终报告和后续生成只保留
-一个生产 checkpoint。
-
-仅重跑 10 个当前未通过结构门的靶点：
-
-```text
-3AVA  3AVB  3AVF  3AVG  3AVH
-3AVI  3AVJ  3AVK  3AVM  3AVN
-```
-
-固定 5 个 seed，共生成 11,500 条原始候选；按未改动的 base likelihood、
-纠正后的甲基位点置信度、跨 seed 稳定性和序列多样性，最多选 150 个结构
-任务。旧 4,115 条和先前 1,333 条 `methylated_new_candidates.csv` 都作为
-强制输入执行两层硬去重：`target + design_seq` 精确重复、以及
-`target + naturalized_seq` 天然化重复均不允许进入新候选池或交接表。
-1,333 条文件缺失或行数不是 1,333 时，流程会在训练前停止，不能靠
-“新模型应该不会重复”来猜。
-
-生成时小写 token 只记录最终甲基化注释；后续自回归步骤只接收其天然母体，
-外层随机生成顺序同时传给模型因果掩码。天然序列完成后才进行循环顺序集成
-复评；生成路径上的临时专家概率只留作审计，不决定最终小写位点。
-
-旧 T=0.5 结构失败不能归因于 Ser 标签或解码顺序问题。新序列仍须重新生成、
-通过结果审计并重新计算结构，才能判断是否通过；现有 872 条不能复用或仅
-重新标注，因为它们的天然序列本身也是在不一致因果掩码下采样的。
-
-## 一键完成 V5（推荐）
-
-在仓库目录
-`E:\ProteinMPNN_work\proteinmpnn-clean-v28` 中运行：
+必须在真正的仓库目录运行，而不是上一层 `E:\ProteinMPNN_work`：
 
 ```powershell
+cd E:\ProteinMPNN_work\proteinmpnn-clean-v28
+git fetch origin
+git switch fix/serine-provenance-retrain-2026
 git pull --ff-only origin fix/serine-provenance-retrain-2026
-powershell -ExecutionPolicy Bypass -File .\resume_serine_qc_structural_support_v5.ps1 -Force
+git rev-parse --short HEAD
+powershell -ExecutionPolicy Bypass -File .\run_serine_qc_cyclic_representation_v6.ps1 -Force
 ```
 
-该命令自动使用现成的 V3 checkpoint、V3 `all_candidates.csv`、仓库里默认的
-历史 4,115 条和先前 1,333 条文件。正常情况下不需要填写任何
-`E:\你的路径\methylated_new_candidates.csv`；那种写法只是“文件若被你移走时
-才填写的占位符”，不是一个真实文件名。
+脚本会依次执行：
 
-脚本会直接复用你刚刚完整算出的 V4 3,379 条候选及其 11,500 条 raw rows；
-只对实际配额短缺靶点补采样，然后执行 held-out 骨架支持门和三遍独立审计。
-`-Force` 只允许覆盖隔离的 V5 输出，不会删除 V3 checkpoint 或 V4 原始结果。
+1. 检查 CUDA、canonical checkpoint、校正后的 train/test 和历史去重文件；
+2. 使用所有循环起点重训 20 个 expert heads；
+3. 跑 151 条独立 test 与 17 个 native target 的循环表示审计；
+4. 只有前述门全部 PASS 才重新生成全部 17 个靶点；
+5. 对生成结果做独立三遍审计；
+6. 只打人工复核包，明确不创建尚哥 handoff。
 
-如果 V5 已经成功生成，只需重新做更严格的人工复核包、且不允许再次训练、
-重打分或 GPU 补采样，运行：
-
-```powershell
-git pull --ff-only origin fix/serine-provenance-retrain-2026
-powershell -ExecutionPolicy Bypass -File .\resume_serine_qc_structural_support_v5.ps1 -ReviewOnly
-```
-
-人工已经明确放行后，才可在同一个无 GPU 重算模式中增加
-`-ReleaseHandoff`：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\resume_serine_qc_structural_support_v5.ps1 -ReviewOnly -ReleaseHandoff
-```
-
-该命令自动生成 150 条结构任务和
-`serine_qc_structural_support_v5_shangge_handoff.zip`。新的 review bundle 使用
-`v3_`/`v4_`/`v5_` 前缀避免
-同名清单覆盖，补齐 `v5_target_manifest.csv`、校正后的 train/test、17 个天然
-复合物、历史 4,115 条和先前 1,333 条，并在
-`review_bundle_manifest.json` 中记录每个文件的 SHA-256。
-
-## 从头完整重跑（通常不需要）
-
-Windows（默认寻找当前环境或名为 `wain` 的 Conda 环境）：
-
-```powershell
-git pull
-powershell -ExecutionPolicy Bypass -File .\run_serine_qc_recovery.ps1
-```
-
-显式指定 Python：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\run_serine_qc_recovery.ps1 `
-  -Python "E:\anaconda3\envs\wain\python.exe"
-```
-
-旧的 1,333 条交接表是强制证据。默认路径不存在时必须显式传入；精确序列
-和天然化序列重复都会被排除：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\run_serine_qc_recovery.ps1 `
-  -PriorHandoffCsv "E:\ProteinMPNN_work\proteinmpnn-clean-v28\paper_clean_v28_outputs\rerun_temperature_0.5_multiseed\methylated_new_candidates.csv"
-```
-
-AutoDL/Linux：
-
-```bash
-git pull
-bash run_serine_qc_recovery.sh --python python
-```
-
-对应的 Linux 参数是 `--prior-handoff-csv /path/to/methylated_new_candidates.csv`。
-
-正常流程需要 CUDA。仅调试时才可显式传 `-AllowCpu` 或 `--allow-cpu`。
-输出目录若已有部分生成结果，脚本会停止；确认要重跑同一隔离目录时传
-`-Force` 或 `--force`。
-
-默认运行**不会**创建给尚哥的交接包。自动门通过后只生成：
+`-Force` 只清理并重建隔离目录：
 
 ```text
-paper_clean_v28_outputs/serine_qc_structural_support_v5/
-  serine_qc_structural_support_v5_review_bundle.zip
+paper_clean_v28_outputs/serine_qc_cyclic_representation_v6/
 ```
 
-必须把该 review bundle 做第三遍人工科学复核；只有明确放行后，才可再次传
-`-ReleaseHandoff`（Linux 为 `--release-handoff`）。不能为了提前拿到 CSV
-绕过这一停点。
+它不会删除 canonical checkpoint、V3/V4/V5 原始结果或历史 CSV。若显存不足，
+可降低批大小，例如：
 
-## 输出与真实先后顺序
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_serine_qc_cyclic_representation_v6.ps1 `
+  -Force -TrainingBatchSize 4 -AuditBatchSize 4 -GenerationBatchSize 4
+```
 
-从头完整脚本依次执行：
+## 正常完成后看什么
 
-1. 从固定旧提交和 751 个 PDB 重建 train/test 标签；
-2. 用顺序平衡协议重训 canonical 全部 20 个 expert heads；
-3. 用循环顺序集成完成 validation 和 151 条独立 test 晋级门；
-4. 对已通过的 7 个靶点做同口径 bridge，复用既有结构；
-5. 只为 10 个失败靶点生成 11,500 条新 T=0.5 原始候选；
-6. 生成器内执行第一轮结果门；
-7. `04_triple_audit_generation.py` 独立重算完整性、解码步分布、held-out
-   骨架支持和去重/配额三遍审计；
-8. 停在人工复核，不自动生成给尚哥的表。
-
-人工复核文件：
+终端最后应显示：
 
 ```text
-paper_clean_v28_outputs/serine_qc_structural_support_v5/serine_qc_structural_support_v5_review_bundle.zip
-paper_clean_v28_outputs/serine_qc_structural_support_v5/generation/generation_manifest.json
-paper_clean_v28_outputs/serine_qc_structural_support_v5/triple_audit/three_pass_generation_audit.json
-paper_clean_v28_outputs/serine_qc_structural_support_v5/triple_audit/structural_position_support.json
-paper_clean_v28_outputs/serine_qc_order_balanced_v3/model/expert_heads_retrain_manifest.json
+V6 AUTOMATED GATES PASSED; MANUAL REVIEW IS STILL REQUIRED
+Shang-ge handoff:     NOT CREATED
 ```
 
-快速恢复复用 V3 checkpoint，所以训练 manifest 始终如实保留在 V3 `model/`
-下；V5 只新增配额补采样和结构证据审计，不伪造第二次训练 provenance。
+然后上传这个文件进行人工复核：
 
-最终条数由重跑和审计决定，不预设为 872，也不为了凑数降低阈值或删除异常
-位点。只有人工复核放行后才会在 `handoff/` 下生成简化结构任务表。
+```text
+paper_clean_v28_outputs/serine_qc_cyclic_representation_v6/
+  serine_qc_cyclic_representation_v6_review_bundle.zip
+```
 
-本流程强制 `STRUCTURE_FIRST_THEN_PERMEABILITY`。结构返回前不会生成
-`permeability_input.csv`，也不会运行透膜模型。透膜性只能在返回结构通过
-同一结构门之后另行筛选。
+关键证据也会单独保留：
+
+```text
+model/expert_heads_retrain_manifest.json
+representation_audit/cyclic_representation_audit.json
+generation/generation_manifest.json
+generation/methylated_new_candidates.csv
+triple_audit/three_pass_generation_audit.json
+```
+
+如果流程报错，不要继续运行 V5 的 `-ReviewOnly -ReleaseHandoff`，也不要手工挑
+CSV。把完整终端日志和当时已有的 V6 review ZIP（若已生成）发回来定位。
+
+已经完成一次 V6 后，仅重新审计和打包可运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_serine_qc_cyclic_representation_v6.ps1 -ReviewOnly
+```
+
+V6 人工复核通过前，结构交接和透膜性步骤都保持阻断。

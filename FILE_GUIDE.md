@@ -146,16 +146,15 @@ Checks whether any files are too large for normal GitHub upload.
 ### `.gitignore`
 Clean-repository ignore rules.
 
-## Ser provenance and decoding-order recovery
+## Ser provenance and cyclic-representation recovery
 
 ### `paper_clean_v28/serine_qc_retrain/README.md`
-Evidence, frozen scope, decoding-order root cause, quality gates, and exact
-commands for the Ser correction plus order-balanced v3 recovery.
+Evidence for the Ser correction, the withdrawn non-methylated 3AV9 row, the
+fixed tensor-position-7 root cause, V6 quality gates, and exact commands.
 
-### `run_serine_qc_recovery.ps1` / `run_serine_qc_recovery.sh`
-One-command Windows and AutoDL/Linux launchers. They rebuild labels from the
-pinned raw PDB source, retrain all 20 canonical expert heads while freezing the
-trunk/base head, bridge the seven already-passed structures, regenerate only the
-ten failed T=0.5 targets, and run an independent three-pass result audit. The
-default stops at a manual-review bundle and does not create the structure
-handoff. Permeability is deliberately deferred until structures return.
+### `run_serine_qc_cyclic_representation_v6.ps1`
+Current Windows launcher. It retrains all 20 expert heads with every equivalent
+cyclic sequence/coordinate start, runs the held-out test gate, regenerates all
+17 targets, and performs the independent three-pass result audit. It stops at a
+manual-review bundle and never creates a structure handoff. The older V5
+handoff path is withdrawn and release-blocked.

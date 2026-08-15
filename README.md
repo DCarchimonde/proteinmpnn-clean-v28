@@ -20,20 +20,20 @@ paper_clean_v28_outputs/generated_fasta_clean_auto_single/all_designs.csv
 paper_clean_v28_outputs/af3_manifest.csv
 ```
 
-## 当前恢复流程：Ser 来源质控、解码顺序平衡、结构先行
+## 当前恢复流程：Ser 来源质控、循环起点不变性、结构先行（V6）
 
 当前应运行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\run_serine_qc_recovery.ps1
+powershell -ExecutionPolicy Bypass -File .\run_serine_qc_cyclic_representation_v6.ps1 -Force
 ```
 
-该流程从固定旧提交的原始 PDB 重建 Ser 标签，冻结共享主干和 base head、
-用循环顺序平衡协议重训 canonical V28 的完整 20-expert 模块；7 个已过
-结构门的 T=0.5 靶点仅用最终 checkpoint 重评分并复用结构，只为 10 个
-未通过靶点重新生成。生成后执行独立三遍结果审计，并默认停在人工复核，
-不会自动创建给尚哥的包；结构返回前也禁止生成透膜输入。完整证据、门槛
-和输出说明见：
+V5 已撤回：3AV9 的旧结构通过行没有甲基 token，且 V5 的甲基候选全部集中
+在数组第 7 位。V6 从 canonical V28 重新训练完整 20-expert 模块；训练和部署
+都联合轮换环肽序列、标签、N/CA/C/O 坐标及 residue index，并把概率映射回
+物理残基。旧 7 条不再冻结，全部 17 个靶点重新生成。独立 test、生成与三遍
+审计通过后仍只产出人工复核包，不自动创建尚哥 handoff；结构返回前也禁止
+透膜步骤。完整证据、门槛和输出说明见：
 
 ```text
 paper_clean_v28/serine_qc_retrain/README.md

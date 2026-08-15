@@ -72,9 +72,20 @@ NATURAL_AA = "ACDEFGHIKLMNPQRSTVWY"
 METHYLATABLE_AA = set(NATURAL_AA) - {"P"}
 VALID_TOKENS = set(NATURAL_AA + NATURAL_AA.lower()) - {"p"}
 ANNOTATION_MODE = "peptide_only_cyclic_order_ensemble_known_natural_sequence"
+REPRESENTATION_ANNOTATION_MODE = (
+    "peptide_only_all_cyclic_starts_and_decoder_orders_mapped_to_physical_residues"
+)
 ANNOTATION_CONTEXT = "peptide_chain_only_no_visible_receptor_chains"
 EXPERT_PROTOCOL = (
     "canonical_clean_v28_all_expert_heads_corrected_labels_order_balanced_v3"
+)
+REPRESENTATION_EXPERT_PROTOCOL = (
+    "canonical_clean_v28_all_expert_heads_corrected_labels_"
+    "cyclic_representation_augmented_v6"
+)
+REPRESENTATION_AUDIT_PROTOCOL = "cyclic_representation_equivariance_heldout_gate_v1"
+REPRESENTATION_AUDIT_AUTHORIZATION = (
+    "REPRESENTATION_ENSEMBLE_VALIDATED_FOR_ISOLATED_V6_REGENERATION"
 )
 
 
@@ -235,6 +246,8 @@ def audit(
         str(row.get("source_recovery_stage", "")) for row in raw_rows
     )
     threshold = float(plan["methyl_threshold"])
+    annotation_mode = str(manifest.get("annotation_mode", ""))
+    representation_mode = annotation_mode == REPRESENTATION_ANNOTATION_MODE
 
     row_errors: List[str] = []
     raw_keys: Counter[Tuple[str, str]] = Counter()
@@ -285,6 +298,44 @@ def audit(
                     row_id,
                 )
             ]
+            if row.get("methyl_probability_representation_std", ""):
+                representation_std = [
+                    float(value)
+                    for value in parse_list(
+                        row.get("methyl_probability_representation_std"),
+                        "methyl_probability_representation_std",
+                        row_id,
+                    )
+                ]
+                representation_min = [
+                    float(value)
+                    for value in parse_list(
+                        row.get("methyl_probability_representation_min"),
+                        "methyl_probability_representation_min",
+                        row_id,
+                    )
+                ]
+                representation_max = [
+                    float(value)
+                    for value in parse_list(
+                        row.get("methyl_probability_representation_max"),
+                        "methyl_probability_representation_max",
+                        row_id,
+                    )
+                ]
+                representation_span = [
+                    float(value)
+                    for value in parse_list(
+                        row.get("methyl_probability_representation_span"),
+                        "methyl_probability_representation_span",
+                        row_id,
+                    )
+                ]
+            else:
+                representation_std = [0.0 for _value in probabilities]
+                representation_min = list(probabilities)
+                representation_max = list(probabilities)
+                representation_span = [0.0 for _value in probabilities]
         except (TypeError, ValueError) as exc:
             row_errors.append(str(exc))
             continue
@@ -315,7 +366,7 @@ def audit(
             row_errors.append(f"{row_id}: invalid order-std vector")
         if len(order) != len(sequence) or len(set(order)) != len(order):
             row_errors.append(f"{row_id}: invalid external decoding order")
-        if str(row.get("annotation_mode", "")) != ANNOTATION_MODE:
+        if str(row.get("annotation_mode", "")) != annotation_mode:
             row_errors.append(f"{row_id}: wrong annotation mode")
         if str(row.get("annotation_context_policy", "")) != ANNOTATION_CONTEXT:
             row_errors.append(f"{row_id}: wrong annotation context")
@@ -323,6 +374,42 @@ def audit(
             row_errors.append(f"{row_id}: receptor chain leaked into annotation context")
         if int(row.get("annotation_order_ensemble_size", -1)) != len(sequence):
             row_errors.append(f"{row_id}: wrong annotation ensemble size")
+        if row.get("annotation_decoder_order_ensemble_size", "") and int(
+            row["annotation_decoder_order_ensemble_size"]
+        ) != len(sequence):
+            row_errors.append(f"{row_id}: wrong decoder-order ensemble size")
+        expected_representation_count = len(sequence) if representation_mode else 1
+        if representation_mode and (
+            int(row.get("annotation_representation_ensemble_size", -1))
+            != expected_representation_count
+        ):
+            row_errors.append(f"{row_id}: wrong representation ensemble size")
+        representation_vectors = (
+            representation_std,
+            representation_min,
+            representation_max,
+            representation_span,
+        )
+        if any(len(values) != len(sequence) for values in representation_vectors):
+            row_errors.append(f"{row_id}: invalid representation diagnostic length")
+        elif any(
+            not math.isfinite(value) or value < 0.0
+            for values in (representation_std, representation_span)
+            for value in values
+        ) or any(
+            not math.isfinite(value) or value < 0.0 or value > 1.0
+            for values in (representation_min, representation_max)
+            for value in values
+        ):
+            row_errors.append(f"{row_id}: invalid representation diagnostic value")
+        elif any(
+            abs((maximum - minimum) - span) > 2e-6
+            or minimum > maximum + 1e-8
+            for minimum, maximum, span in zip(
+                representation_min, representation_max, representation_span
+            )
+        ):
+            row_errors.append(f"{row_id}: inconsistent representation min/max/span")
         if len(probabilities) == len(sequence):
             for index, (token, probability) in enumerate(
                 zip(sequence, probabilities), start=1
@@ -339,6 +426,20 @@ def audit(
             if not math.isfinite(recorded_max) or abs(recorded_max - max(order_std)) > 1e-6:
                 row_errors.append(f"{row_id}: order-std maximum mismatch")
             order_std_maxima.append(max(order_std))
+        if row.get("methyl_probability_representation_std_max", ""):
+            recorded_representation_std_max = float(
+                row.get("methyl_probability_representation_std_max", "nan")
+            )
+            recorded_representation_span_max = float(
+                row.get("methyl_probability_representation_span_max", "nan")
+            )
+            if (
+                not math.isfinite(recorded_representation_std_max)
+                or abs(recorded_representation_std_max - max(representation_std)) > 1e-6
+                or not math.isfinite(recorded_representation_span_max)
+                or abs(recorded_representation_span_max - max(representation_span)) > 1e-6
+            ):
+                row_errors.append(f"{row_id}: representation maximum mismatch")
 
         sorted_order = sorted(order)
         for position in expected_positions:
@@ -434,14 +535,55 @@ def audit(
             )
 
     pass_1_checks = {
-        "order_balanced_checkpoint_protocol": (
-            manifest.get("model_expert_qc_protocol") == EXPERT_PROTOCOL
+        "checkpoint_protocol_matches_annotation_mode": (
+            manifest.get("model_expert_qc_protocol")
+            == (
+                REPRESENTATION_EXPERT_PROTOCOL
+                if representation_mode
+                else EXPERT_PROTOCOL
+            )
         ),
         "peptide_only_train_matched_annotation_protocol": (
-            manifest.get("annotation_mode") == ANNOTATION_MODE
+            annotation_mode in {ANNOTATION_MODE, REPRESENTATION_ANNOTATION_MODE}
             and manifest.get("annotation_context_policy") == ANNOTATION_CONTEXT
             and int(manifest.get("annotation_visible_receptor_chains", -1)) == 0
             and bool(manifest.get("train_deployment_context_match"))
+        ),
+        "representation_mode_has_pinned_passed_heldout_gate": (
+            not representation_mode
+            or (
+                bool(manifest.get("cyclic_representation_ensemble_enabled"))
+                and str(
+                    dict(manifest.get("cyclic_representation_heldout_audit") or {}).get(
+                        "quality_gate", ""
+                    )
+                )
+                == "PASS"
+                and str(
+                    dict(manifest.get("cyclic_representation_heldout_audit") or {}).get(
+                        "protocol", ""
+                    )
+                )
+                == REPRESENTATION_AUDIT_PROTOCOL
+                and str(
+                    dict(manifest.get("cyclic_representation_heldout_audit") or {}).get(
+                        "release_authorization", ""
+                    )
+                )
+                == REPRESENTATION_AUDIT_AUTHORIZATION
+                and str(
+                    dict(manifest.get("cyclic_representation_heldout_audit") or {}).get(
+                        "model_sha256", ""
+                    )
+                )
+                == str(manifest.get("model_sha256", ""))
+                and str(
+                    dict(manifest.get("cyclic_representation_heldout_audit") or {}).get(
+                        "plan_sha256", ""
+                    )
+                )
+                == sha256_file(plan_path)
+            )
         ),
         "raw_count_matches_plan": len(raw_rows) == expected_raw,
         "adaptive_v5_source_plus_topup_accounting": (

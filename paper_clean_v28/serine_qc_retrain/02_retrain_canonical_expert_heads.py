@@ -10,9 +10,11 @@ never leak through the sequence embedding.
 
 Every training epoch receives an explicit cyclic designed-position rotation;
 the 30-epoch minimum covers every possible relative depth allowed by the frozen
-30-residue peptide cap. Validation, test promotion, and downstream annotation
-use the same deterministic cyclic-order ensemble, so no absolute point is
-favored merely because it was decoded late.
+30-residue peptide cap.  The V6 option additionally enumerates every equivalent
+physical cyclic start by jointly rotating sequence/labels and N/CA/C/O
+coordinates while resetting the linear residue index.  Validation, test
+promotion, and downstream annotation then use the matching all-start and
+all-decoder-order ensemble mapped back to physical residues.
 
 The corrected 600-record training split is divided deterministically into a
 development-train and record-disjoint validation partition.  The original 151
@@ -56,6 +58,7 @@ from paper_clean_v28.clean_v28_common import (  # noqa: E402
     binary_metrics,
     cyclic_designed_decoding_order,
     cyclic_known_sequence_methyl_probabilities,
+    cyclic_representation_known_sequence_methyl_probabilities,
     featurize_records,
     load_v28_model,
     naturalize_tensor_for_input,
@@ -80,6 +83,10 @@ ALL_EXPERT_STATE_KEYS = {
 }
 ORDER_BALANCED_PROTOCOL = (
     "canonical_clean_v28_all_expert_heads_corrected_labels_order_balanced_v3"
+)
+CYCLIC_REPRESENTATION_PROTOCOL = (
+    "canonical_clean_v28_all_expert_heads_corrected_labels_"
+    "cyclic_representation_augmented_v6"
 )
 MINIMUM_ORDER_COVERAGE_EPOCHS = 30
 VALIDATION_INTERVAL_EPOCHS = 5
@@ -166,6 +173,120 @@ def per_base_binary_counts(
                 elif token in METHYL_AA_ALPHABET:
                     counts[token.upper()]["methyl_positive"] += 1
     return counts
+
+
+def cyclic_augmented_per_base_binary_counts(
+    records: Sequence[Mapping[str, Any]],
+) -> Dict[str, Dict[str, int]]:
+    """Count labels after every physical cyclic start is used once.
+
+    A length-L single-chain record contributes L equivalent serializations, so
+    each physical label must be observed exactly L times in an augmented epoch.
+    """
+
+    counts = {
+        base: {"natural_negative": 0, "methyl_positive": 0}
+        for base in NATURAL_AA_ALPHABET
+    }
+    for record in records:
+        sequence_keys = [
+            key
+            for key, value in record.items()
+            if key.startswith("seq_chain_") and str(value)
+        ]
+        if len(sequence_keys) != 1:
+            raise RuntimeError(
+                "Cyclic representation augmentation requires one peptide chain"
+            )
+        sequence = str(record[sequence_keys[0]])
+        length = len(sequence)
+        for token in sequence:
+            if token in NATURAL_AA_ALPHABET:
+                counts[token]["natural_negative"] += length
+            elif token in METHYL_AA_ALPHABET:
+                counts[token.upper()]["methyl_positive"] += length
+    return counts
+
+
+def expand_all_cyclic_training_representations(
+    X: torch.Tensor,
+    S_label: torch.Tensor,
+    mask: torch.Tensor,
+    chain_M: torch.Tensor,
+    residue_idx: torch.Tensor,
+    chain_encoding_all: torch.Tensor,
+    real_pos: torch.Tensor,
+) -> Tuple[torch.Tensor, ...]:
+    """Jointly rotate coordinates and labels through every cyclic start.
+
+    The model sees a fresh linear ``0..L-1`` residue index for every equivalent
+    serialization.  Labels and coordinates are rolled together, so the target
+    remains attached to the same physical residue rather than the same tensor
+    column.  Padding is retained but never rotated.
+    """
+
+    selected_mask = (mask * chain_M) > 0
+    if bool(((mask > 0) & ~selected_mask).any()):
+        raise RuntimeError(
+            "Cyclic representation training requires peptide-only input with "
+            "zero visible receptor positions"
+        )
+
+    expanded: List[List[torch.Tensor]] = [[] for _ in range(7)]
+    for row_index in range(S_label.shape[0]):
+        positions = torch.where(selected_mask[row_index])[0]
+        length = int(positions.numel())
+        if length <= 0:
+            raise RuntimeError("Cyclic representation training row is empty")
+        chain_values = torch.unique(chain_encoding_all[row_index, positions])
+        if int(chain_values.numel()) != 1:
+            raise RuntimeError(
+                "Cyclic representation training row contains multiple chains"
+            )
+        canonical_residue_idx = torch.arange(
+            length,
+            device=residue_idx.device,
+            dtype=residue_idx.dtype,
+        )
+        for shift in range(length):
+            row_X = X[row_index].clone()
+            row_S = S_label[row_index].clone()
+            row_mask = mask[row_index].clone()
+            row_chain_M = chain_M[row_index].clone()
+            row_residue_idx = residue_idx[row_index].clone()
+            row_chain_encoding = chain_encoding_all[row_index].clone()
+            row_real_pos = real_pos[row_index].clone()
+            row_X[positions] = torch.roll(
+                X[row_index, positions], shifts=-shift, dims=0
+            )
+            row_S[positions] = torch.roll(
+                S_label[row_index, positions], shifts=-shift, dims=0
+            )
+            row_mask[positions] = torch.roll(
+                mask[row_index, positions], shifts=-shift, dims=0
+            )
+            row_chain_M[positions] = torch.roll(
+                chain_M[row_index, positions], shifts=-shift, dims=0
+            )
+            row_real_pos[positions] = torch.roll(
+                real_pos[row_index, positions], shifts=-shift, dims=0
+            )
+            row_residue_idx[positions] = canonical_residue_idx
+            row_chain_encoding[positions] = chain_values[0]
+            for bucket, value in zip(
+                expanded,
+                (
+                    row_X,
+                    row_S,
+                    row_mask,
+                    row_chain_M,
+                    row_residue_idx,
+                    row_chain_encoding,
+                    row_real_pos,
+                ),
+            ):
+                bucket.append(value)
+    return tuple(torch.stack(values, dim=0) for values in expanded)
 
 
 def record_name(record: Mapping[str, Any], fallback: int) -> str:
@@ -392,6 +513,7 @@ def validation_balanced_bce(
     device: torch.device,
     batch_size: int,
     positive_weights: Mapping[int, float],
+    cyclic_representation_ensemble: bool = False,
 ) -> float:
     model.eval()
     losses: List[float] = []
@@ -409,16 +531,33 @@ def validation_balanced_bce(
                 & (S_label != X_INDEX)
             )
             S_forward = naturalize_tensor_for_input(S_label)
-            probabilities, _order_std = cyclic_known_sequence_methyl_probabilities(
-                model,
-                X,
-                S_forward,
-                mask,
-                chain_M,
-                residue_idx,
-                chain_encoding_all,
-                temperature=1.0,
-            )
+            if cyclic_representation_ensemble:
+                representation = (
+                    cyclic_representation_known_sequence_methyl_probabilities(
+                        model,
+                        X,
+                        S_forward,
+                        mask,
+                        chain_M,
+                        residue_idx,
+                        chain_encoding_all,
+                        temperature=1.0,
+                    )
+                )
+                probabilities = representation["mean"]
+            else:
+                probabilities, _order_std = (
+                    cyclic_known_sequence_methyl_probabilities(
+                        model,
+                        X,
+                        S_forward,
+                        mask,
+                        chain_M,
+                        residue_idx,
+                        chain_encoding_all,
+                        temperature=1.0,
+                    )
+                )
             loss = expert_probability_loss(
                 probabilities,
                 S_label,
@@ -441,6 +580,7 @@ def train_all_expert_heads(
     learning_rate: float,
     patience: int,
     seed: int,
+    cyclic_representation_augmentation: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, torch.Tensor], Dict[str, Any]]:
     expert_parameters = trainable_expert_parameters(model)
     positive_weights = positive_weights_by_base(train_records)
@@ -455,6 +595,11 @@ def train_all_expert_heads(
 
     # The frozen trunk is always evaluated with dropout/augmentation disabled.
     model.eval()
+    expected_counts = (
+        cyclic_augmented_per_base_binary_counts(train_records)
+        if cyclic_representation_augmentation
+        else per_base_binary_counts(train_records)
+    )
     for epoch in range(1, epochs + 1):
         order = list(range(len(train_records)))
         random.Random(seed + epoch).shuffle(order)
@@ -470,6 +615,24 @@ def train_all_expert_heads(
                 continue
             tensors, _metas = packed
             X, S_label, mask, chain_M, residue_idx, chain_encoding_all, real_pos = tensors
+            if cyclic_representation_augmentation:
+                (
+                    X,
+                    S_label,
+                    mask,
+                    chain_M,
+                    residue_idx,
+                    chain_encoding_all,
+                    real_pos,
+                ) = expand_all_cyclic_training_representations(
+                    X,
+                    S_label,
+                    mask,
+                    chain_M,
+                    residue_idx,
+                    chain_encoding_all,
+                    real_pos,
+                )
             valid = (
                 (mask > 0)
                 & (chain_M > 0)
@@ -503,7 +666,6 @@ def train_all_expert_heads(
                 epoch_coverage[base_index][0] += negative_count
                 epoch_coverage[base_index][1] += positive_count
 
-        expected_counts = per_base_binary_counts(train_records)
         for base_index, base in enumerate(NATURAL_AA_ALPHABET):
             observed = epoch_coverage[base_index]
             expected = [
@@ -530,6 +692,7 @@ def train_all_expert_heads(
                 device,
                 batch_size,
                 positive_weights,
+                cyclic_representation_ensemble=cyclic_representation_augmentation,
             )
             if should_validate
             else None
@@ -559,6 +722,9 @@ def train_all_expert_heads(
             "validation_evaluated": int(should_validate),
             "is_best_epoch": int(improved),
             "order_coverage_complete": int(order_coverage_complete),
+            "all_cyclic_representations_used": int(
+                cyclic_representation_augmentation
+            ),
             "epochs_without_improvement": epochs_without_improvement,
             "learning_rate": learning_rate,
         }
@@ -594,6 +760,9 @@ def train_all_expert_heads(
             NATURAL_AA_ALPHABET[index]: value
             for index, value in positive_weights.items()
         },
+        "cyclic_representation_augmentation": bool(
+            cyclic_representation_augmentation
+        ),
     }
 
 
@@ -605,6 +774,7 @@ def evaluate(
     threshold: float,
     deployment_temperature: float,
     checkpoint_label: str,
+    cyclic_representation_ensemble: bool = False,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
     model.eval()
     position_rows: List[Dict[str, Any]] = []
@@ -624,16 +794,36 @@ def evaluate(
             # Prevent target leakage: lowercase methyl labels are evaluation
             # targets only, never inputs to the canonical model trunk.
             S_forward = naturalize_tensor_for_input(S_label)
-            probability, order_std = cyclic_known_sequence_methyl_probabilities(
-                model,
-                X,
-                S_forward,
-                mask,
-                chain_M,
-                residue_idx,
-                chain_encoding_all,
-                temperature=deployment_temperature,
-            )
+            if cyclic_representation_ensemble:
+                representation = (
+                    cyclic_representation_known_sequence_methyl_probabilities(
+                        model,
+                        X,
+                        S_forward,
+                        mask,
+                        chain_M,
+                        residue_idx,
+                        chain_encoding_all,
+                        temperature=deployment_temperature,
+                    )
+                )
+                probability = representation["mean"]
+                order_std = representation["decoder_order_std_mean"]
+                representation_std = representation["representation_std"]
+                representation_span = representation["representation_span"]
+            else:
+                probability, order_std = cyclic_known_sequence_methyl_probabilities(
+                    model,
+                    X,
+                    S_forward,
+                    mask,
+                    chain_M,
+                    residue_idx,
+                    chain_encoding_all,
+                    temperature=deployment_temperature,
+                )
+                representation_std = torch.zeros_like(probability)
+                representation_span = torch.zeros_like(probability)
             true_base = naturalize_tensor_for_input(S_label)
 
             for row_index, meta in enumerate(metas):
@@ -656,14 +846,27 @@ def evaluate(
                             "probability_order_std": float(
                                 order_std[row_index, position].item()
                             ),
+                            "probability_representation_std": float(
+                                representation_std[row_index, position].item()
+                            ),
+                            "probability_representation_span": float(
+                                representation_span[row_index, position].item()
+                            ),
                             "annotation_mode": (
-                                "peptide_only_cyclic_order_ensemble_known_natural_sequence"
+                                "peptide_only_all_cyclic_starts_and_decoder_orders_"
+                                "mapped_to_physical_residues"
+                                if cyclic_representation_ensemble
+                                else "peptide_only_cyclic_order_ensemble_"
+                                "known_natural_sequence"
                             ),
                             "annotation_context_policy": (
                                 "peptide_chain_only_no_visible_receptor_chains"
                             ),
                             "annotation_visible_receptor_chains": 0,
                             "annotation_order_ensemble_size": ensemble_size,
+                            "annotation_representation_ensemble_size": (
+                                ensemble_size if cyclic_representation_ensemble else 1
+                            ),
                         }
                     )
 
@@ -674,6 +877,10 @@ def evaluate(
     )
     order_std_all = np.asarray(
         [row["probability_order_std"] for row in position_rows],
+        dtype=np.float64,
+    )
+    representation_span_all = np.asarray(
+        [row["probability_representation_span"] for row in position_rows],
         dtype=np.float64,
     )
     grouped_indices: Dict[str, List[int]] = defaultdict(list)
@@ -731,6 +938,12 @@ def evaluate(
         ) if supported_rows else None,
         "maximum_probability_order_std": float(np.max(order_std_all)),
         "mean_probability_order_std": float(np.mean(order_std_all)),
+        "maximum_probability_representation_span": float(
+            np.max(representation_span_all)
+        ),
+        "mean_probability_representation_span": float(
+            np.mean(representation_span_all)
+        ),
         "serine": serine,
         "proline": proline,
     }
@@ -758,6 +971,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deployment-temperature", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--allow-cpu", action="store_true")
+    parser.add_argument(
+        "--cyclic-representation-augmentation",
+        action="store_true",
+        help=(
+            "jointly rotate sequence/labels and N/CA/C/O coordinates through "
+            "every physical cyclic start during training, and use the matching "
+            "all-start deployment ensemble for validation and test"
+        ),
+    )
     parser.add_argument("--no-fail-on-quality-gate", action="store_true")
     return parser.parse_args()
 
@@ -816,6 +1038,7 @@ def main() -> None:
         device,
         args.batch_size,
         positive_weights_by_base(development_records),
+        cyclic_representation_ensemble=args.cyclic_representation_augmentation,
     )
     history, _best_expert_state, training_selection = train_all_expert_heads(
         model,
@@ -827,6 +1050,7 @@ def main() -> None:
         args.learning_rate,
         args.early_stopping_patience,
         args.seed,
+        cyclic_representation_augmentation=args.cyclic_representation_augmentation,
     )
     after_hashes = state_hashes(model.state_dict())
     changed_keys = sorted(
@@ -848,17 +1072,39 @@ def main() -> None:
         args.batch_size,
         args.threshold,
         args.deployment_temperature,
-        "all_expert_heads_qc_retrained",
+        (
+            "all_expert_heads_qc_cyclic_representation_retrained"
+            if args.cyclic_representation_augmentation
+            else "all_expert_heads_qc_retrained"
+        ),
+        cyclic_representation_ensemble=args.cyclic_representation_augmentation,
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = out_dir / "frankenstein_v28_expert_heads_qc.pt"
     candidate_checkpoint_path = out_dir / "frankenstein_v28_expert_heads_qc.candidate.pt"
+    selected_protocol = (
+        CYCLIC_REPRESENTATION_PROTOCOL
+        if args.cyclic_representation_augmentation
+        else ORDER_BALANCED_PROTOCOL
+    )
+    training_order_policy = (
+        "all_cyclic_sequence_coordinate_starts_with_epoch_indexed_"
+        "decoder_rotation_mapped_to_physical_labels"
+        if args.cyclic_representation_augmentation
+        else "epoch_indexed_cyclic_designed_position_rotation"
+    )
+    deployment_policy = (
+        "all_cyclic_starts_and_all_decoder_orders_mapped_to_physical_"
+        "residues_probability_mean"
+        if args.cyclic_representation_augmentation
+        else "complete_natural_sequence_all_cyclic_rotations_probability_mean"
+    )
     checkpoint_payload = {
         "model_state_dict": {
             key: value.detach().cpu().clone() for key, value in model.state_dict().items()
         },
         "expert_head_qc_metadata": {
-            "protocol": ORDER_BALANCED_PROTOCOL,
+            "protocol": selected_protocol,
             "parent_checkpoint_sha256": file_sha256(model_path),
             "train_jsonl_sha256": file_sha256(train_path),
             "test_jsonl_sha256": file_sha256(test_path),
@@ -870,12 +1116,14 @@ def main() -> None:
             "early_stopping_patience": args.early_stopping_patience,
             "best_epoch": training_selection["best_epoch"],
             "minimum_order_coverage_epochs": MINIMUM_ORDER_COVERAGE_EPOCHS,
-            "training_decoding_order_policy": (
-                "epoch_indexed_cyclic_designed_position_rotation"
+            "training_decoding_order_policy": training_order_policy,
+            "training_cyclic_representation_policy": (
+                "all_physical_cyclic_starts_jointly_rotate_sequence_labels_and_"
+                "backbone_coordinates_with_residue_index_reset"
+                if args.cyclic_representation_augmentation
+                else "serialized_cyclic_start_fixed"
             ),
-            "deployment_annotation_policy": (
-                "complete_natural_sequence_all_cyclic_rotations_probability_mean"
-            ),
+            "deployment_annotation_policy": deployment_policy,
             "expert_training_context_policy": (
                 "peptide_chain_only_no_visible_receptor_chains"
             ),
@@ -887,6 +1135,9 @@ def main() -> None:
             "threshold": args.threshold,
             "deployment_temperature": args.deployment_temperature,
             "seed": args.seed,
+            "cyclic_representation_augmentation": bool(
+                args.cyclic_representation_augmentation
+            ),
         },
     }
     temporary_checkpoint = candidate_checkpoint_path.with_suffix(".pt.tmp")
@@ -926,6 +1177,15 @@ def main() -> None:
         "selected_epoch_has_complete_cyclic_order_coverage": (
             int(training_selection["best_epoch"])
             >= MINIMUM_ORDER_COVERAGE_EPOCHS
+        ),
+        "requested_cyclic_representation_training_protocol_is_active": (
+            not args.cyclic_representation_augmentation
+            or (
+                selected_protocol == CYCLIC_REPRESENTATION_PROTOCOL
+                and bool(
+                    training_selection.get("cyclic_representation_augmentation")
+                )
+            )
         ),
         "all_19_supported_experts_present_in_test": (
             int(corrected_summary["supported_expert_count"]) == 19
@@ -970,7 +1230,7 @@ def main() -> None:
         checkpoint_artifact_path = candidate_checkpoint_path
     manifest = {
         "quality_gate": quality_gate,
-        "protocol": ORDER_BALANCED_PROTOCOL,
+        "protocol": selected_protocol,
         "device": str(device),
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
@@ -1003,14 +1263,21 @@ def main() -> None:
             "test": test_context_audit,
         },
         "training_decoding_order_policy": (
-            "epoch-indexed cyclic designed-position rotation per batch row; "
+            "all physical cyclic starts jointly rotate sequence, labels, and "
+            "N/CA/C/O coordinates with residue_idx reset; an epoch-indexed "
+            "decoder rotation is applied to every representation"
+            if args.cyclic_representation_augmentation
+            else "epoch-indexed cyclic designed-position rotation per batch row; "
             "receptor/padding positions are prefixed, every relative depth is "
             "covered within the 30-epoch minimum, and the exact full order is "
             "passed into the causal decoder"
         ),
         "validation_test_annotation_policy": (
-            "complete natural sequence scored over every cyclic rotation; each "
-            "peptide site appears once at every relative decoder depth"
+            "all equivalent cyclic sequence/coordinate starts and all decoder "
+            "orders are evaluated, then mapped back to physical residues"
+            if args.cyclic_representation_augmentation
+            else "complete natural sequence scored over every cyclic rotation; "
+            "each peptide site appears once at every relative decoder depth"
         ),
         "deployment_gate_policy": (
             f"expert probabilities are sigmoid(logit / {args.deployment_temperature}) "
@@ -1027,6 +1294,9 @@ def main() -> None:
             "validation_fraction": args.validation_fraction,
             "early_stopping_patience": args.early_stopping_patience,
             "seed": args.seed,
+            "cyclic_representation_augmentation": bool(
+                args.cyclic_representation_augmentation
+            ),
             "train_jsonl": str(train_path),
             "train_jsonl_sha256": file_sha256(train_path),
             "test_jsonl": str(test_path),

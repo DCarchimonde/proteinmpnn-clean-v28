@@ -1,0 +1,156 @@
+{
+  "protocol": "temperature_0.5_cyclic_representation_invariant_full_17_target_regeneration_v6",
+  "temperature": 0.5,
+  "methyl_threshold": 0.6,
+  "sampling_context_policy": "native_complex_longest_receptor_visible",
+  "annotation_context_policy": "peptide_chain_only_no_visible_receptor_chains_all_cyclic_starts_mapped_back",
+  "seeds": [101, 202, 303, 404, 505],
+  "sequence_identity_ceiling": 0.8,
+  "expected_target_count": 17,
+  "selection_source": "best_forward_cyclic_shift_new_rmsd_best85_all_valid.csv",
+  "selection_source_sha256": "132bf1102f5e316595a03dbae3a9a5245138b38ffeccc4dc068dc2c340795fcb",
+  "selection_rule": "No pre-QC methyl annotation is grandfathered. Every released candidate must contain at least one final-model methyl token, be novel after naturalization, and later pass both the global-complex and complete cyclic-peptide CA RMSD <3 A structure gates.",
+  "frozen_targets": [],
+  "frozen_target_evidence": {},
+  "withdrawn_historical_structure_controls": [
+    {
+      "target_name": "1SFI",
+      "design_seq": "RCCrGNCGQCQFGG",
+      "reason": "pre-QC methyl annotation disagrees with the corrected checkpoint"
+    },
+    {
+      "target_name": "3AV9",
+      "design_seq": "QICGRGRG",
+      "reason": "contains no methyl token and therefore never satisfied the compound gate"
+    },
+    {
+      "target_name": "3P8F",
+      "design_seq": "CrrrGrQGKGrRGC",
+      "reason": "pre-QC methyl annotation disagrees with the corrected checkpoint"
+    },
+    {
+      "target_name": "3WNE",
+      "design_seq": "GrKWNC",
+      "reason": "pre-QC methyl annotation disagrees with the corrected checkpoint"
+    },
+    {
+      "target_name": "3ZGC",
+      "design_seq": "rEGGQNR",
+      "reason": "pre-QC methyl annotation disagrees with the corrected checkpoint"
+    },
+    {
+      "target_name": "4K1E",
+      "design_seq": "rcrrrQCrQGNCDR",
+      "reason": "pre-QC methyl annotation disagrees with the corrected checkpoint"
+    },
+    {
+      "target_name": "4KEL",
+      "design_seq": "RcrrGNCrQGFCDR",
+      "reason": "pre-QC methyl annotation disagrees with the corrected checkpoint"
+    }
+  ],
+  "targets": [
+    {
+      "target_name": "1SFI",
+      "sequences_per_seed": 200,
+      "structure_quota": 15,
+      "current_problem": "pre_qc_annotation_disagrees_requires_uniform_v6_regeneration"
+    },
+    {
+      "target_name": "3AV9",
+      "sequences_per_seed": 200,
+      "structure_quota": 15,
+      "current_problem": "old_t05_structure_row_was_non_methylated_and_invalid"
+    },
+    {
+      "target_name": "3AVA",
+      "sequences_per_seed": 200,
+      "structure_quota": 15,
+      "current_problem": "t05_joint_structure_gate_failed"
+    },
+    {
+      "target_name": "3AVB",
+      "sequences_per_seed": 400,
+      "structure_quota": 15,
+      "current_problem": "t05_joint_structure_gate_failed_and_prior_pool_was_quota_limited"
+    },
+    {
+      "target_name": "3AVF",
+      "sequences_per_seed": 200,
+      "structure_quota": 15,
+      "current_problem": "t05_joint_structure_gate_failed"
+    },
+    {
+      "target_name": "3AVG",
+      "sequences_per_seed": 300,
+      "structure_quota": 20,
+      "current_problem": "t05_joint_structure_gate_failed"
+    },
+    {
+      "target_name": "3AVH",
+      "sequences_per_seed": 200,
+      "structure_quota": 10,
+      "current_problem": "t05_joint_structure_gate_failed"
+    },
+    {
+      "target_name": "3AVI",
+      "sequences_per_seed": 300,
+      "structure_quota": 20,
+      "current_problem": "t05_joint_structure_gate_failed"
+    },
+    {
+      "target_name": "3AVJ",
+      "sequences_per_seed": 200,
+      "structure_quota": 15,
+      "current_problem": "t05_joint_structure_gate_failed"
+    },
+    {
+      "target_name": "3AVK",
+      "sequences_per_seed": 300,
+      "structure_quota": 20,
+      "current_problem": "t05_joint_structure_gate_failed"
+    },
+    {
+      "target_name": "3AVM",
+      "sequences_per_seed": 200,
+      "structure_quota": 10,
+      "current_problem": "t05_joint_structure_gate_failed"
+    },
+    {
+      "target_name": "3AVN",
+      "sequences_per_seed": 200,
+      "structure_quota": 10,
+      "current_problem": "t05_joint_structure_gate_failed"
+    },
+    {
+      "target_name": "3P8F",
+      "sequences_per_seed": 200,
+      "structure_quota": 10,
+      "current_problem": "pre_qc_annotation_disagrees_requires_uniform_v6_regeneration"
+    },
+    {
+      "target_name": "3WNE",
+      "sequences_per_seed": 200,
+      "structure_quota": 15,
+      "current_problem": "pre_qc_annotation_disagrees_requires_uniform_v6_regeneration"
+    },
+    {
+      "target_name": "3ZGC",
+      "sequences_per_seed": 200,
+      "structure_quota": 10,
+      "current_problem": "pre_qc_annotation_disagrees_requires_uniform_v6_regeneration"
+    },
+    {
+      "target_name": "4K1E",
+      "sequences_per_seed": 200,
+      "structure_quota": 15,
+      "current_problem": "pre_qc_annotation_disagrees_requires_uniform_v6_regeneration"
+    },
+    {
+      "target_name": "4KEL",
+      "sequences_per_seed": 200,
+      "structure_quota": 15,
+      "current_problem": "pre_qc_annotation_disagrees_requires_uniform_v6_regeneration"
+    }
+  ]
+}

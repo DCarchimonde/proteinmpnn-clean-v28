@@ -138,6 +138,13 @@ class FrozenRecoveryPlanTests(unittest.TestCase):
             / "target_plan_structure_failures.json"
         )
         cls.plan = json.loads(cls.plan_path.read_text(encoding="utf-8"))
+        cls.v6_plan_path = (
+            ROOT
+            / "paper_clean_v28"
+            / "serine_qc_retrain"
+            / "target_plan_cyclic_representation_v6.json"
+        )
+        cls.v6_plan = json.loads(cls.v6_plan_path.read_text(encoding="utf-8"))
 
     def test_only_ten_failed_targets_are_regenerated(self):
         checked = generator.validate_plan(self.plan)
@@ -161,6 +168,79 @@ class FrozenRecoveryPlanTests(unittest.TestCase):
                 float(target["prior_global_rmsd"]) >= 3.0
                 or float(target["prior_cyclic_rmsd"]) >= 3.0
             )
+
+    def test_legacy_seven_row_set_is_not_a_valid_methylated_compound_set(self):
+        evidence = self.plan["frozen_target_evidence"]["3AV9"]
+        self.assertEqual(evidence["design_seq"], evidence["design_seq"].upper())
+        bridge_text = (
+            ROOT
+            / "paper_clean_v28"
+            / "serine_qc_retrain"
+            / "03_revalidate_frozen_structures.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            '"all_frozen_compounds_contain_at_least_one_methyl_token"',
+            bridge_text,
+        )
+        self.assertIn(
+            '"WITHDRAW_NON_METHYLATED_ROW_NOT_A_VALID_COMPOUND"',
+            bridge_text,
+        )
+
+    def test_v6_regenerates_all_17_targets_without_grandfathering_old_annotations(self):
+        checked = generator.validate_plan(self.v6_plan)
+        self.assertEqual(checked["expected_target_count"], 17)
+        self.assertEqual(checked["expected_raw_candidates"], 19_500)
+        self.assertEqual(checked["planned_structure_handoff"], 245)
+        self.assertEqual(self.v6_plan["frozen_targets"], [])
+        self.assertEqual(len(self.v6_plan["withdrawn_historical_structure_controls"]), 7)
+        withdrawn = {
+            row["target_name"]: row
+            for row in self.v6_plan["withdrawn_historical_structure_controls"]
+        }
+        self.assertIn("no methyl token", withdrawn["3AV9"]["reason"])
+        self.assertEqual(set(checked["target_names"]), {
+            "1SFI", "3AV9", "3AVA", "3AVB", "3AVF", "3AVG", "3AVH",
+            "3AVI", "3AVJ", "3AVK", "3AVM", "3AVN", "3P8F", "3WNE",
+            "3ZGC", "4K1E", "4KEL",
+        })
+
+    def test_v6_launcher_retrains_before_audit_and_never_creates_handoff(self):
+        launcher = (
+            ROOT / "run_serine_qc_cyclic_representation_v6.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn("--cyclic-representation-augmentation", launcher)
+        self.assertIn("$ParentCheckpoint", launcher)
+        self.assertIn('"frankenstein_v28.pt"', launcher)
+        self.assertIn("all 17; no pre-QC methyl annotation is grandfathered", launcher)
+        self.assertIn("Shang-ge handoff:     NOT CREATED", launcher)
+        self.assertNotIn("03_select_structure_first_handoff.py", launcher)
+        self.assertLess(
+            launcher.index("02_retrain_canonical_expert_heads.py"),
+            launcher.index("07_audit_cyclic_representation_equivariance.py"),
+        )
+        self.assertLess(
+            launcher.rindex("& $ResolvedPython @TrainingArguments"),
+            launcher.rindex("& $ResolvedPython @AuditArguments"),
+        )
+        self.assertLess(
+            launcher.rindex("& $ResolvedPython @AuditArguments"),
+            launcher.rindex("& $ResolvedPython @GenerationArguments"),
+        )
+
+    def test_v6_training_jointly_rotates_labels_coordinates_and_resets_indices(self):
+        trainer = (
+            ROOT
+            / "paper_clean_v28"
+            / "serine_qc_retrain"
+            / "02_retrain_canonical_expert_heads.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("def expand_all_cyclic_training_representations(", trainer)
+        self.assertIn("row_X[positions] = torch.roll", trainer)
+        self.assertIn("row_S[positions] = torch.roll", trainer)
+        self.assertIn("row_residue_idx[positions] = canonical_residue_idx", trainer)
+        self.assertIn("CYCLIC_REPRESENTATION_PROTOCOL", trainer)
+        self.assertIn("cyclic_representation_augmentation=args.", trainer)
 
 
 class CompleteExpertRetrainIsolationTests(unittest.TestCase):
@@ -308,6 +388,9 @@ class StructureFirstHandoffTests(unittest.TestCase):
         self.assertIn("serine_qc_structural_support_v5_shangge_handoff.zip", launcher)
         self.assertIn('"review_evidence"', launcher)
         self.assertIn("function Compress-PortableArchive", launcher)
+        self.assertIn("V5 IS WITHDRAWN", launcher)
+        self.assertIn("V5 structure handoff is permanently blocked", launcher)
+        self.assertIn("AcknowledgeWithdrawnV5Diagnostic", launcher)
         self.assertIn("path.relative_to(source).as_posix()", launcher)
         self.assertIn("archive.testzip()", launcher)
         self.assertNotRegex(launcher, r"(?m)^\s*Compress-Archive\b")

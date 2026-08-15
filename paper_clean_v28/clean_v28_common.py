@@ -240,6 +240,189 @@ def cyclic_known_sequence_methyl_probabilities(
     return mean, torch.sqrt(variance)
 
 
+def cyclic_representation_known_sequence_methyl_probabilities(
+    model: nn.Module,
+    X: torch.Tensor,
+    S_natural: torch.Tensor,
+    mask: torch.Tensor,
+    chain_M: torch.Tensor,
+    residue_idx: torch.Tensor,
+    chain_encoding_all: torch.Tensor,
+    temperature: float,
+) -> Dict[str, torch.Tensor]:
+    """Average every physical cyclic start *and* every decoder-depth rotation.
+
+    ``cyclic_known_sequence_methyl_probabilities`` balances only the causal
+    decoder order while keeping the serialized peptide start fixed.  A cyclic
+    peptide, however, can be serialized from any residue.  ProteinMPNN's
+    relative positional features treat the first/last array boundary specially,
+    so decoder-order balancing alone cannot rule out an absolute tensor-index
+    artefact.
+
+    This function evaluates all equivalent cyclic serializations.  For each
+    representation it jointly rolls the natural sequence and N/CA/C/O
+    coordinates, resets the peptide residue indices to ``0..L-1``, evaluates
+    the complete decoder-order ensemble, and finally maps the probabilities
+    back to the original physical residues before averaging.  The returned mean
+    is therefore invariant to which residue was chosen as array position 1.
+
+    The deployment contract is deliberately narrow: every non-padding position
+    must belong to one designed peptide chain and there may be no visible
+    receptor positions.  That is exactly the expert-head train/test and final
+    annotation context used by the Ser-QC workflow.
+    """
+
+    if temperature <= 0.0:
+        raise ValueError("temperature must be positive")
+    if X.ndim != 4 or S_natural.ndim != 2:
+        raise ValueError("X must be rank 4 and S_natural must be rank 2")
+    if (
+        X.shape[:2] != S_natural.shape
+        or mask.shape != S_natural.shape
+        or chain_M.shape != S_natural.shape
+        or residue_idx.shape != S_natural.shape
+        or chain_encoding_all.shape != S_natural.shape
+    ):
+        raise ValueError("cyclic representation tensors have incompatible shapes")
+
+    selected_mask = (chain_M * mask) > 0.0
+    if bool(((mask > 0.0) & ~selected_mask).any()):
+        raise ValueError(
+            "cyclic representation ensemble requires peptide-only input with "
+            "no visible receptor positions"
+        )
+    selected_rows = [
+        torch.nonzero(selected_mask[index], as_tuple=False).squeeze(-1)
+        for index in range(chain_M.shape[0])
+    ]
+    lengths = [int(value.numel()) for value in selected_rows]
+    if not lengths or min(lengths) <= 0:
+        raise ValueError("Every batch row must contain at least one peptide position")
+
+    expanded_X: List[torch.Tensor] = []
+    expanded_S: List[torch.Tensor] = []
+    expanded_mask: List[torch.Tensor] = []
+    expanded_chain_M: List[torch.Tensor] = []
+    expanded_residue_idx: List[torch.Tensor] = []
+    expanded_chain_encoding: List[torch.Tensor] = []
+    representation_map: List[Tuple[int, int]] = []
+
+    for row_index, positions in enumerate(selected_rows):
+        length = int(positions.numel())
+        chain_values = torch.unique(chain_encoding_all[row_index, positions])
+        if int(chain_values.numel()) != 1:
+            raise ValueError("Every cyclic representation row must contain one peptide chain")
+        canonical_residue_idx = torch.arange(
+            length,
+            device=residue_idx.device,
+            dtype=residue_idx.dtype,
+        )
+        for shift in range(length):
+            row_X = X[row_index].clone()
+            row_S = S_natural[row_index].clone()
+            row_residue_idx = residue_idx[row_index].clone()
+            row_chain_encoding = chain_encoding_all[row_index].clone()
+            row_X[positions] = torch.roll(
+                X[row_index, positions], shifts=-shift, dims=0
+            )
+            row_S[positions] = torch.roll(
+                S_natural[row_index, positions], shifts=-shift, dims=0
+            )
+            # A new cyclic serialization starts its linear residue numbering at
+            # zero.  Rolling the old residue_idx values would preserve the old
+            # artificial boundary and would not test representation bias.
+            row_residue_idx[positions] = canonical_residue_idx
+            row_chain_encoding[positions] = chain_values[0]
+            expanded_X.append(row_X)
+            expanded_S.append(row_S)
+            expanded_mask.append(mask[row_index].clone())
+            expanded_chain_M.append(chain_M[row_index].clone())
+            expanded_residue_idx.append(row_residue_idx)
+            expanded_chain_encoding.append(row_chain_encoding)
+            representation_map.append((row_index, shift))
+
+    expanded_probability, expanded_order_std = (
+        cyclic_known_sequence_methyl_probabilities(
+            model=model,
+            X=torch.stack(expanded_X, dim=0),
+            S_natural=torch.stack(expanded_S, dim=0),
+            mask=torch.stack(expanded_mask, dim=0),
+            chain_M=torch.stack(expanded_chain_M, dim=0),
+            residue_idx=torch.stack(expanded_residue_idx, dim=0),
+            chain_encoding_all=torch.stack(expanded_chain_encoding, dim=0),
+            temperature=temperature,
+        )
+    )
+
+    probability_sum = torch.zeros_like(S_natural, dtype=torch.float32)
+    probability_square_sum = torch.zeros_like(S_natural, dtype=torch.float32)
+    probability_min = torch.full_like(
+        S_natural, float("inf"), dtype=torch.float32
+    )
+    probability_max = torch.full_like(
+        S_natural, float("-inf"), dtype=torch.float32
+    )
+    decoder_order_std_sum = torch.zeros_like(S_natural, dtype=torch.float32)
+    representation_count = torch.zeros_like(S_natural, dtype=torch.float32)
+
+    for expanded_index, (row_index, shift) in enumerate(representation_map):
+        positions = selected_rows[row_index]
+        # The representation was rolled left by ``shift``.  Rolling the output
+        # right maps every value back to its original physical residue.
+        mapped_probability = torch.roll(
+            expanded_probability[expanded_index, positions],
+            shifts=shift,
+            dims=0,
+        )
+        mapped_order_std = torch.roll(
+            expanded_order_std[expanded_index, positions],
+            shifts=shift,
+            dims=0,
+        )
+        probability_sum[row_index, positions] += mapped_probability
+        probability_square_sum[row_index, positions] += mapped_probability.square()
+        probability_min[row_index, positions] = torch.minimum(
+            probability_min[row_index, positions], mapped_probability
+        )
+        probability_max[row_index, positions] = torch.maximum(
+            probability_max[row_index, positions], mapped_probability
+        )
+        decoder_order_std_sum[row_index, positions] += mapped_order_std
+        representation_count[row_index, positions] += 1.0
+
+    expected_count = torch.tensor(
+        lengths,
+        device=representation_count.device,
+        dtype=representation_count.dtype,
+    ).unsqueeze(-1).expand_as(representation_count)
+    if not torch.equal(
+        representation_count[selected_mask], expected_count[selected_mask]
+    ):
+        raise RuntimeError("Cyclic representation ensemble coverage is incomplete")
+
+    safe_count = representation_count.clamp_min(1.0)
+    mean = probability_sum / safe_count
+    variance = (
+        probability_square_sum / safe_count - mean.square()
+    ).clamp_min(0.0)
+    representation_std = torch.sqrt(variance)
+    representation_span = probability_max - probability_min
+    decoder_order_std_mean = decoder_order_std_sum / safe_count
+
+    zero = torch.zeros_like(mean)
+    return {
+        "mean": torch.where(selected_mask, mean, zero),
+        "representation_std": torch.where(selected_mask, representation_std, zero),
+        "representation_min": torch.where(selected_mask, probability_min, zero),
+        "representation_max": torch.where(selected_mask, probability_max, zero),
+        "representation_span": torch.where(selected_mask, representation_span, zero),
+        "decoder_order_std_mean": torch.where(
+            selected_mask, decoder_order_std_mean, zero
+        ),
+        "representation_count": representation_count,
+    }
+
+
 def peptide_only_annotation_tensors(
     X: torch.Tensor,
     S_natural: torch.Tensor,

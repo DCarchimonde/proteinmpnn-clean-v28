@@ -160,6 +160,9 @@ def score_one(
     threshold: float,
 ) -> Dict[str, Any]:
     old_design = str(evidence["design_seq"])
+    retained_methyl_positions = [
+        index for index, token in enumerate(old_design, start=1) if token.islower()
+    ]
     design_natural = old_design.upper()
     selected_chain = str(evidence["selected_chain"])
     record = prepare_candidate_record(source, selected_chain, design_natural)
@@ -245,9 +248,8 @@ def score_one(
         "retained_result_design_seq": old_design,
         "design_natural_seq": design_natural,
         "final_model_suggested_design_seq": final_design,
-        "old_methyl_positions_1based": json.dumps(
-            [index for index, token in enumerate(old_design, start=1) if token.islower()]
-        ),
+        "old_methyl_positions_1based": json.dumps(retained_methyl_positions),
+        "retained_design_has_methylation": int(bool(retained_methyl_positions)),
         "final_methyl_positions_1based": json.dumps(final_positions),
         "final_design_methyl_count": len(final_positions),
         "exact_methyl_annotation_match": int(exact_annotation_match),
@@ -284,8 +286,12 @@ def score_one(
             and float(evidence["cyclic_rmsd"]) < 3.0
         ),
         "natural_sequence_invariant": int(natural_invariant),
-        "structure_reuse_allowed": 1,
-        "structure_action": "KEEP_EXISTING_PDB_NO_HIGHFOLD_RERUN",
+        "structure_reuse_allowed": int(bool(retained_methyl_positions)),
+        "structure_action": (
+            "KEEP_EXISTING_PDB_NO_HIGHFOLD_RERUN"
+            if retained_methyl_positions
+            else "WITHDRAW_NON_METHYLATED_ROW_NOT_A_VALID_COMPOUND"
+        ),
         "paper_annotation_action": (
             "KEEP_PRE_QC_RESULT_AND_REPORT_FINAL_MODEL_AGREEMENT"
             if exact_annotation_match
@@ -367,7 +373,7 @@ def main() -> None:
         for target in frozen_targets
     ]
     quality_checks = {
-        "exactly_7_frozen_targets": len(rows) == 7,
+        "frozen_target_count_matches_plan": len(rows) == len(frozen_targets),
         "all_previously_passed_same_joint_structure_gate": all(
             int(row["frozen_joint_structure_gate_pass"]) == 1 for row in rows
         ),
@@ -376,6 +382,9 @@ def main() -> None:
         ),
         "all_accepted_result_sequences_unchanged": all(
             int(row["result_sequence_changed"]) == 0 for row in rows
+        ),
+        "all_frozen_compounds_contain_at_least_one_methyl_token": all(
+            int(row["retained_design_has_methylation"]) == 1 for row in rows
         ),
         "all_existing_structures_reusable": all(
             int(row["structure_reuse_allowed"]) == 1 for row in rows
@@ -416,18 +425,25 @@ def main() -> None:
         "quality_checks": quality_checks,
         "scientific_scope": (
             "No sequence or structure was regenerated. Existing PDBs are reused only "
-            "because the final checkpoint preserves the identical naturalized sequence. "
-            "The accepted pre-QC compound identity is retained; any final-model "
-            "annotation disagreement is reported and never substituted silently."
+            "when the retained result is actually methylated and the final checkpoint "
+            "preserves the identical naturalized sequence. A structure-only row with "
+            "zero methyl tokens is withdrawn rather than mislabeled as an accepted "
+            "compound. Final-model annotation disagreement is reported and never "
+            "substituted silently."
         ),
     }
     atomic_write_json(out_dir / "frozen_target_bridge_manifest.json", manifest)
     print("===== FROZEN TARGET FINAL-MODEL BRIDGE COMPLETE =====", flush=True)
     print(f"Quality gate: {quality_gate}", flush=True)
-    print(f"Frozen structures kept: {len(rows)} / 7", flush=True)
     print(
-        f"Exact annotations: {manifest['exact_annotation_matches']} / 7; "
-        f"final-model disagreements: {manifest['final_model_annotation_disagreements']} / 7",
+        "Frozen structures eligible after methyl gate: "
+        f"{sum(int(row['structure_reuse_allowed']) for row in rows)} / {len(rows)}",
+        flush=True,
+    )
+    print(
+        f"Exact annotations: {manifest['exact_annotation_matches']} / {len(rows)}; "
+        "final-model disagreements: "
+        f"{manifest['final_model_annotation_disagreements']} / {len(rows)}",
         flush=True,
     )
     print(f"Bridge CSV: {out_dir / 'frozen_target_final_model_bridge.csv'}", flush=True)

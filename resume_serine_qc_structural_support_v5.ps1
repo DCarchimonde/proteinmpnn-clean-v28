@@ -5,10 +5,18 @@ param(
     [switch]$AllowCpu,
     [switch]$Force,
     [switch]$ReviewOnly,
-    [switch]$ReleaseHandoff
+    [switch]$ReleaseHandoff,
+    [switch]$AcknowledgeWithdrawnV5Diagnostic
 )
 
 $ErrorActionPreference = "Stop"
+if (-not $AcknowledgeWithdrawnV5Diagnostic) {
+    throw "V5 IS WITHDRAWN: 3AV9 had no methyl token and V5 annotations show an unresolved fixed tensor-position-7 bias. Run .\run_serine_qc_cyclic_representation_v6.ps1 -Force instead."
+}
+if ($ReleaseHandoff) {
+    throw "V5 structure handoff is permanently blocked. The withdrawn 150-row/3,389-row result must not be sent."
+}
+Write-Warning "Running withdrawn V5 in forensic diagnostic mode only; no release is permitted."
 $RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $V3Root = Join-Path $RepoRoot "paper_clean_v28_outputs\serine_qc_order_balanced_v3"
 $V4Root = Join-Path $RepoRoot "paper_clean_v28_outputs\serine_qc_peptide_only_v4"

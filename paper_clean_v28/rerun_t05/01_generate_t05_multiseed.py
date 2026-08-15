@@ -65,11 +65,34 @@ EXPECTED_PRIOR_HANDOFF_ROWS = 1_333
 REQUIRED_ORDER_BALANCED_EXPERT_PROTOCOL = (
     "canonical_clean_v28_all_expert_heads_corrected_labels_order_balanced_v3"
 )
+REQUIRED_CYCLIC_REPRESENTATION_EXPERT_PROTOCOL = (
+    "canonical_clean_v28_all_expert_heads_corrected_labels_"
+    "cyclic_representation_augmented_v6"
+)
+REQUIRED_CYCLIC_REPRESENTATION_TRAINING_POLICY = (
+    "all_physical_cyclic_starts_jointly_rotate_sequence_labels_and_"
+    "backbone_coordinates_with_residue_index_reset"
+)
+REQUIRED_CYCLIC_REPRESENTATION_ORDER_POLICY = (
+    "all_cyclic_sequence_coordinate_starts_with_epoch_indexed_"
+    "decoder_rotation_mapped_to_physical_labels"
+)
+REQUIRED_CYCLIC_REPRESENTATION_DEPLOYMENT_POLICY = (
+    "all_cyclic_starts_and_all_decoder_orders_mapped_to_physical_"
+    "residues_probability_mean"
+)
 PEPTIDE_ONLY_ANNOTATION_MODE = (
     "peptide_only_cyclic_order_ensemble_known_natural_sequence"
 )
+CYCLIC_REPRESENTATION_ANNOTATION_MODE = (
+    "peptide_only_all_cyclic_starts_and_decoder_orders_mapped_to_physical_residues"
+)
 PEPTIDE_ONLY_ANNOTATION_CONTEXT = (
     "peptide_chain_only_no_visible_receptor_chains"
+)
+REPRESENTATION_AUDIT_PROTOCOL = "cyclic_representation_equivariance_heldout_gate_v1"
+REPRESENTATION_AUDIT_AUTHORIZATION = (
+    "REPRESENTATION_ENSEMBLE_VALIDATED_FOR_ISOLATED_V6_REGENERATION"
 )
 SAMPLING_CONTEXT_POLICY = "native_complex_longest_receptor_visible"
 DEFAULT_OUT = (
@@ -482,18 +505,37 @@ def generate_batch(
             annotation_residue_idx,
             annotation_chain_encoding,
         ) = peptide_only_tensors_fn(X, S_context, mask, chain_M)
-        final_methyl_probability, order_probability_std = (
-            ensemble_probability_fn(
-                model=model,
-                X=annotation_X,
-                S_natural=annotation_S,
-                mask=annotation_mask,
-                chain_M=annotation_chain_M,
-                residue_idx=annotation_residue_idx,
-                chain_encoding_all=annotation_chain_encoding,
-                temperature=temperature,
-            )
+        ensemble_result = ensemble_probability_fn(
+            model=model,
+            X=annotation_X,
+            S_natural=annotation_S,
+            mask=annotation_mask,
+            chain_M=annotation_chain_M,
+            residue_idx=annotation_residue_idx,
+            chain_encoding_all=annotation_chain_encoding,
+            temperature=temperature,
         )
+        if isinstance(ensemble_result, Mapping):
+            final_methyl_probability = ensemble_result["mean"]
+            order_probability_std = ensemble_result["decoder_order_std_mean"]
+            representation_probability_std = ensemble_result["representation_std"]
+            representation_probability_min = ensemble_result["representation_min"]
+            representation_probability_max = ensemble_result["representation_max"]
+            representation_probability_span = ensemble_result["representation_span"]
+            representation_count = ensemble_result["representation_count"]
+            annotation_mode = CYCLIC_REPRESENTATION_ANNOTATION_MODE
+        else:
+            final_methyl_probability, order_probability_std = ensemble_result
+            representation_probability_std = torch_module.zeros_like(
+                final_methyl_probability
+            )
+            representation_probability_min = final_methyl_probability
+            representation_probability_max = final_methyl_probability
+            representation_probability_span = torch_module.zeros_like(
+                final_methyl_probability
+            )
+            representation_count = torch_module.ones_like(final_methyl_probability)
+            annotation_mode = PEPTIDE_ONLY_ANNOTATION_MODE
 
     S_output = S_context.clone()
     final_natural_tokens = S_context[:, masked_positions]
@@ -515,10 +557,25 @@ def generate_batch(
     sampled_lp = sampled_log_prob.detach().cpu().tolist()
     methyl_p = final_methyl_probability.detach().cpu().tolist()
     methyl_order_std = order_probability_std.detach().cpu().tolist()
+    methyl_representation_std = representation_probability_std.detach().cpu().tolist()
+    methyl_representation_min = representation_probability_min.detach().cpu().tolist()
+    methyl_representation_max = representation_probability_max.detach().cpu().tolist()
+    methyl_representation_span = representation_probability_span.detach().cpu().tolist()
+    representation_counts = representation_count.detach().cpu().tolist()
     sampling_path_p = sampling_path_methyl_probability.detach().cpu().tolist()
     orders_cpu = orders.detach().cpu().tolist()
     for index in range(batch_size):
         sequence = "".join(extended_alphabet[int(token)] for token in peptide_tokens[index])
+        representation_disagreement_positions = [
+            position + 1
+            for position, (minimum, maximum) in enumerate(
+                zip(
+                    methyl_representation_min[index],
+                    methyl_representation_max[index],
+                )
+            )
+            if float(minimum) <= methyl_threshold < float(maximum)
+        ]
         methyl_site_probabilities = [
             float(methyl_p[index][position])
             for position, token in enumerate(sequence)
@@ -558,14 +615,54 @@ def generate_batch(
                 "methyl_probability_order_std_max": float(
                     max(methyl_order_std[index])
                 ),
+                "methyl_probability_representation_std": json.dumps(
+                    [
+                        round(float(value), 8)
+                        for value in methyl_representation_std[index]
+                    ]
+                ),
+                "methyl_probability_representation_std_max": float(
+                    max(methyl_representation_std[index])
+                ),
+                "methyl_probability_representation_min": json.dumps(
+                    [
+                        round(float(value), 8)
+                        for value in methyl_representation_min[index]
+                    ]
+                ),
+                "methyl_probability_representation_max": json.dumps(
+                    [
+                        round(float(value), 8)
+                        for value in methyl_representation_max[index]
+                    ]
+                ),
+                "methyl_probability_representation_span": json.dumps(
+                    [
+                        round(float(value), 8)
+                        for value in methyl_representation_span[index]
+                    ]
+                ),
+                "methyl_probability_representation_span_max": float(
+                    max(methyl_representation_span[index])
+                ),
+                "representation_threshold_disagreement_positions_1based": json.dumps(
+                    representation_disagreement_positions
+                ),
+                "representation_threshold_disagreement_count": len(
+                    representation_disagreement_positions
+                ),
                 "sampling_path_methyl_probabilities": json.dumps(
                     [round(float(value), 8) for value in sampling_path_p[index]]
                 ),
-                "annotation_mode": PEPTIDE_ONLY_ANNOTATION_MODE,
+                "annotation_mode": annotation_mode,
                 "annotation_context_policy": PEPTIDE_ONLY_ANNOTATION_CONTEXT,
                 "annotation_visible_receptor_chains": 0,
                 "sampling_context_policy": SAMPLING_CONTEXT_POLICY,
                 "annotation_order_ensemble_size": peptide_length,
+                "annotation_decoder_order_ensemble_size": peptide_length,
+                "annotation_representation_ensemble_size": int(
+                    round(max(representation_counts[index]))
+                ),
                 "decoding_order_absolute": json.dumps([int(value) for value in orders_cpu[index]]),
             }
         )
@@ -604,11 +701,21 @@ FINAL_ANNOTATION_FIELDS = (
     "methyl_probabilities",
     "methyl_probability_order_std",
     "methyl_probability_order_std_max",
+    "methyl_probability_representation_std",
+    "methyl_probability_representation_std_max",
+    "methyl_probability_representation_min",
+    "methyl_probability_representation_max",
+    "methyl_probability_representation_span",
+    "methyl_probability_representation_span_max",
+    "representation_threshold_disagreement_positions_1based",
+    "representation_threshold_disagreement_count",
     "annotation_mode",
     "annotation_context_policy",
     "annotation_visible_receptor_chains",
     "sampling_context_policy",
     "annotation_order_ensemble_size",
+    "annotation_decoder_order_ensemble_size",
+    "annotation_representation_ensemble_size",
 )
 
 
@@ -807,6 +914,14 @@ def audit_annotation_stability(
     eligible_rows: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Any]:
     """Detect the two failure signatures that invalidated earlier reruns."""
+    observed_annotation_modes = {
+        str(row.get("annotation_mode", "")) for row in raw_rows
+    }
+    expected_annotation_mode = (
+        next(iter(observed_annotation_modes))
+        if len(observed_annotation_modes) == 1
+        else ""
+    )
     repeated: MutableMapping[Tuple[str, str], List[Mapping[str, Any]]] = defaultdict(list)
     for row in raw_rows:
         repeated[
@@ -835,6 +950,9 @@ def audit_annotation_stability(
     target_site_positions: MutableMapping[str, Counter[int]] = defaultdict(Counter)
     target_site_residues: MutableMapping[str, Counter[str]] = defaultdict(Counter)
     order_std_maxima: List[float] = []
+    representation_std_maxima: List[float] = []
+    representation_span_maxima: List[float] = []
+    representation_disagreement_counts: List[int] = []
     for row in eligible_rows:
         target = str(row["target_name"])
         sequence = str(row["design_seq"])
@@ -845,6 +963,15 @@ def audit_annotation_stability(
                 target_site_positions[target][position] += 1
                 target_site_residues[target][token.upper()] += 1
         order_std_maxima.append(float(row["methyl_probability_order_std_max"]))
+        representation_std_maxima.append(
+            float(row.get("methyl_probability_representation_std_max", 0.0))
+        )
+        representation_span_maxima.append(
+            float(row.get("methyl_probability_representation_span_max", 0.0))
+        )
+        representation_disagreement_counts.append(
+            int(row.get("representation_threshold_disagreement_count", 0))
+        )
 
     total_sites = int(sum(site_positions.values()))
     max_position_share = (
@@ -904,13 +1031,28 @@ def audit_annotation_stability(
         ),
     }
     quality_checks = {
-        "peptide_only_cyclic_ensemble_annotation_recorded_for_every_raw_row": all(
+        "one_uniform_supported_peptide_only_annotation_mode_is_recorded": (
+            expected_annotation_mode
+            in {
+                PEPTIDE_ONLY_ANNOTATION_MODE,
+                CYCLIC_REPRESENTATION_ANNOTATION_MODE,
+            }
+        ),
+        "peptide_only_annotation_context_recorded_for_every_raw_row": all(
             str(row.get("annotation_mode", ""))
-            == PEPTIDE_ONLY_ANNOTATION_MODE
+            == expected_annotation_mode
             and str(row.get("annotation_context_policy", ""))
             == PEPTIDE_ONLY_ANNOTATION_CONTEXT
             and int(row.get("annotation_visible_receptor_chains", -1)) == 0
             for row in raw_rows
+        ),
+        "cyclic_representation_ensemble_size_matches_peptide_length_when_enabled": (
+            expected_annotation_mode != CYCLIC_REPRESENTATION_ANNOTATION_MODE
+            or all(
+                int(row.get("annotation_representation_ensemble_size", -1))
+                == int(row.get("design_length", -2))
+                for row in raw_rows
+            )
         ),
         "repeated_final_natural_sequences_have_identical_annotations": (
             len(inconsistent_groups) == 0
@@ -952,6 +1094,21 @@ def audit_annotation_stability(
             if order_std_maxima
             else 0.0
         ),
+        "maximum_candidate_representation_probability_std": (
+            max(representation_std_maxima) if representation_std_maxima else 0.0
+        ),
+        "mean_candidate_representation_probability_std_max": (
+            sum(representation_std_maxima) / len(representation_std_maxima)
+            if representation_std_maxima
+            else 0.0
+        ),
+        "maximum_candidate_representation_probability_span": (
+            max(representation_span_maxima) if representation_span_maxima else 0.0
+        ),
+        "eligible_candidates_with_pre_ensemble_threshold_disagreement": sum(
+            count > 0 for count in representation_disagreement_counts
+        ),
+        "observed_annotation_mode": expected_annotation_mode,
     }
 
 
@@ -974,6 +1131,7 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
         NAT_TO_METHYL_ABS,
         complete_decoding_order,
         cyclic_known_sequence_methyl_probabilities,
+        cyclic_representation_known_sequence_methyl_probabilities,
         featurize_records,
         load_v28_model,
         peptide_only_annotation_tensors,
@@ -990,38 +1148,114 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
     for required in (model_path, native_path, best_path, old_path):
         if not required.is_file():
             raise FileNotFoundError(required)
-    if "all_expert_qc" in str(plan.get("protocol", "")):
+    requires_expert_qc = (
+        "all_expert_qc" in str(plan.get("protocol", ""))
+        or bool(args.cyclic_representation_ensemble)
+    )
+    if requires_expert_qc:
         if prior_path is None or not prior_path.is_file():
             raise FileNotFoundError(
                 "This recovery protocol requires the prior 1,333-row handoff CSV "
                 "for hard duplicate exclusion"
             )
     checkpoint_metadata: Dict[str, Any] = {}
-    if "all_expert_qc" in str(plan.get("protocol", "")):
+    if requires_expert_qc:
         checkpoint_payload = torch.load(model_path, map_location="cpu")
         if isinstance(checkpoint_payload, Mapping):
             checkpoint_metadata = dict(
                 checkpoint_payload.get("expert_head_qc_metadata", {})
             )
         observed_protocol = str(checkpoint_metadata.get("protocol", ""))
-        metadata_is_complete = (
-            observed_protocol == REQUIRED_ORDER_BALANCED_EXPERT_PROTOCOL
-            and int(checkpoint_metadata.get("minimum_order_coverage_epochs", 0)) >= 30
-            and str(checkpoint_metadata.get("training_decoding_order_policy", ""))
-            == "epoch_indexed_cyclic_designed_position_rotation"
-            and str(checkpoint_metadata.get("deployment_annotation_policy", ""))
-            == "complete_natural_sequence_all_cyclic_rotations_probability_mean"
-        )
+        if args.cyclic_representation_ensemble:
+            metadata_is_complete = (
+                observed_protocol
+                == REQUIRED_CYCLIC_REPRESENTATION_EXPERT_PROTOCOL
+                and int(checkpoint_metadata.get("minimum_order_coverage_epochs", 0))
+                >= 30
+                and bool(
+                    checkpoint_metadata.get("cyclic_representation_augmentation")
+                )
+                and str(
+                    checkpoint_metadata.get(
+                        "training_cyclic_representation_policy", ""
+                    )
+                )
+                == REQUIRED_CYCLIC_REPRESENTATION_TRAINING_POLICY
+                and str(
+                    checkpoint_metadata.get("training_decoding_order_policy", "")
+                )
+                == REQUIRED_CYCLIC_REPRESENTATION_ORDER_POLICY
+                and str(
+                    checkpoint_metadata.get("deployment_annotation_policy", "")
+                )
+                == REQUIRED_CYCLIC_REPRESENTATION_DEPLOYMENT_POLICY
+            )
+            expected_protocol = REQUIRED_CYCLIC_REPRESENTATION_EXPERT_PROTOCOL
+        else:
+            metadata_is_complete = (
+                observed_protocol == REQUIRED_ORDER_BALANCED_EXPERT_PROTOCOL
+                and int(checkpoint_metadata.get("minimum_order_coverage_epochs", 0))
+                >= 30
+                and str(
+                    checkpoint_metadata.get("training_decoding_order_policy", "")
+                )
+                == "epoch_indexed_cyclic_designed_position_rotation"
+                and str(
+                    checkpoint_metadata.get("deployment_annotation_policy", "")
+                )
+                == "complete_natural_sequence_all_cyclic_rotations_probability_mean"
+            )
+            expected_protocol = REQUIRED_ORDER_BALANCED_EXPERT_PROTOCOL
         if not metadata_is_complete:
             raise RuntimeError(
                 "Generation is blocked because the expert checkpoint was not "
-                "trained and promoted with the complete order-balanced v3 "
+                "trained and promoted with the required training/deployment "
                 "protocol metadata. Expected "
-                f"{REQUIRED_ORDER_BALANCED_EXPERT_PROTOCOL!r}, observed "
+                f"{expected_protocol!r}, observed "
                 f"{observed_protocol or '<missing>'!r}. Rerun expert-head "
                 "retraining before generation."
             )
         del checkpoint_payload
+    model_sha256 = sha256_file(model_path)
+    representation_audit: Dict[str, Any] = {}
+    representation_audit_path: Path | None = None
+    if args.cyclic_representation_ensemble:
+        if not args.representation_audit_json:
+            raise ValueError(
+                "--representation-audit-json is required with "
+                "--cyclic-representation-ensemble"
+            )
+        representation_audit_path = Path(args.representation_audit_json).resolve()
+        if not representation_audit_path.is_file():
+            raise FileNotFoundError(representation_audit_path)
+        representation_audit = read_json(representation_audit_path)
+        audit_is_authorized = (
+            str(representation_audit.get("quality_gate", "")) == "PASS"
+            and str(representation_audit.get("protocol", ""))
+            == REPRESENTATION_AUDIT_PROTOCOL
+            and str(representation_audit.get("release_authorization", ""))
+            == REPRESENTATION_AUDIT_AUTHORIZATION
+            and str(representation_audit.get("model_sha256", "")) == model_sha256
+            and str(representation_audit.get("plan_sha256", ""))
+            == sha256_file(Path(args.plan).resolve())
+            and str(representation_audit.get("annotation_mode", ""))
+            == CYCLIC_REPRESENTATION_ANNOTATION_MODE
+        )
+        if not audit_is_authorized:
+            raise RuntimeError(
+                "Cyclic-representation generation is blocked because its held-out "
+                "audit is absent, failed, or belongs to different model/plan bytes"
+            )
+    annotation_probability_fn = (
+        cyclic_representation_known_sequence_methyl_probabilities
+        if args.cyclic_representation_ensemble
+        else cyclic_known_sequence_methyl_probabilities
+    )
+    annotation_mode = (
+        CYCLIC_REPRESENTATION_ANNOTATION_MODE
+        if args.cyclic_representation_ensemble
+        else PEPTIDE_ONLY_ANNOTATION_MODE
+    )
     ensure_output_scope(out_dir, args.overwrite)
     if args.defer_permeability_until_structure and args.overwrite:
         # ``--overwrite`` is an explicit request to replace this isolated run.
@@ -1115,9 +1349,7 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
                         x_index=int(EXTENDED_AA_TO_INDEX["X"]),
                         natural_to_methyl=NAT_TO_METHYL_ABS,
                         complete_order_fn=complete_decoding_order,
-                        ensemble_probability_fn=(
-                            cyclic_known_sequence_methyl_probabilities
-                        ),
+                        ensemble_probability_fn=annotation_probability_fn,
                         peptide_only_tensors_fn=peptide_only_annotation_tensors,
                     )
                 except RuntimeError as exc:
@@ -1321,7 +1553,7 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
         "torch_version": str(torch.__version__),
         "numpy_version": str(np.__version__),
         "model_path": str(model_path),
-        "model_sha256": sha256_file(model_path),
+        "model_sha256": model_sha256,
         "model_expert_qc_protocol": checkpoint_metadata.get("protocol"),
         "native_jsonl": str(native_path),
         "best_csv": str(best_path),
@@ -1357,8 +1589,15 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
             "one explicit random peptide-position order is shared by the outer "
             "sampling loop and causal decoder mask; natural base sampled at T=0.5; "
             "after the complete natural sequence is available, visible receptor chains "
-            "are removed and expert probabilities are averaged over every peptide-only "
-            "cyclic rotation; ensemble mean >0.6 emits the "
+            "are removed and expert probabilities are averaged over every causal "
+            "decoder-depth rotation"
+            + (
+                " and every joint sequence/coordinate cyclic start after mapping "
+                "back to physical residues"
+                if args.cyclic_representation_ensemble
+                else " while the serialized cyclic start remains fixed"
+            )
+            + "; ensemble mean >0.6 emits the "
             "lowercase methyl token; only natural parents enter model context"
         ),
         "generation_decoding_order_policy": (
@@ -1369,11 +1608,36 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
             "complete-natural-sequence cyclic ensemble; every peptide site occurs "
             "once at every relative decoder depth"
         ),
+        "annotation_representation_policy": (
+            "all equivalent cyclic starts jointly rotate sequence and N/CA/C/O "
+            "coordinates, reset linear residue indices, and map probabilities back "
+            "to physical residues before averaging"
+            if args.cyclic_representation_ensemble
+            else "serialized cyclic start fixed; decoder-order ensemble only"
+        ),
         "sampling_context_policy": SAMPLING_CONTEXT_POLICY,
-        "annotation_mode": PEPTIDE_ONLY_ANNOTATION_MODE,
+        "annotation_mode": annotation_mode,
         "annotation_context_policy": PEPTIDE_ONLY_ANNOTATION_CONTEXT,
         "annotation_visible_receptor_chains": 0,
         "train_deployment_context_match": True,
+        "cyclic_representation_ensemble_enabled": bool(
+            args.cyclic_representation_ensemble
+        ),
+        "cyclic_representation_heldout_audit": (
+            {
+                "path": str(representation_audit_path),
+                "sha256": sha256_file(representation_audit_path),
+                "quality_gate": representation_audit.get("quality_gate"),
+                "protocol": representation_audit.get("protocol"),
+                "release_authorization": representation_audit.get(
+                    "release_authorization"
+                ),
+                "model_sha256": representation_audit.get("model_sha256"),
+                "plan_sha256": representation_audit.get("plan_sha256"),
+            }
+            if representation_audit_path is not None
+            else None
+        ),
         "annotation_payload_canonicalization": canonicalization,
         "annotation_stability_audit": annotation_audit,
         "autoregressive_input_policy": (
@@ -1420,6 +1684,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--validate-prior-designs-only", action="store_true")
+    parser.add_argument(
+        "--cyclic-representation-ensemble",
+        action="store_true",
+        help=(
+            "jointly rotate peptide sequence/coordinates through every cyclic start, "
+            "map probabilities back to physical residues, and average"
+        ),
+    )
+    parser.add_argument(
+        "--representation-audit-json",
+        help=(
+            "required PASS report produced by "
+            "07_audit_cyclic_representation_equivariance.py"
+        ),
+    )
     parser.add_argument(
         "--defer-permeability-until-structure",
         action="store_true",
