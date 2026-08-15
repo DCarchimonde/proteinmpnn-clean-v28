@@ -1,7 +1,9 @@
 {
-  "protocol": "temperature_0.5_all_expert_qc_order_balanced_structure_failure_recovery_v3",
+  "protocol": "temperature_0.5_all_expert_qc_peptide_only_annotation_structure_failure_recovery_v4",
   "temperature": 0.5,
   "methyl_threshold": 0.6,
+  "sampling_context_policy": "native_complex_longest_receptor_visible",
+  "annotation_context_policy": "peptide_chain_only_no_visible_receptor_chains",
   "seeds": [101, 202, 303, 404, 505],
   "sequence_identity_ceiling": 0.8,
   "expected_target_count": 10,

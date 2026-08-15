@@ -3,8 +3,8 @@
 """Revalidate the seven frozen T=0.5 structures with the final expert checkpoint.
 
 This step does not regenerate sequences or structures.  It re-scores each
-already-passed naturalized peptide on the same native-complex design backbone,
-using the final checkpoint and a strict naturalized sequence input.  It never
+already-passed naturalized peptide on its native peptide backbone with every
+receptor chain removed, matching the expert-head train/test domain.  It never
 overwrites the accepted compound's sequence or methyl sites: disagreement is
 reported as provenance, not silently converted into a different compound.  The
 existing HighFold structure remains reusable because HighFold received the
@@ -56,10 +56,16 @@ DEFAULT_MODEL = (
 )
 DEFAULT_NATIVE = REPO_ROOT / "17_complexes_native.jsonl"
 DEFAULT_OUT = (
-    REPO_ROOT / "paper_clean_v28_outputs" / "serine_qc_order_balanced_v3" / "bridge"
+    REPO_ROOT / "paper_clean_v28_outputs" / "serine_qc_peptide_only_v4" / "bridge"
 )
 REQUIRED_ORDER_BALANCED_EXPERT_PROTOCOL = (
     "canonical_clean_v28_all_expert_heads_corrected_labels_order_balanced_v3"
+)
+PEPTIDE_ONLY_ANNOTATION_MODE = (
+    "peptide_only_cyclic_order_ensemble_known_natural_sequence"
+)
+PEPTIDE_ONLY_ANNOTATION_CONTEXT = (
+    "peptide_chain_only_no_visible_receptor_chains"
 )
 
 
@@ -120,26 +126,27 @@ def chain_ids(record: Mapping[str, Any]) -> List[str]:
 def prepare_candidate_record(
     source: Mapping[str, Any], selected_chain: str, design_natural: str
 ) -> Dict[str, Any]:
-    record = copy.deepcopy(dict(source))
-    available = chain_ids(record)
+    available = chain_ids(source)
     if selected_chain not in available:
-        raise RuntimeError(f"Selected chain {selected_chain} is absent from {record_name(record, 0)}")
-    native_length = len(str(record.get(f"seq_chain_{selected_chain}", "")))
+        raise RuntimeError(f"Selected chain {selected_chain} is absent from {record_name(source, 0)}")
+    native_length = len(str(source.get(f"seq_chain_{selected_chain}", "")))
     if native_length != len(design_natural):
         raise RuntimeError(
-            f"Candidate/native length mismatch for {record_name(record, 0)}: "
+            f"Candidate/native length mismatch for {record_name(source, 0)}: "
             f"{len(design_natural)} != {native_length}"
         )
-    receptor_candidates = [chain for chain in available if chain != selected_chain]
-    if not receptor_candidates:
-        raise RuntimeError(f"No receptor chain for {record_name(record, 0)}")
-    generation_receptor = max(
-        receptor_candidates,
-        key=lambda chain: len(str(record.get(f"seq_chain_{chain}", ""))),
-    )
-    record[f"seq_chain_{selected_chain}"] = design_natural
+    record: Dict[str, Any] = {
+        "name": record_name(source, 0),
+        "seq": design_natural,
+        f"seq_chain_{selected_chain}": design_natural,
+    }
+    for atom_name in ("N", "CA", "C", "O"):
+        key = f"{atom_name}_chain_{selected_chain}"
+        if key not in source:
+            raise RuntimeError(f"Missing {key} for {record_name(source, 0)}")
+        record[key] = copy.deepcopy(source[key])
     record["masked_list"] = [selected_chain]
-    record["visible_list"] = [generation_receptor]
+    record["visible_list"] = []
     return record
 
 
@@ -265,7 +272,9 @@ def score_one(
         "expert_probability_order_std_temperature_scaled": json.dumps(
             [round(float(value), 8) for value in scaled_order_std.detach().cpu().tolist()]
         ),
-        "annotation_mode": "cyclic_order_ensemble_known_natural_sequence",
+        "annotation_mode": PEPTIDE_ONLY_ANNOTATION_MODE,
+        "annotation_context_policy": PEPTIDE_ONLY_ANNOTATION_CONTEXT,
+        "annotation_visible_receptor_chains": 0,
         "annotation_order_ensemble_size": int(positions.numel()),
         "base_log_probability_mean": float(base_log_probabilities.mean().item()),
         "global_complex_ca_rmsd": float(evidence["global_rmsd"]),
@@ -371,12 +380,18 @@ def main() -> None:
         "all_existing_structures_reusable": all(
             int(row["structure_reuse_allowed"]) == 1 for row in rows
         ),
+        "all_expert_annotations_use_training_matched_peptide_only_context": all(
+            row["annotation_mode"] == PEPTIDE_ONLY_ANNOTATION_MODE
+            and row["annotation_context_policy"] == PEPTIDE_ONLY_ANNOTATION_CONTEXT
+            and int(row["annotation_visible_receptor_chains"]) == 0
+            for row in rows
+        ),
     }
     quality_gate = "PASS" if all(quality_checks.values()) else "FAIL"
     atomic_write_csv(out_dir / "frozen_target_final_model_bridge.csv", rows, list(rows[0]))
     manifest = {
         "quality_gate": quality_gate,
-        "protocol": "final_order_balanced_expert_checkpoint_frozen_structure_bridge_v2",
+        "protocol": "final_order_balanced_expert_checkpoint_frozen_structure_bridge_v3_peptide_only",
         "model_expert_qc_protocol": metadata.get("protocol"),
         "model_path": str(model_path),
         "model_sha256": file_sha256(model_path),
@@ -394,6 +409,10 @@ def main() -> None:
             == "FINAL_MODEL_DISAGREES_RETAIN_PRE_QC_RESULT"
             for row in rows
         ),
+        "annotation_mode": PEPTIDE_ONLY_ANNOTATION_MODE,
+        "annotation_context_policy": PEPTIDE_ONLY_ANNOTATION_CONTEXT,
+        "annotation_visible_receptor_chains": 0,
+        "train_deployment_context_match": True,
         "quality_checks": quality_checks,
         "scientific_scope": (
             "No sequence or structure was regenerated. Existing PDBs are reused only "

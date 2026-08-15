@@ -31,7 +31,7 @@ REPO_ROOT = SCRIPT_PATH.parents[2]
 DEFAULT_RUN_DIR = (
     REPO_ROOT
     / "paper_clean_v28_outputs"
-    / "serine_qc_order_balanced_v3"
+    / "serine_qc_peptide_only_v4"
     / "generation"
 )
 DEFAULT_PLAN = SCRIPT_PATH.with_name("target_plan_structure_failures.json")
@@ -45,7 +45,8 @@ EXPECTED_PRIOR_ROWS = 1_333
 NATURAL_AA = "ACDEFGHIKLMNPQRSTVWY"
 METHYLATABLE_AA = set(NATURAL_AA) - {"P"}
 VALID_TOKENS = set(NATURAL_AA + NATURAL_AA.lower()) - {"p"}
-ANNOTATION_MODE = "cyclic_order_ensemble_known_natural_sequence"
+ANNOTATION_MODE = "peptide_only_cyclic_order_ensemble_known_natural_sequence"
+ANNOTATION_CONTEXT = "peptide_chain_only_no_visible_receptor_chains"
 EXPERT_PROTOCOL = (
     "canonical_clean_v28_all_expert_heads_corrected_labels_order_balanced_v3"
 )
@@ -275,6 +276,10 @@ def audit(
             row_errors.append(f"{row_id}: invalid external decoding order")
         if str(row.get("annotation_mode", "")) != ANNOTATION_MODE:
             row_errors.append(f"{row_id}: wrong annotation mode")
+        if str(row.get("annotation_context_policy", "")) != ANNOTATION_CONTEXT:
+            row_errors.append(f"{row_id}: wrong annotation context")
+        if int(row.get("annotation_visible_receptor_chains", -1)) != 0:
+            row_errors.append(f"{row_id}: receptor chain leaked into annotation context")
         if int(row.get("annotation_order_ensemble_size", -1)) != len(sequence):
             row_errors.append(f"{row_id}: wrong annotation ensemble size")
         if len(probabilities) == len(sequence):
@@ -345,19 +350,14 @@ def audit(
     for rows in repeated_groups:
         if len({str(row["design_seq"]) for row in rows}) != 1:
             inconsistent_annotation_groups += 1
-        try:
-            probability_rows = [
-                [float(value) for value in json.loads(str(row["methyl_probabilities"]))]
-                for row in rows
-            ]
-            reference = probability_rows[0]
-            if any(
-                len(values) != len(reference)
-                or any(abs(left - right) > 1e-6 for left, right in zip(reference, values))
-                for values in probability_rows[1:]
-            ):
-                probability_disagreement_groups += 1
-        except (TypeError, ValueError, json.JSONDecodeError):
+        # V4 scores each unique target/natural sequence once and copies that
+        # serialized payload to every occurrence.  Require exact persistence;
+        # do not reinterpret last-place CUDA batch noise as biology.
+        reference_probability_json = str(rows[0]["methyl_probabilities"])
+        if any(
+            str(row["methyl_probabilities"]) != reference_probability_json
+            for row in rows[1:]
+        ):
             probability_disagreement_groups += 1
 
     unique_key_counts = Counter(
@@ -393,9 +393,14 @@ def audit(
             )
 
     pass_1_checks = {
-        "generation_manifest_passed": manifest.get("quality_gate") == "PASS",
         "order_balanced_checkpoint_protocol": (
             manifest.get("model_expert_qc_protocol") == EXPERT_PROTOCOL
+        ),
+        "peptide_only_train_matched_annotation_protocol": (
+            manifest.get("annotation_mode") == ANNOTATION_MODE
+            and manifest.get("annotation_context_policy") == ANNOTATION_CONTEXT
+            and int(manifest.get("annotation_visible_receptor_chains", -1)) == 0
+            and bool(manifest.get("train_deployment_context_match"))
         ),
         "raw_count_matches_plan": len(raw_rows) == expected_raw,
         "generation_manifest_counts_match_files": (
@@ -546,7 +551,7 @@ def audit(
             if quality_gate == "PASS"
             else "BLOCKED_DO_NOT_SEND_TO_SHANGGE"
         ),
-        "protocol": "independent_three_pass_order_balanced_generation_audit_v1",
+        "protocol": "independent_three_pass_peptide_only_generation_audit_v2",
         "run_dir": str(run_dir),
         "plan": str(plan_path),
         "prior_handoff": str(prior_path),

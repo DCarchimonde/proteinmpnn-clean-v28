@@ -26,14 +26,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 SOURCE_COMMIT="28dff152d83623dfb322480413b7dc889f8537a4"
-OUTPUT_ROOT="$SCRIPT_DIR/paper_clean_v28_outputs/serine_qc_order_balanced_v3"
+OUTPUT_ROOT="$SCRIPT_DIR/paper_clean_v28_outputs/serine_qc_peptide_only_v4"
 DATA_OUT="$OUTPUT_ROOT/data"
 MODEL_OUT="$OUTPUT_ROOT/model"
 BRIDGE_OUT="$OUTPUT_ROOT/bridge"
 GENERATION_OUT="$OUTPUT_ROOT/generation"
 AUDIT_OUT="$OUTPUT_ROOT/triple_audit"
 HANDOFF_OUT="$OUTPUT_ROOT/handoff"
-AUDIT_BUNDLE="$OUTPUT_ROOT/serine_qc_order_balanced_v3_review_bundle.zip"
+AUDIT_BUNDLE="$OUTPUT_ROOT/serine_qc_peptide_only_v4_review_bundle.zip"
 PLAN="$SCRIPT_DIR/paper_clean_v28/serine_qc_retrain/target_plan_structure_failures.json"
 PARENT_CHECKPOINT="$SCRIPT_DIR/frankenstein_v28.pt"
 CORRECTED_CHECKPOINT="$MODEL_OUT/frankenstein_v28_expert_heads_qc.pt"
@@ -194,7 +194,7 @@ if [[ "$TASK_RELEASE_HANDOFF" == "1" ]]; then
   "$TASK_PYTHON" "${SELECT_ARGS[@]}"
 fi
 
-echo "AUTOMATED V3 QUALITY GATES PASSED"
+echo "AUTOMATED V4 QUALITY GATES PASSED"
 echo "Corrected checkpoint: $CORRECTED_CHECKPOINT"
 echo "Frozen-target bridge: $BRIDGE_OUT/frozen_target_final_model_bridge.csv"
 echo "Manual-review bundle: $AUDIT_BUNDLE"

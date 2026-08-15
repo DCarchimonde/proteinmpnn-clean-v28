@@ -240,6 +240,76 @@ def cyclic_known_sequence_methyl_probabilities(
     return mean, torch.sqrt(variance)
 
 
+def peptide_only_annotation_tensors(
+    X: torch.Tensor,
+    S_natural: torch.Tensor,
+    mask: torch.Tensor,
+    chain_M: torch.Tensor,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Extract the designed peptide as the single-chain expert context.
+
+    The corrected expert heads are trained and validated on peptide-only JSONL
+    records.  Base-sequence sampling may still use a receptor-conditioned
+    complex, but final N-methyl annotation must use the same single-chain input
+    domain as expert-head training.  This helper removes every visible receptor
+    position and rebuilds the exact single-chain residue/chain indices that
+    :func:`featurize_records` creates for a peptide-only record.
+
+    All rows must contain the same number of selected peptide residues.  That is
+    the deployment case here: batches are constructed for one target at a time.
+    """
+
+    if X.ndim != 4 or S_natural.ndim != 2:
+        raise ValueError("X must be rank 4 and S_natural must be rank 2")
+    if (
+        X.shape[:2] != S_natural.shape
+        or mask.shape != S_natural.shape
+        or chain_M.shape != S_natural.shape
+    ):
+        raise ValueError("X, S_natural, mask, and chain_M batch/length shapes must match")
+
+    selected_mask = (chain_M * mask) > 0.0
+    selected_rows = [
+        torch.nonzero(selected_mask[index], as_tuple=False).squeeze(-1)
+        for index in range(S_natural.shape[0])
+    ]
+    lengths = [int(positions.numel()) for positions in selected_rows]
+    if not lengths or min(lengths) <= 0:
+        raise ValueError("Every batch row must contain at least one designed peptide residue")
+    if len(set(lengths)) != 1:
+        raise ValueError("Peptide-only annotation batches must have one peptide length")
+
+    X_peptide = torch.stack(
+        [X[index, positions] for index, positions in enumerate(selected_rows)],
+        dim=0,
+    )
+    S_peptide = torch.stack(
+        [S_natural[index, positions] for index, positions in enumerate(selected_rows)],
+        dim=0,
+    )
+    peptide_mask = torch.ones_like(S_peptide, dtype=mask.dtype)
+    peptide_chain_M = torch.ones_like(S_peptide, dtype=chain_M.dtype)
+    residue_idx = torch.arange(
+        lengths[0], device=S_natural.device, dtype=torch.long
+    ).unsqueeze(0).expand(S_natural.shape[0], -1).clone()
+    chain_encoding = torch.zeros_like(residue_idx)
+    return (
+        X_peptide,
+        S_peptide,
+        peptide_mask,
+        peptide_chain_M,
+        residue_idx,
+        chain_encoding,
+    )
+
+
 class RobustHierarchicalProteinMPNN(ProteinMPNN):
     """与 v28 / frankenstein_v28.pt 对齐的模型结构。"""
 

@@ -209,6 +209,18 @@ class CompleteExpertRetrainIsolationTests(unittest.TestCase):
         self.assertIn('default=0.5', self.trainer_text)
         self.assertIn("probability_methyl_deployment_scaled", self.trainer_text)
 
+    def test_training_context_is_hard_gated_to_one_peptide_and_zero_receptors(self):
+        self.assertIn("def require_peptide_only_training_context(", self.trainer_text)
+        self.assertIn('record.get("visible_list", [])', self.trainer_text)
+        self.assertIn(
+            '"train_and_test_are_peptide_only_with_zero_visible_receptors"',
+            self.trainer_text,
+        )
+        self.assertIn(
+            '"peptide_chain_only_no_visible_receptor_chains"',
+            self.trainer_text,
+        )
+
     def test_trainer_evaluates_test_partition_only_after_training(self):
         training_position = self.trainer_text.rindex("train_all_expert_heads(")
         final_test_position = self.trainer_text.rindex("corrected_summary, corrected_per_residue")
@@ -257,6 +269,29 @@ class StructureFirstHandoffTests(unittest.TestCase):
             ]
             self.assertEqual(positions, sorted(positions))
 
+    def test_resume_launcher_reuses_v3_checkpoint_and_rows_without_retraining(self):
+        launcher = (
+            ROOT / "resume_serine_qc_peptide_only_v4.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn("05_rescore_existing_generation_peptide_only.py", launcher)
+        self.assertIn("serine_qc_order_balanced_v3", launcher)
+        self.assertIn("serine_qc_peptide_only_v4", launcher)
+        self.assertIn("no retraining; no base-sequence resampling", launcher)
+        self.assertNotIn("02_retrain_canonical_expert_heads.py", launcher)
+        self.assertNotIn("01_rebuild_provenance_labels.py", launcher)
+        programs = re.findall(r"\$ProbeCode = '([^'\r\n]+)'", launcher)
+        self.assertEqual(len(programs), 2)
+        for program in programs:
+            compile(program, "<Ser V4 PowerShell Python probe>", "exec")
+        self.assertLess(
+            launcher.index("03_revalidate_frozen_structures.py"),
+            launcher.index("05_rescore_existing_generation_peptide_only.py"),
+        )
+        self.assertLess(
+            launcher.index("05_rescore_existing_generation_peptide_only.py"),
+            launcher.index("04_triple_audit_generation.py"),
+        )
+
     def test_generator_has_no_deferred_permeability_write_path(self):
         text = (
             ROOT / "paper_clean_v28" / "rerun_t05" / "01_generate_t05_multiseed.py"
@@ -277,6 +312,25 @@ class StructureFirstHandoffTests(unittest.TestCase):
         self.assertIn("S_output[:, masked_positions] = final_output_tokens", text)
         self.assertNotIn("S_context[row_indices, positions] = final_token", text)
         self.assertNotIn("S_context[row_indices, positions] = final_output_tokens", text)
+
+    def test_generation_and_bridge_remove_receptor_for_final_expert_annotation(self):
+        common = (ROOT / "paper_clean_v28" / "clean_v28_common.py").read_text(
+            encoding="utf-8"
+        )
+        generator_text = (
+            ROOT / "paper_clean_v28" / "rerun_t05" / "01_generate_t05_multiseed.py"
+        ).read_text(encoding="utf-8")
+        bridge = (
+            ROOT
+            / "paper_clean_v28"
+            / "serine_qc_retrain"
+            / "03_revalidate_frozen_structures.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("def peptide_only_annotation_tensors(", common)
+        self.assertIn("chain_encoding = torch.zeros_like(residue_idx)", common)
+        self.assertIn("peptide_only_annotation_tensors", generator_text)
+        self.assertIn('record["visible_list"] = []', bridge)
+        self.assertIn("annotation_visible_receptor_chains", bridge)
 
     def test_prior_exact_sequences_are_identified_for_exclusion(self):
         with tempfile.TemporaryDirectory() as temporary_name:

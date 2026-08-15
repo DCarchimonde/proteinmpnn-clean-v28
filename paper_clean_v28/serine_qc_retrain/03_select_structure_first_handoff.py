@@ -27,13 +27,13 @@ REPO_ROOT = SCRIPT_PATH.parents[2]
 DEFAULT_RUN_DIR = (
     REPO_ROOT
     / "paper_clean_v28_outputs"
-    / "serine_qc_order_balanced_v3"
+    / "serine_qc_peptide_only_v4"
     / "generation"
 )
 DEFAULT_OUT = (
     REPO_ROOT
     / "paper_clean_v28_outputs"
-    / "serine_qc_order_balanced_v3"
+    / "serine_qc_peptide_only_v4"
     / "handoff"
 )
 DEFAULT_PLAN = SCRIPT_PATH.with_name("target_plan_structure_failures.json")
@@ -46,6 +46,12 @@ DEFAULT_PRIOR_HANDOFF = (
 EXPECTED_PRIOR_HANDOFF_ROWS = 1_333
 REQUIRED_ORDER_BALANCED_EXPERT_PROTOCOL = (
     "canonical_clean_v28_all_expert_heads_corrected_labels_order_balanced_v3"
+)
+REQUIRED_ANNOTATION_MODE = (
+    "peptide_only_cyclic_order_ensemble_known_natural_sequence"
+)
+REQUIRED_ANNOTATION_CONTEXT = (
+    "peptide_chain_only_no_visible_receptor_chains"
 )
 
 
@@ -438,6 +444,17 @@ def main() -> None:
         raise RuntimeError(
             "Structure handoff requires the order-balanced v3 expert checkpoint"
         )
+    if not (
+        str(generation_manifest.get("annotation_mode", ""))
+        == REQUIRED_ANNOTATION_MODE
+        and str(generation_manifest.get("annotation_context_policy", ""))
+        == REQUIRED_ANNOTATION_CONTEXT
+        and int(generation_manifest.get("annotation_visible_receptor_chains", -1)) == 0
+        and bool(generation_manifest.get("train_deployment_context_match"))
+    ):
+        raise RuntimeError(
+            "Structure handoff requires training-matched peptide-only V4 annotation"
+        )
     if (
         str(triple_audit.get("quality_gate", "")) != "PASS"
         or str(triple_audit.get("release_status", ""))
@@ -458,12 +475,14 @@ def main() -> None:
     identity_ceiling = float(plan["sequence_identity_ceiling"])
     candidates = [add_methyl_site_statistics(row) for row in read_csv(candidate_path)]
     if any(
-        str(row.get("annotation_mode", ""))
-        != "cyclic_order_ensemble_known_natural_sequence"
+        str(row.get("annotation_mode", "")) != REQUIRED_ANNOTATION_MODE
+        or str(row.get("annotation_context_policy", ""))
+        != REQUIRED_ANNOTATION_CONTEXT
+        or int(row.get("annotation_visible_receptor_chains", -1)) != 0
         for row in candidates
     ):
         raise RuntimeError(
-            "Structure handoff contains a candidate without cyclic-ensemble annotation"
+            "Structure handoff contains a candidate without peptide-only cyclic annotation"
         )
     unexpected_targets = sorted(
         {str(row["target_name"]).upper() for row in candidates} - set(target_plan)
@@ -548,7 +567,7 @@ def main() -> None:
     write_structure_inputs(out_dir, tasks)
     manifest = {
         "quality_gate": quality_gate,
-        "protocol": "all_expert_qc_order_balanced_structure_first_handoff_v3",
+        "protocol": "all_expert_qc_peptide_only_annotation_structure_first_handoff_v4",
         "generation_manifest": str(generation_manifest_path),
         "generation_manifest_sha256": file_sha256(generation_manifest_path),
         "generation_quality_gate": generation_manifest["quality_gate"],

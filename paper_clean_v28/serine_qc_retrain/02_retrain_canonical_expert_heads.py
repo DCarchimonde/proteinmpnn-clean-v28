@@ -65,10 +65,10 @@ from paper_clean_v28.clean_v28_common import (  # noqa: E402
 
 
 DEFAULT_DATA_DIR = (
-    REPO_ROOT / "paper_clean_v28_outputs" / "serine_qc_order_balanced_v3" / "data"
+    REPO_ROOT / "paper_clean_v28_outputs" / "serine_qc_peptide_only_v4" / "data"
 )
 DEFAULT_OUT = (
-    REPO_ROOT / "paper_clean_v28_outputs" / "serine_qc_order_balanced_v3" / "model"
+    REPO_ROOT / "paper_clean_v28_outputs" / "serine_qc_peptide_only_v4" / "model"
 )
 EXPECTED_TRAIN_COUNTS = {"S": 242, "s": 50, "P": 307, "p": 0}
 EXPECTED_TEST_COUNTS = {"S": 62, "s": 12, "P": 83, "p": 0}
@@ -176,6 +176,43 @@ def record_name(record: Mapping[str, Any], fallback: int) -> str:
         or record.get("id")
         or f"record_{fallback}"
     )
+
+
+def require_peptide_only_training_context(
+    records: Sequence[Mapping[str, Any]], split_name: str
+) -> Dict[str, Any]:
+    """Block training if any record contains a visible receptor or second chain."""
+
+    peptide_lengths: List[int] = []
+    for index, record in enumerate(records):
+        chain_ids = sorted(
+            key[len("seq_chain_") :]
+            for key in record
+            if key.startswith("seq_chain_") and str(record[key])
+        )
+        masked = [str(value) for value in record.get("masked_list", [])]
+        visible = [str(value) for value in record.get("visible_list", [])]
+        if (
+            len(chain_ids) != 1
+            or masked != chain_ids
+            or visible
+            or int(record.get("num_of_chains", 1)) != 1
+        ):
+            raise RuntimeError(
+                f"{split_name} record {record_name(record, index)} is not a "
+                "single masked peptide with zero visible receptor chains"
+            )
+        peptide_lengths.append(len(str(record[f"seq_chain_{chain_ids[0]}"])))
+    if not peptide_lengths or min(peptide_lengths) <= 0:
+        raise RuntimeError(f"{split_name} has no non-empty peptide-only records")
+    return {
+        "rows": len(records),
+        "minimum_peptide_length": min(peptide_lengths),
+        "maximum_peptide_length": max(peptide_lengths),
+        "visible_receptor_chains": 0,
+        "chains_per_record": 1,
+        "context_policy": "peptide_chain_only_no_visible_receptor_chains",
+    }
 
 
 def deterministic_train_validation_split(
@@ -620,8 +657,12 @@ def evaluate(
                                 order_std[row_index, position].item()
                             ),
                             "annotation_mode": (
-                                "cyclic_order_ensemble_known_natural_sequence"
+                                "peptide_only_cyclic_order_ensemble_known_natural_sequence"
                             ),
+                            "annotation_context_policy": (
+                                "peptide_chain_only_no_visible_receptor_chains"
+                            ),
+                            "annotation_visible_receptor_chains": 0,
                             "annotation_order_ensemble_size": ensemble_size,
                         }
                     )
@@ -754,6 +795,8 @@ def main() -> None:
 
     train_records = read_jsonl(str(train_path))
     test_records = read_jsonl(str(test_path))
+    train_context_audit = require_peptide_only_training_context(train_records, "train")
+    test_context_audit = require_peptide_only_training_context(test_records, "test")
     require_corrected_counts(train_records, EXPECTED_TRAIN_COUNTS, "train")
     require_corrected_counts(test_records, EXPECTED_TEST_COUNTS, "test")
     development_records, validation_records, split_manifest = (
@@ -833,6 +876,14 @@ def main() -> None:
             "deployment_annotation_policy": (
                 "complete_natural_sequence_all_cyclic_rotations_probability_mean"
             ),
+            "expert_training_context_policy": (
+                "peptide_chain_only_no_visible_receptor_chains"
+            ),
+            "required_deployment_annotation_context_policy": (
+                "peptide_chain_only_no_visible_receptor_chains"
+            ),
+            "train_context_audit": train_context_audit,
+            "test_context_audit": test_context_audit,
             "threshold": args.threshold,
             "deployment_temperature": args.deployment_temperature,
             "seed": args.seed,
@@ -857,6 +908,12 @@ def main() -> None:
     quality_checks = {
         "all_20_expert_heads_changed_and_only_experts_changed": (
             set(changed_keys) == ALL_EXPERT_STATE_KEYS
+        ),
+        "train_and_test_are_peptide_only_with_zero_visible_receptors": (
+            int(train_context_audit["visible_receptor_chains"]) == 0
+            and int(test_context_audit["visible_receptor_chains"]) == 0
+            and int(train_context_audit["chains_per_record"]) == 1
+            and int(test_context_audit["chains_per_record"]) == 1
         ),
         "record_disjoint_validation_split": not (
             set(split_manifest["development_record_names"])
@@ -941,6 +998,10 @@ def main() -> None:
             "all methyl target tokens are converted to their natural parent before "
             "every forward pass; labels never enter W_s"
         ),
+        "expert_training_context": {
+            "train": train_context_audit,
+            "test": test_context_audit,
+        },
         "training_decoding_order_policy": (
             "epoch-indexed cyclic designed-position rotation per batch row; "
             "receptor/padding positions are prefixed, every relative depth is "

@@ -1,9 +1,36 @@
-# Ser 来源质控 + 解码顺序平衡恢复流程（v3）
+# Ser 来源质控 + 肽链单独标注恢复流程（v4）
 
 本目录修复一个有明确 PDB 来源证据的标签问题，重新训练生产网络中的
 完整专家模块，并修复训练、生成和最终甲基位点注释之间的解码顺序不一致。
 昂贵的结构补跑仍限制在当前 T=0.5 结构门未通过的复合物。最终只产出一个
 新的完整 checkpoint；共享主干和天然氨基酸 base head 仍逐字节冻结。
+
+## V3 review bundle 为什么被拦住，以及 V4 修了什么
+
+V3 的 11,500 条天然序列已经通过以下检查：外层采样顺序与模型因果掩码
+一致、行数/长度/token 正确、历史 4,115 条和先前 1,333 条均无重复。因此
+**不用再重训 80 轮，也不用重新采样这 11,500 条天然序列**。
+
+真正的问题发生在天然序列生成完成后的最后一步：纠正后的 expert heads 在
+train/validation/test 中只看“单独一条肽链”，V3 最终甲基标注却让它们看了
+“受体蛋白 + 肽链复合物”。这是未验证的 train/deployment context mismatch，
+在同源 3AV* 受体骨架上表现为 2,534 个候选甲基位点中 2,464 个集中在第 7 位
+（97.24%）。它还造成两个次生现象：3AVB 只有 11 条、低于 15 条结构配额；
+同一天然序列在不同 GPU batch 中有最多约 `1.76e-6` 的概率尾数差，被旧的
+`1e-6` 比较误报为 12 组“不一致”。这些不是五个独立故障。
+
+V4 把两个模型用途明确分开：
+
+- 天然 base 序列采样继续使用受体可见的复合物上下文；
+- 最终 expert 甲基标注删除所有受体链，只保留肽链坐标、肽链天然序列、
+  从 0 开始的单链 residue index 和单一 chain encoding，与训练完全相同；
+- 每个 `target + naturalized sequence` 只复算一次，然后把同一份序列化概率
+  回填到所有重复 draw，彻底消除 batch 浮点尾差；
+- V4 仍重新执行点位/残基集中、目标配额、历史去重和三遍独立审计；不会通过
+  删除第 7 位、降低阈值或强行凑数来放行。
+
+注意：这里可复用的是**已经修好因果顺序后生成的 V3 11,500 条天然序列**。
+更早被撤回的 872 条仍不能复用，因为那一批连天然序列的采样因果掩码都不一致。
 
 ## 已确认的问题
 
@@ -132,7 +159,26 @@ checkpoint”，不能写成由新 checkpoint 重新采样；最终报告和后�
 通过结果审计并重新计算结构，才能判断是否通过；现有 872 条不能复用或仅
 重新标注，因为它们的天然序列本身也是在不一致因果掩码下采样的。
 
-## 一键运行
+## 一键恢复现有 V3 结果（推荐）
+
+在仓库目录
+`E:\ProteinMPNN_work\proteinmpnn-clean-v28` 中运行：
+
+```powershell
+git pull --ff-only origin fix/serine-provenance-retrain-2026
+powershell -ExecutionPolicy Bypass -File .\resume_serine_qc_peptide_only_v4.ps1
+```
+
+该命令自动使用现成的 V3 checkpoint、V3 `all_candidates.csv`、仓库里默认的
+历史 4,115 条和先前 1,333 条文件。正常情况下不需要填写任何
+`E:\你的路径\methylated_new_candidates.csv`；那种写法只是“文件若被你移走时
+才填写的占位符”，不是一个真实文件名。
+
+恢复脚本会清楚打印 `no retraining; no base-sequence resampling`，只做肽链
+单独复评分、7 条冻结结果 bridge、三遍审计和 review bundle 打包。若 V4 目录
+已经存在，它会保护性停止；确认覆盖同一 V4 结果时才加 `-Force`。
+
+## 从头完整重跑（通常不需要）
 
 Windows（默认寻找当前环境或名为 `wain` 的 Conda 环境）：
 
@@ -145,7 +191,7 @@ powershell -ExecutionPolicy Bypass -File .\run_serine_qc_recovery.ps1
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\run_serine_qc_recovery.ps1 `
-  -Python "E:\path\to\wain\python.exe"
+  -Python "E:\anaconda3\envs\wain\python.exe"
 ```
 
 旧的 1,333 条交接表是强制证据。默认路径不存在时必须显式传入；精确序列
@@ -153,7 +199,7 @@ powershell -ExecutionPolicy Bypass -File .\run_serine_qc_recovery.ps1 `
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\run_serine_qc_recovery.ps1 `
-  -PriorHandoffCsv "E:\path\to\methylated_new_candidates.csv"
+  -PriorHandoffCsv "E:\ProteinMPNN_work\proteinmpnn-clean-v28\paper_clean_v28_outputs\rerun_temperature_0.5_multiseed\methylated_new_candidates.csv"
 ```
 
 AutoDL/Linux：
@@ -172,8 +218,8 @@ bash run_serine_qc_recovery.sh --python python
 默认运行**不会**创建给尚哥的交接包。自动门通过后只生成：
 
 ```text
-paper_clean_v28_outputs/serine_qc_order_balanced_v3/
-  serine_qc_order_balanced_v3_review_bundle.zip
+paper_clean_v28_outputs/serine_qc_peptide_only_v4/
+  serine_qc_peptide_only_v4_review_bundle.zip
 ```
 
 必须把该 review bundle 做第三遍人工科学复核；只有明确放行后，才可再次传
@@ -196,11 +242,14 @@ paper_clean_v28_outputs/serine_qc_order_balanced_v3/
 人工复核文件：
 
 ```text
-paper_clean_v28_outputs/serine_qc_order_balanced_v3/serine_qc_order_balanced_v3_review_bundle.zip
+paper_clean_v28_outputs/serine_qc_peptide_only_v4/serine_qc_peptide_only_v4_review_bundle.zip
+paper_clean_v28_outputs/serine_qc_peptide_only_v4/generation/generation_manifest.json
+paper_clean_v28_outputs/serine_qc_peptide_only_v4/triple_audit/three_pass_generation_audit.json
 paper_clean_v28_outputs/serine_qc_order_balanced_v3/model/expert_heads_retrain_manifest.json
-paper_clean_v28_outputs/serine_qc_order_balanced_v3/generation/generation_manifest.json
-paper_clean_v28_outputs/serine_qc_order_balanced_v3/triple_audit/three_pass_generation_audit.json
 ```
+
+快速恢复复用 V3 checkpoint，所以训练 manifest 仍在 V3 `model/` 下；只有选择
+“从头完整重跑”时，新的 checkpoint 和训练 manifest 才写进 V4 `model/`。
 
 最终条数由重跑和审计决定，不预设为 872，也不为了凑数降低阈值或删除异常
 位点。只有人工复核放行后才会在 `handoff/` 下生成简化结构任务表。

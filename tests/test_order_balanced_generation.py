@@ -52,7 +52,13 @@ def audit_row(
         "design_natural_seq": design.upper(),
         "methyl_probabilities": json.dumps(probabilities),
         "methyl_probability_order_std_max": 0.05,
-        "annotation_mode": "cyclic_order_ensemble_known_natural_sequence",
+        "annotation_mode": (
+            "peptide_only_cyclic_order_ensemble_known_natural_sequence"
+        ),
+        "annotation_context_policy": (
+            "peptide_chain_only_no_visible_receptor_chains"
+        ),
+        "annotation_visible_receptor_chains": 0,
     }
 
 
@@ -108,9 +114,22 @@ class ResultAnomalyGateTests(unittest.TestCase):
         self.assertEqual(report["quality_gate"], "PASS")
         self.assertTrue(all(report["quality_checks"].values()))
 
+    def test_gpu_tail_noise_is_removed_by_canonical_payload_persistence(self):
+        first = audit_row("3AVA", "ACDEFGHI", 2, "C")
+        second = audit_row("3AVA", "ACDEFGHI", 2, "C")
+        first["candidate_id"] = "a"
+        second["candidate_id"] = "b"
+        second_probabilities = json.loads(second["methyl_probabilities"])
+        second_probabilities[0] += 0.0000015
+        second["methyl_probabilities"] = json.dumps(second_probabilities)
+        generator.canonicalize_repeated_natural_annotations([first, second])
+        report = generator.audit_annotation_stability([first, second], [first])
+        self.assertEqual(report["quality_gate"], "PASS")
+        self.assertEqual(report["raw_probability_disagreement_groups"], 0)
+
 
 class IndependentTripleAuditIntegrationTests(unittest.TestCase):
-    def test_complete_synthetic_v3_run_passes_all_three_independent_audits(self):
+    def test_complete_synthetic_v4_run_passes_all_three_independent_audits(self):
         natural_alphabet = "ACDEFGHIKLMNPQRSTVWY"
         methylatable = natural_alphabet.replace("P", "")
 
@@ -154,8 +173,12 @@ class IndependentTripleAuditIntegrationTests(unittest.TestCase):
                         "methyl_probability_order_std": json.dumps([0.02] * 8),
                         "methyl_probability_order_std_max": 0.02,
                         "annotation_mode": (
-                            "cyclic_order_ensemble_known_natural_sequence"
+                            "peptide_only_cyclic_order_ensemble_known_natural_sequence"
                         ),
+                        "annotation_context_policy": (
+                            "peptide_chain_only_no_visible_receptor_chains"
+                        ),
+                        "annotation_visible_receptor_chains": 0,
                         "annotation_order_ensemble_size": 8,
                         "decoding_order_absolute": json.dumps(order),
                         "occurrence_count": 1,
@@ -251,6 +274,14 @@ class IndependentTripleAuditIntegrationTests(unittest.TestCase):
                 "new_methylated_candidates_for_permeability": 160,
                 "historical_design_csv": str(historical_path),
                 "permeability_status": "DEFERRED_UNTIL_STRUCTURE_RETURNS",
+                "annotation_mode": (
+                    "peptide_only_cyclic_order_ensemble_known_natural_sequence"
+                ),
+                "annotation_context_policy": (
+                    "peptide_chain_only_no_visible_receptor_chains"
+                ),
+                "annotation_visible_receptor_chains": 0,
+                "train_deployment_context_match": True,
                 "annotation_stability_audit": embedded_audit,
             }
             (run_dir / "generation_manifest.json").write_text(
@@ -299,6 +330,12 @@ class OrderProtocolSourceTests(unittest.TestCase):
             / "serine_qc_retrain"
             / "04_triple_audit_generation.py"
         ).read_text(encoding="utf-8")
+        cls.rescorer = (
+            ROOT
+            / "paper_clean_v28"
+            / "serine_qc_retrain"
+            / "05_rescore_existing_generation_peptide_only.py"
+        ).read_text(encoding="utf-8")
 
     def test_model_accepts_and_validates_explicit_full_order(self):
         self.assertIn("decoding_order=None", self.common)
@@ -322,6 +359,18 @@ class OrderProtocolSourceTests(unittest.TestCase):
         self.assertLess(model_order_use, final_ensemble)
         self.assertIn("REQUIRED_ORDER_BALANCED_EXPERT_PROTOCOL", self.generator)
         self.assertIn("Generation annotation/coverage quality gate failed", self.generator)
+        self.assertIn("peptide_only_tensors_fn(X, S_context, mask, chain_M)", self.generator)
+        self.assertIn("peptide_chain_only_no_visible_receptor_chains", self.generator)
+
+    def test_v4_recovery_reuses_natural_sequences_and_scores_each_unique_key_once(self):
+        self.assertIn(
+            "RESCORE_EXISTING_V3_NATURAL_SEQUENCES_NO_RETRAIN_NO_RESAMPLING",
+            self.rescorer,
+        )
+        self.assertIn("by_target[str(row[\"target_name\"]).upper()].add", self.rescorer)
+        self.assertIn("annotation_by_key[(target, natural_sequence)]", self.rescorer)
+        self.assertIn('"visible_list": []', self.rescorer)
+        self.assertNotIn("train_all_expert_heads", self.rescorer)
 
     def test_handoff_requires_passed_generation_and_independent_audit_has_three_passes(self):
         self.assertIn('generation_manifest.get("quality_gate", "")', self.selector)
@@ -330,6 +379,7 @@ class OrderProtocolSourceTests(unittest.TestCase):
         self.assertIn("pass_1_integrity", self.independent_audit)
         self.assertIn("pass_2_result_annotation", self.independent_audit)
         self.assertIn("pass_3_novelty_coverage_workflow", self.independent_audit)
+        self.assertNotIn('"generation_manifest_passed"', self.independent_audit)
 
 
 if __name__ == "__main__":
