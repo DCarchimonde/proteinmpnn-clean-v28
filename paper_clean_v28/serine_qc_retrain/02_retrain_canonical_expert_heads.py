@@ -445,6 +445,28 @@ def normalize_active_base_indices(
     return indices
 
 
+def batch_has_active_expert_positions(
+    S_label: torch.Tensor,
+    valid: torch.Tensor,
+    active_base_indices: Sequence[int] | None = None,
+) -> bool:
+    """Return whether a batch contributes labels to the requested experts.
+
+    A scope-limited run such as V7 Ser-only training can legitimately receive a
+    shuffled mini-batch containing no Ser positions.  Such a batch has no loss
+    for the active expert and must be skipped before both the model forward and
+    the AdamW step; applying an optimizer-only step would otherwise introduce
+    weight decay without evidence.  Exact full-epoch label coverage remains a
+    separate hard gate in ``train_all_expert_heads``.
+    """
+
+    true_base = naturalize_tensor_for_input(S_label)
+    return any(
+        bool((valid & (true_base == base_index)).any())
+        for base_index in normalize_active_base_indices(active_base_indices)
+    )
+
+
 def trainable_expert_parameters(
     model: torch.nn.Module,
     active_base_indices: Sequence[int] | None = None,
@@ -573,6 +595,12 @@ def validation_balanced_bce(
                 & (real_pos > 0)
                 & (S_label != X_INDEX)
             )
+            if not batch_has_active_expert_positions(
+                S_label,
+                valid,
+                active_base_indices=active_base_indices,
+            ):
+                continue
             S_forward = naturalize_tensor_for_input(S_label)
             if cyclic_representation_ensemble:
                 representation = (
@@ -656,6 +684,8 @@ def train_all_expert_heads(
         random.Random(seed + epoch).shuffle(order)
         shuffled = [train_records[index] for index in order]
         batch_losses: List[float] = []
+        optimizer_update_batches = 0
+        skipped_no_active_position_batches = 0
         epoch_coverage = {
             index: [0, 0] for index in active_indices
         }
@@ -690,6 +720,13 @@ def train_all_expert_heads(
                 & (real_pos > 0)
                 & (S_label != X_INDEX)
             )
+            if not batch_has_active_expert_positions(
+                S_label,
+                valid,
+                active_base_indices=active_indices,
+            ):
+                skipped_no_active_position_batches += 1
+                continue
             optimizer.zero_grad(set_to_none=True)
             S_forward = naturalize_tensor_for_input(S_label)
             decoding_order = cyclic_designed_decoding_order(
@@ -717,6 +754,7 @@ def train_all_expert_heads(
             torch.nn.utils.clip_grad_norm_(expert_parameters, 5.0)
             optimizer.step()
             batch_losses.append(float(loss.item()))
+            optimizer_update_batches += 1
             for base_index, (negative_count, positive_count) in coverage.items():
                 epoch_coverage[base_index][0] += negative_count
                 epoch_coverage[base_index][1] += positive_count
@@ -734,6 +772,11 @@ def train_all_expert_heads(
                     f"expected {expected}, observed {observed}"
                 )
 
+        if not batch_losses:
+            raise RuntimeError(
+                f"Epoch {epoch} produced no optimizer update for active experts "
+                f"{[NATURAL_AA_ALPHABET[index] for index in active_indices]}"
+            )
         mean_train_loss = float(sum(batch_losses) / len(batch_losses))
         order_coverage_complete = epoch >= MINIMUM_ORDER_COVERAGE_EPOCHS
         should_validate = order_coverage_complete and (
@@ -782,6 +825,11 @@ def train_all_expert_heads(
             "all_cyclic_representations_used": int(
                 cyclic_representation_augmentation
             ),
+            "optimizer_update_batches": optimizer_update_batches,
+            "skipped_no_active_position_batches": (
+                skipped_no_active_position_batches
+            ),
+            "active_position_coverage_verified": 1,
             "epochs_without_improvement": epochs_without_improvement,
             "learning_rate": learning_rate,
         }
@@ -822,6 +870,16 @@ def train_all_expert_heads(
         ),
         "active_expert_indices": list(active_indices),
         "active_expert_tokens": [NATURAL_AA_ALPHABET[index] for index in active_indices],
+        "zero_active_position_batch_policy": (
+            "skip_before_model_forward_and_optimizer_step_with_exact_epoch_"
+            "active_label_coverage_gate"
+        ),
+        "total_optimizer_update_batches": sum(
+            int(row["optimizer_update_batches"]) for row in history
+        ),
+        "total_skipped_no_active_position_batches": sum(
+            int(row["skipped_no_active_position_batches"]) for row in history
+        ),
     }
 
 

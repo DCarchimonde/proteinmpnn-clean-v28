@@ -5,7 +5,9 @@ import csv
 import importlib.util
 import json
 import re
+import subprocess
 import sys
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -46,6 +48,47 @@ for methyl_relative_index, natural_index in NMETHYL_TO_NATURAL_MAPPING.items():
     )
 
 
+TORCH_ACTIVE_BATCH_PROGRAM = textwrap.dedent(
+    r"""
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    import torch
+
+    root = Path(sys.argv[1]).resolve()
+    trainer_path = (
+        root
+        / "paper_clean_v28"
+        / "serine_qc_retrain"
+        / "02_retrain_canonical_expert_heads.py"
+    )
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    spec = importlib.util.spec_from_file_location("serine_only_v7_trainer", trainer_path)
+    assert spec and spec.loader
+    trainer = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = trainer
+    spec.loader.exec_module(trainer)
+
+    ser = trainer.SERINE_EXPERT_INDEX
+    labels = torch.tensor([[0, 1], [2, 3]], dtype=torch.long)
+    valid = torch.ones_like(labels, dtype=torch.bool)
+    assert not trainer.batch_has_active_expert_positions(labels, valid, (ser,))
+
+    labels[1, 1] = ser
+    assert trainer.batch_has_active_expert_positions(labels, valid, (ser,))
+
+    labels[1, 1] = trainer.EXTENDED_AA_ALPHABET.index("s")
+    assert trainer.batch_has_active_expert_positions(labels, valid, (ser,))
+
+    valid[1, 1] = False
+    assert not trainer.batch_has_active_expert_positions(labels, valid, (ser,))
+    assert trainer.batch_has_active_expert_positions(labels, valid, tuple(range(20)))
+    """
+)
+
+
 class FakeTensor:
     def __init__(self, values):
         self.values = values
@@ -79,6 +122,30 @@ class SerineOnlyV7Tests(unittest.TestCase):
         self.assertIn("expected_changed_keys", trainer)
         self.assertIn("maximum_non_ser_probability_difference", trainer)
         self.assertIn("all_non_target_tensors_are_bitwise_parent_identical", trainer)
+
+    def test_scope_limited_empty_batches_are_guarded_before_forward_and_optimizer(self):
+        trainer = (RETRAIN_DIR / "02_retrain_canonical_expert_heads.py").read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(trainer)
+        functions = {
+            node.name: ast.get_source_segment(trainer, node)
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        training = functions["train_all_expert_heads"]
+        validation = functions["validation_balanced_bce"]
+        helper_call = "if not batch_has_active_expert_positions("
+        self.assertLess(training.index(helper_call), training.index("optimizer.zero_grad"))
+        self.assertLess(training.index(helper_call), training.index("model("))
+        self.assertIn("skipped_no_active_position_batches += 1", training)
+        self.assertIn("active_position_coverage_verified", training)
+        self.assertLess(
+            validation.index(helper_call),
+            validation.index(
+                "cyclic_representation_known_sequence_methyl_probabilities("
+            ),
+        )
 
     def test_strict_threshold_and_no_proline_methyl_token(self):
         representation = {
@@ -228,6 +295,46 @@ class SerineOnlyV7Tests(unittest.TestCase):
         self.assertIn('"all_17_targets_have_at_least_one_signature_candidate"', auditor)
         self.assertIn('"formal_target_abstention_is_absent"', auditor)
         self.assertNotIn("FORMAL_ABSTENTION_MINIMUM_TOPUP_DRAWS", auditor)
+
+
+class SerineOnlyActiveBatchTorchTests(unittest.TestCase):
+    """Exercise the V7 active-position guard in a clean Torch process."""
+
+    @classmethod
+    def setUpClass(cls):
+        probe = subprocess.run(
+            [sys.executable, "-c", "import torch"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if probe.returncode != 0 and "No module named 'torch'" in probe.stderr:
+            raise unittest.SkipTest("torch is not installed in this test environment")
+        if probe.returncode != 0:
+            raise RuntimeError(
+                "PyTorch failed in a clean test process:\n"
+                + probe.stdout
+                + probe.stderr
+            )
+
+    def test_serine_only_guard_distinguishes_empty_active_and_masked_batches(self):
+        completed = subprocess.run(
+            [sys.executable, "-c", TORCH_ACTIVE_BATCH_PROGRAM, str(ROOT)],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=(
+                "isolated V7 active-position guard failed\n"
+                f"stdout:\n{completed.stdout}\n"
+                f"stderr:\n{completed.stderr}"
+            ),
+        )
 
 
 if __name__ == "__main__":
