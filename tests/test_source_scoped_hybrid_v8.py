@@ -606,6 +606,39 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
         self.assertIn("position_auditor_program_sha256", source)
         self.assertIn('Filter "3zgc_round_*.json.gz"', source)
 
+    def test_runner_accepts_the_pinned_legacy_v6_manifest_without_v7_scope_fields(self):
+        runner = (
+            ROOT
+            / "paper_clean_v28"
+            / "run_serine_qc_source_scoped_hybrid_v8.ps1"
+        )
+        source = runner.read_text(encoding="utf-8")
+        self.assertIn("function Assert-LegacyV6SourceModel", source)
+        self.assertIn(
+            "$V6Source = Assert-LegacyV6SourceModel "
+            "$V6Checkpoint $V6ExpertManifest $V6ExpertProtocol",
+            source,
+        )
+        self.assertNotIn("$V6Source = Assert-SourceModel", source)
+        self.assertIn("$ExpertIndex -lt 20", source)
+        self.assertIn(
+            'Assert-SameStringSet -Observed @($Manifest.changed_non_expert_keys) '
+            '-Expected @()',
+            source,
+        )
+        self.assertIn(
+            "all 20 expert linear heads are retrained",
+            source,
+        )
+        self.assertIn(
+            "-not [bool]$Manifest.training.cyclic_representation_augmentation",
+            source,
+        )
+        self.assertIn(
+            '$V7Source = Assert-SourceModel $V7Checkpoint',
+            source,
+        )
+
     def test_search_budget_trace_and_candidate_provenance_are_hard_gated(self):
         source = (RETRAIN_DIR / "14_directed_recovery_search_v8.py").read_text(
             encoding="utf-8"

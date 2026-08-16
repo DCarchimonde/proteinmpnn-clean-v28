@@ -332,6 +332,55 @@ function Assert-SourceModel {
     return $Manifest
 }
 
+function Assert-LegacyV6SourceModel {
+    param(
+        [string]$Checkpoint,
+        [string]$ManifestPath,
+        [string]$Protocol,
+        [string]$Stage
+    )
+    $Manifest = Assert-PassedManifest $ManifestPath $Protocol $Stage
+    if (-not [bool]$Manifest.checkpoint_ready_for_generation) {
+        throw "$Stage checkpoint is not authorized for generation"
+    }
+    if ((Get-Sha256 $Checkpoint) -ne [string]$Manifest.checkpoint_artifact_sha256) {
+        throw "$Stage checkpoint hash does not match its manifest"
+    }
+    if ((Get-Sha256 $CanonicalCheckpoint) -ne [string]$Manifest.parent_checkpoint_sha256) {
+        throw "$Stage was not derived from the pinned canonical checkpoint"
+    }
+
+    # The immutable V6 manifest predates expert_scope/active_expert_tokens.
+    # Its exact all-expert scope is instead proven by the 40 changed expert
+    # tensors plus the frozen-non-expert policy recorded by the V6 trainer.
+    $ExpectedChangedStateKeys = @()
+    for ($ExpertIndex = 0; $ExpertIndex -lt 20; $ExpertIndex++) {
+        $ExpectedChangedStateKeys += "experts.$ExpertIndex.bias"
+        $ExpectedChangedStateKeys += "experts.$ExpertIndex.weight"
+    }
+    Assert-SameStringSet -Observed @($Manifest.changed_state_keys) -Expected $ExpectedChangedStateKeys -Stage "$Stage changed tensors"
+    Assert-SameStringSet -Observed @($Manifest.changed_non_expert_keys) -Expected @() -Stage "$Stage changed non-expert tensors"
+    $ExpectedParameterPolicy = "shared trunk, sequence embedding, decoder, and base head are bitwise frozen; all 20 expert linear heads are retrained"
+    if ([string]$Manifest.parameter_policy -ne $ExpectedParameterPolicy) {
+        throw "$Stage has wrong frozen-parameter policy: $($Manifest.parameter_policy)"
+    }
+    if ($null -eq $Manifest.training -or
+        -not [bool]$Manifest.training.cyclic_representation_augmentation) {
+        throw "$Stage did not use cyclic representation augmentation"
+    }
+
+    # If a later copy adds the newer fields, they must agree with the legacy
+    # evidence rather than silently contradicting it.
+    if ($null -ne $Manifest.PSObject.Properties["expert_scope"] -and
+        [string]$Manifest.expert_scope -ne "all") {
+        throw "$Stage has wrong expert scope: $($Manifest.expert_scope)"
+    }
+    if ($null -ne $Manifest.PSObject.Properties["active_expert_tokens"]) {
+        Assert-SameStringSet -Observed @($Manifest.active_expert_tokens) -Expected @("A", "C", "D", "E", "F", "G", "H", "I", "K", "L", "M", "N", "P", "Q", "R", "S", "T", "V", "W", "Y") -Stage "$Stage active experts"
+    }
+    return $Manifest
+}
+
 function Assert-SourceRepresentation {
     param(
         [string]$Path,
@@ -661,7 +710,7 @@ if ((Get-Sha256 $V6AllCandidates) -ne $ExpectedV6AllSha -or
     throw "V6 source pool is not the uploaded audited 31,500-row result"
 }
 
-$V6Source = Assert-SourceModel $V6Checkpoint $V6ExpertManifest $V6ExpertProtocol "all" @("A", "C", "D", "E", "F", "G", "H", "I", "K", "L", "M", "N", "P", "Q", "R", "S", "T", "V", "W", "Y") "V6 source model"
+$V6Source = Assert-LegacyV6SourceModel $V6Checkpoint $V6ExpertManifest $V6ExpertProtocol "V6 source model"
 $V7Source = Assert-SourceModel $V7Checkpoint $V7ExpertManifest $V7ExpertProtocol "serine-only" @("S") "V7 source model"
 $V6SourceRepresentation = Assert-SourceRepresentation $V6Representation $V6RepresentationProtocol $V6RepresentationAuthorization $V6Checkpoint "V6 representation audit"
 $V7SourceRepresentation = Assert-SourceRepresentation $V7Representation $V7RepresentationProtocol $V7RepresentationAuthorization $V7Checkpoint "V7 representation audit"
