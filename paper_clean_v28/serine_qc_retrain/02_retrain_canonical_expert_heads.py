@@ -1,12 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Retrain the complete clean-V28 expert module on provenance-corrected labels.
+"""Retrain clean-V28 expert heads on provenance-corrected labels.
 
 The shared ProteinMPNN trunk and the natural-amino-acid base head remain frozen.
-All twenty residue experts are optimized together inside the production network;
-there is no surrogate network and no post-hoc weight splicing.  Lowercase target
-tokens are naturalized before every model forward so the methylation answer can
-never leak through the sequence embedding.
+The historical V3/V6 mode optimizes all twenty residue experts together.  The
+V7 ``serine-only`` mode is narrower: provenance correction changed only the
+ordinary-ATOM Ser label, so it optimizes only the Ser expert and requires every
+other tensor (including the other nineteen experts) to remain bitwise identical
+to the canonical parent.  There is no surrogate network or post-hoc weight
+splicing.  Lowercase target tokens are naturalized before every model forward
+so the methylation answer can never leak through the sequence embedding.
 
 Every training epoch receives an explicit cyclic designed-position rotation;
 the 30-epoch minimum covers every possible relative depth allowed by the frozen
@@ -88,6 +91,14 @@ CYCLIC_REPRESENTATION_PROTOCOL = (
     "canonical_clean_v28_all_expert_heads_corrected_labels_"
     "cyclic_representation_augmented_v6"
 )
+SERINE_ONLY_CYCLIC_PROTOCOL = (
+    "canonical_clean_v28_serine_only_corrected_labels_"
+    "cyclic_representation_augmented_v7"
+)
+SERINE_EXPERT_INDEX = NATURAL_AA_ALPHABET.index("S")
+SERINE_EXPERT_STATE_KEYS = {
+    f"experts.{SERINE_EXPERT_INDEX}.{suffix}" for suffix in ("weight", "bias")
+}
 MINIMUM_ORDER_COVERAGE_EPOCHS = 30
 VALIDATION_INTERVAL_EPOCHS = 5
 
@@ -419,10 +430,37 @@ def batches(records: Sequence[Mapping[str, Any]], batch_size: int) -> Iterable[L
         yield [dict(value) for value in records[start : start + batch_size]]
 
 
-def trainable_expert_parameters(model: torch.nn.Module) -> List[torch.nn.Parameter]:
+def normalize_active_base_indices(
+    active_base_indices: Sequence[int] | None,
+) -> Tuple[int, ...]:
+    indices = tuple(
+        range(len(NATURAL_AA_ALPHABET))
+        if active_base_indices is None
+        else sorted({int(value) for value in active_base_indices})
+    )
+    if not indices or any(
+        value < 0 or value >= len(NATURAL_AA_ALPHABET) for value in indices
+    ):
+        raise ValueError("active expert indices are empty or out of range")
+    return indices
+
+
+def trainable_expert_parameters(
+    model: torch.nn.Module,
+    active_base_indices: Sequence[int] | None = None,
+) -> List[torch.nn.Parameter]:
     for parameter in model.parameters():
         parameter.requires_grad_(False)
-    parameters = list(model.experts.parameters())
+    if active_base_indices is None:
+        # Preserve the original V3/V6 all-expert path exactly.
+        parameters = list(model.experts.parameters())
+    else:
+        indices = normalize_active_base_indices(active_base_indices)
+        parameters = [
+            parameter
+            for index in indices
+            for parameter in model.experts[index].parameters()
+        ]
     for parameter in parameters:
         parameter.requires_grad_(True)
     return parameters
@@ -430,10 +468,12 @@ def trainable_expert_parameters(model: torch.nn.Module) -> List[torch.nn.Paramet
 
 def positive_weights_by_base(
     records: Sequence[Mapping[str, Any]],
+    active_base_indices: Sequence[int] | None = None,
 ) -> Dict[int, float]:
     counts = per_base_binary_counts(records)
     result: Dict[int, float] = {}
-    for base_index, base in enumerate(NATURAL_AA_ALPHABET):
+    for base_index in normalize_active_base_indices(active_base_indices):
+        base = NATURAL_AA_ALPHABET[base_index]
         negatives = int(counts[base]["natural_negative"])
         positives = int(counts[base]["methyl_positive"])
         if negatives <= 0:
@@ -451,11 +491,12 @@ def expert_head_loss(
     S_label: torch.Tensor,
     valid: torch.Tensor,
     positive_weights: Mapping[int, float],
+    active_base_indices: Sequence[int] | None = None,
 ) -> Tuple[torch.Tensor, Dict[int, Tuple[int, int]]]:
     true_base = naturalize_tensor_for_input(S_label)
     losses: List[torch.Tensor] = []
     coverage: Dict[int, Tuple[int, int]] = {}
-    for base_index in range(len(NATURAL_AA_ALPHABET)):
+    for base_index in normalize_active_base_indices(active_base_indices):
         selected = valid & (true_base == base_index)
         if not bool(selected.any()):
             continue
@@ -484,12 +525,13 @@ def expert_probability_loss(
     S_label: torch.Tensor,
     valid: torch.Tensor,
     positive_weights: Mapping[int, float],
+    active_base_indices: Sequence[int] | None = None,
 ) -> torch.Tensor:
     """Balanced BCE on deterministic deployment-ensemble probabilities."""
 
     true_base = naturalize_tensor_for_input(S_label)
     losses: List[torch.Tensor] = []
-    for base_index in range(len(NATURAL_AA_ALPHABET)):
+    for base_index in normalize_active_base_indices(active_base_indices):
         selected = valid & (true_base == base_index)
         if not bool(selected.any()):
             continue
@@ -514,6 +556,7 @@ def validation_balanced_bce(
     batch_size: int,
     positive_weights: Mapping[int, float],
     cyclic_representation_ensemble: bool = False,
+    active_base_indices: Sequence[int] | None = None,
 ) -> float:
     model.eval()
     losses: List[float] = []
@@ -563,6 +606,7 @@ def validation_balanced_bce(
                 S_label,
                 valid,
                 positive_weights,
+                active_base_indices=active_base_indices,
             )
             losses.append(float(loss.item()))
     if not losses:
@@ -581,9 +625,16 @@ def train_all_expert_heads(
     patience: int,
     seed: int,
     cyclic_representation_augmentation: bool = False,
+    active_base_indices: Sequence[int] | None = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, torch.Tensor], Dict[str, Any]]:
-    expert_parameters = trainable_expert_parameters(model)
-    positive_weights = positive_weights_by_base(train_records)
+    active_indices = normalize_active_base_indices(active_base_indices)
+    active_state_keys = {
+        f"experts.{index}.{suffix}"
+        for index in active_indices
+        for suffix in ("weight", "bias")
+    }
+    expert_parameters = trainable_expert_parameters(model, active_indices)
+    positive_weights = positive_weights_by_base(train_records, active_indices)
     optimizer = torch.optim.AdamW(
         expert_parameters, lr=learning_rate, weight_decay=1e-4
     )
@@ -606,7 +657,7 @@ def train_all_expert_heads(
         shuffled = [train_records[index] for index in order]
         batch_losses: List[float] = []
         epoch_coverage = {
-            index: [0, 0] for index in range(len(NATURAL_AA_ALPHABET))
+            index: [0, 0] for index in active_indices
         }
 
         for batch in batches(shuffled, batch_size):
@@ -656,7 +707,11 @@ def train_all_expert_heads(
                 decoding_order=decoding_order,
             )
             loss, coverage = expert_head_loss(
-                expert_logits, S_label, valid, positive_weights
+                expert_logits,
+                S_label,
+                valid,
+                positive_weights,
+                active_base_indices=active_indices,
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(expert_parameters, 5.0)
@@ -666,7 +721,8 @@ def train_all_expert_heads(
                 epoch_coverage[base_index][0] += negative_count
                 epoch_coverage[base_index][1] += positive_count
 
-        for base_index, base in enumerate(NATURAL_AA_ALPHABET):
+        for base_index in active_indices:
+            base = NATURAL_AA_ALPHABET[base_index]
             observed = epoch_coverage[base_index]
             expected = [
                 int(expected_counts[base]["natural_negative"]),
@@ -693,6 +749,7 @@ def train_all_expert_heads(
                 batch_size,
                 positive_weights,
                 cyclic_representation_ensemble=cyclic_representation_augmentation,
+                active_base_indices=active_indices,
             )
             if should_validate
             else None
@@ -707,7 +764,7 @@ def train_all_expert_heads(
             best_state = {
                 key: value.detach().cpu().clone()
                 for key, value in model.state_dict().items()
-                if key in ALL_EXPERT_STATE_KEYS
+                if key in active_state_keys
             }
             epochs_without_improvement = 0
         elif should_validate:
@@ -763,6 +820,8 @@ def train_all_expert_heads(
         "cyclic_representation_augmentation": bool(
             cyclic_representation_augmentation
         ),
+        "active_expert_indices": list(active_indices),
+        "active_expert_tokens": [NATURAL_AA_ALPHABET[index] for index in active_indices],
     }
 
 
@@ -972,6 +1031,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--allow-cpu", action="store_true")
     parser.add_argument(
+        "--expert-scope",
+        choices=("all", "serine-only"),
+        default="all",
+        help=(
+            "all preserves the historical V3/V6 workflow; serine-only is the "
+            "V7 provenance-scoped repair and keeps every non-Ser tensor bitwise "
+            "identical to the canonical parent"
+        ),
+    )
+    parser.add_argument(
         "--cyclic-representation-augmentation",
         action="store_true",
         help=(
@@ -986,6 +1055,20 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    serine_only = args.expert_scope == "serine-only"
+    if serine_only and not args.cyclic_representation_augmentation:
+        raise ValueError(
+            "--expert-scope serine-only requires "
+            "--cyclic-representation-augmentation"
+        )
+    active_indices = (
+        (SERINE_EXPERT_INDEX,)
+        if serine_only
+        else tuple(range(len(NATURAL_AA_ALPHABET)))
+    )
+    expected_changed_keys = (
+        SERINE_EXPERT_STATE_KEYS if serine_only else ALL_EXPERT_STATE_KEYS
+    )
     if (
         args.epochs < MINIMUM_ORDER_COVERAGE_EPOCHS
         or args.batch_size <= 0
@@ -1032,13 +1115,16 @@ def main() -> None:
     print(f"Loading canonical clean-V28 checkpoint: {model_path}", flush=True)
     model = load_v28_model(str(model_path), device)
     before_hashes = state_hashes(model.state_dict())
+    parent_summary: Dict[str, Any] | None = None
+    parent_positions: List[Dict[str, Any]] | None = None
     baseline_validation_loss = validation_balanced_bce(
         model,
         validation_records,
         device,
         args.batch_size,
-        positive_weights_by_base(development_records),
+        positive_weights_by_base(development_records, active_indices),
         cyclic_representation_ensemble=args.cyclic_representation_augmentation,
+        active_base_indices=active_indices,
     )
     history, _best_expert_state, training_selection = train_all_expert_heads(
         model,
@@ -1051,19 +1137,46 @@ def main() -> None:
         args.early_stopping_patience,
         args.seed,
         cyclic_representation_augmentation=args.cyclic_representation_augmentation,
+        active_base_indices=active_indices,
     )
     after_hashes = state_hashes(model.state_dict())
     changed_keys = sorted(
         key for key in before_hashes if before_hashes[key] != after_hashes[key]
     )
     changed_non_expert_keys = sorted(set(changed_keys) - ALL_EXPERT_STATE_KEYS)
-    unchanged_expected_expert_keys = sorted(ALL_EXPERT_STATE_KEYS - set(changed_keys))
-    if set(changed_keys) != ALL_EXPERT_STATE_KEYS:
+    unexpected_changed_keys = sorted(set(changed_keys) - expected_changed_keys)
+    unchanged_expected_keys = sorted(expected_changed_keys - set(changed_keys))
+    if not serine_only and set(changed_keys) != ALL_EXPERT_STATE_KEYS:
         raise RuntimeError(
             "All-expert state isolation failed: expected exactly the 40 expert "
-            f"tensors to change; missing={unchanged_expected_expert_keys}, "
-            f"unexpected={changed_non_expert_keys}"
+            f"tensors to change; missing={unchanged_expected_keys}, "
+            f"unexpected={unexpected_changed_keys}"
         )
+    if serine_only and set(changed_keys) != SERINE_EXPERT_STATE_KEYS:
+        raise RuntimeError(
+            "Expert-scope state isolation failed: expected exactly "
+            f"{sorted(expected_changed_keys)} to change; "
+            f"missing={unchanged_expected_keys}, unexpected={unexpected_changed_keys}"
+        )
+
+    # The independent test remains untouched until epoch selection is complete.
+    # In V7 only, evaluate a freshly reloaded canonical parent now so exact
+    # non-Ser preservation can be verified without influencing training.
+    if serine_only:
+        parent_model = load_v28_model(str(model_path), device)
+        parent_summary, _parent_per_residue, parent_positions = evaluate(
+            parent_model,
+            test_records,
+            device,
+            args.batch_size,
+            args.threshold,
+            args.deployment_temperature,
+            "canonical_parent_after_training_for_non_ser_invariance",
+            cyclic_representation_ensemble=True,
+        )
+        del parent_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     corrected_summary, corrected_per_residue, corrected_positions = evaluate(
         model,
@@ -1073,19 +1186,34 @@ def main() -> None:
         args.threshold,
         args.deployment_temperature,
         (
-            "all_expert_heads_qc_cyclic_representation_retrained"
-            if args.cyclic_representation_augmentation
-            else "all_expert_heads_qc_retrained"
+            "serine_only_qc_cyclic_representation_retrained"
+            if serine_only
+            else (
+                "all_expert_heads_qc_cyclic_representation_retrained"
+                if args.cyclic_representation_augmentation
+                else "all_expert_heads_qc_retrained"
+            )
         ),
         cyclic_representation_ensemble=args.cyclic_representation_augmentation,
     )
     out_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = out_dir / "frankenstein_v28_expert_heads_qc.pt"
-    candidate_checkpoint_path = out_dir / "frankenstein_v28_expert_heads_qc.candidate.pt"
+    checkpoint_name = (
+        "frankenstein_v28_serine_only_qc.pt"
+        if serine_only
+        else "frankenstein_v28_expert_heads_qc.pt"
+    )
+    checkpoint_path = out_dir / checkpoint_name
+    candidate_checkpoint_path = out_dir / checkpoint_name.replace(
+        ".pt", ".candidate.pt"
+    )
     selected_protocol = (
-        CYCLIC_REPRESENTATION_PROTOCOL
-        if args.cyclic_representation_augmentation
-        else ORDER_BALANCED_PROTOCOL
+        SERINE_ONLY_CYCLIC_PROTOCOL
+        if serine_only
+        else (
+            CYCLIC_REPRESENTATION_PROTOCOL
+            if args.cyclic_representation_augmentation
+            else ORDER_BALANCED_PROTOCOL
+        )
     )
     training_order_policy = (
         "all_cyclic_sequence_coordinate_starts_with_epoch_indexed_"
@@ -1109,6 +1237,15 @@ def main() -> None:
             "train_jsonl_sha256": file_sha256(train_path),
             "test_jsonl_sha256": file_sha256(test_path),
             "changed_state_keys": changed_keys,
+            "expert_scope": args.expert_scope,
+            "active_expert_tokens": [
+                NATURAL_AA_ALPHABET[index] for index in active_indices
+            ],
+            "preserved_state_key_hashes": {
+                key: value
+                for key, value in before_hashes.items()
+                if key not in expected_changed_keys
+            },
             "epochs": args.epochs,
             "batch_size": args.batch_size,
             "learning_rate": args.learning_rate,
@@ -1156,9 +1293,57 @@ def main() -> None:
     proline = corrected_summary["proline"]
     overall_fixed = corrected_summary["overall_at_threshold"]
     corrected_auc = corrected_summary["overall_auc"]
+    maximum_non_ser_probability_difference = 0.0
+    parent_test_summary: Dict[str, Any] | None = None
+    if serine_only:
+        if parent_summary is None or parent_positions is None:
+            raise RuntimeError("Ser-only parent evaluation was not produced")
+        if len(parent_positions) != len(corrected_positions):
+            raise RuntimeError("Parent/corrected held-out position counts differ")
+        differences: List[float] = []
+        for parent_row, corrected_row in zip(parent_positions, corrected_positions):
+            identity = (
+                str(parent_row["sample_name"]),
+                int(parent_row["position_in_model_0based"]),
+                str(parent_row["base_token"]),
+            )
+            corrected_identity = (
+                str(corrected_row["sample_name"]),
+                int(corrected_row["position_in_model_0based"]),
+                str(corrected_row["base_token"]),
+            )
+            if identity != corrected_identity:
+                raise RuntimeError("Parent/corrected held-out row order differs")
+            if identity[2] != "S":
+                differences.append(
+                    abs(
+                        float(
+                            parent_row["probability_methyl_deployment_scaled"]
+                        )
+                        - float(
+                            corrected_row["probability_methyl_deployment_scaled"]
+                        )
+                    )
+                )
+        maximum_non_ser_probability_difference = max(differences, default=0.0)
+        parent_test_summary = {
+            "overall_auc": parent_summary["overall_auc"],
+            "overall_at_threshold": parent_summary["overall_at_threshold"],
+            "non_ser_auc": parent_summary["non_ser_auc"],
+            "non_ser_at_threshold": parent_summary["non_ser_at_threshold"],
+            "serine": parent_summary["serine"],
+        }
     quality_checks = {
-        "all_20_expert_heads_changed_and_only_experts_changed": (
-            set(changed_keys) == ALL_EXPERT_STATE_KEYS
+        "requested_expert_scope_changed_exactly_expected_tensors": (
+            set(changed_keys) == expected_changed_keys
+        ),
+        "all_non_target_tensors_are_bitwise_parent_identical": all(
+            before_hashes[key] == after_hashes[key]
+            for key in before_hashes
+            if key not in expected_changed_keys
+        ),
+        "serine_only_non_ser_probabilities_are_exactly_preserved": (
+            not serine_only or maximum_non_ser_probability_difference == 0.0
         ),
         "train_and_test_are_peptide_only_with_zero_visible_receptors": (
             int(train_context_audit["visible_receptor_chains"]) == 0
@@ -1181,11 +1366,16 @@ def main() -> None:
         "requested_cyclic_representation_training_protocol_is_active": (
             not args.cyclic_representation_augmentation
             or (
-                selected_protocol == CYCLIC_REPRESENTATION_PROTOCOL
+                selected_protocol
+                in {CYCLIC_REPRESENTATION_PROTOCOL, SERINE_ONLY_CYCLIC_PROTOCOL}
                 and bool(
                     training_selection.get("cyclic_representation_augmentation")
                 )
             )
+        ),
+        "serine_only_scope_metadata_is_exact": (
+            not serine_only
+            or training_selection.get("active_expert_tokens") == ["S"]
         ),
         "all_19_supported_experts_present_in_test": (
             int(corrected_summary["supported_expert_count"]) == 19
@@ -1241,6 +1431,11 @@ def main() -> None:
         "output_checkpoint": str(checkpoint_path) if quality_gate == "PASS" else None,
         "candidate_checkpoint": str(checkpoint_artifact_path),
         "checkpoint_artifact_sha256": file_sha256(checkpoint_artifact_path),
+        "expert_scope": args.expert_scope,
+        "active_expert_tokens": [
+            NATURAL_AA_ALPHABET[index] for index in active_indices
+        ],
+        "expected_changed_state_keys": sorted(expected_changed_keys),
         "changed_state_keys": changed_keys,
         "unchanged_state_key_count": len(before_hashes) - len(changed_keys),
         "changed_non_expert_keys": changed_non_expert_keys,
@@ -1251,8 +1446,11 @@ def main() -> None:
             "generation contains no P-to-p mapping"
         ),
         "parameter_policy": (
-            "shared trunk, sequence embedding, decoder, and base head are bitwise "
-            "frozen; all 20 expert linear heads are retrained"
+            "shared trunk, sequence embedding, decoder, base head, and nineteen "
+            "non-Ser experts are bitwise frozen; only the Ser expert is retrained"
+            if serine_only
+            else "shared trunk, sequence embedding, decoder, and base head are "
+            "bitwise frozen; all 20 expert linear heads are retrained"
         ),
         "label_input_policy": (
             "all methyl target tokens are converted to their natural parent before "
@@ -1306,6 +1504,10 @@ def main() -> None:
             "selection": training_selection,
         },
         "corrected_test": corrected_summary,
+        "canonical_parent_test_before_serine_only_repair": parent_test_summary,
+        "maximum_non_ser_probability_difference_from_parent": (
+            maximum_non_ser_probability_difference
+        ),
         "quality_checks": quality_checks,
     }
     atomic_write_json(out_dir / "expert_heads_retrain_manifest.json", manifest)
@@ -1323,9 +1525,23 @@ def main() -> None:
         list(corrected_positions[0]),
     )
 
-    print("===== CANONICAL ALL-EXPERT-HEAD RETRAIN COMPLETE =====", flush=True)
+    print(
+        "===== CANONICAL SER-ONLY RETRAIN COMPLETE ====="
+        if serine_only
+        else "===== CANONICAL ALL-EXPERT-HEAD RETRAIN COMPLETE =====",
+        flush=True,
+    )
     print(f"Quality gate: {quality_gate}", flush=True)
-    print(f"Changed expert tensors: {len(changed_keys)} / {len(ALL_EXPERT_STATE_KEYS)}", flush=True)
+    print(
+        f"Changed tensors: {len(changed_keys)} / {len(expected_changed_keys)} expected",
+        flush=True,
+    )
+    if serine_only:
+        print(
+            "Maximum non-Ser probability difference from parent: "
+            f"{maximum_non_ser_probability_difference:.12g}",
+            flush=True,
+        )
     print(
         "Validation BCE: parent={:.6f}, selected={:.6f} at epoch {}".format(
             baseline_validation_loss,

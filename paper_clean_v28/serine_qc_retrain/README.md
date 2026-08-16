@@ -1,6 +1,58 @@
-# Ser 来源质控与循环起点不变性恢复（V6）
+# Ser 来源质控与循环起点不变性恢复（V7）
 
 ## 先说结论
+
+V7 取代 V6。**不要再运行 V6 的 `-Force` 或 `-ResumeQuota`，也不要把 3ZGC 的
+`MODEL_ABSTAINS` 当最终科学结论。** V6 的 31,500 条自然序列和 base-head
+采样统计保留为只读输入；V7 不再抽样，而是修正模型训练范围后统一重新标注。
+
+根因是训练范围扩大错了：PDB 来源修复只把普通 `ATOM-SER` 的错误小写 `s`
+改回天然 `S`，没有改变 R、G、L 等另外 19 个专家的标签；V3/V6 却重训了全部
+20 个 expert heads。3ZGC 在 V6 中 13,000 次抽样零产出（最高概率约 0.195）
+不是“种子不够”，而是非 Ser 专家也被不必要地改写了。历史上 3ZGC 的结构
+通过候选 `rEGGQNR` 和 3WNE 的 `GrKWNC` 都依赖 R 专家，这与退化方向一致。
+
+V7 的硬约束是：
+
+- 从 canonical `frankenstein_v28.pt` 开始，只训练 Ser expert 的 weight/bias；
+- 共享 trunk、base head 和其余 19 个 experts 必须逐张量 SHA-256 不变；
+- 独立 test 上所有非 Ser 概率必须与 parent **精确相等**；
+- 继续使用“所有循环起点 × 所有 decoder order，再映射回物理残基”的口径；
+- 直接重标注已审计的 31,500 条 V6 自然序列，不重新生成、不降低 `>0.6`
+  阈值、不继承 V6 的 sampling-path expert 概率；
+- 不允许正式弃权来换 PASS：17 个靶点都至少要有 1 个新颖甲基候选；
+- 只生成人工复核包，不生成尚哥 handoff；结构返回前不跑透膜性。
+
+一次运行（脚本会自动复用已经 PASS 的阶段，避免重复长跑）：
+
+```powershell
+cd E:\ProteinMPNN_work\proteinmpnn-clean-v28
+git fetch origin
+git switch fix/serine-provenance-retrain-2026
+git pull --ff-only origin fix/serine-provenance-retrain-2026
+python -m unittest discover -s tests -p "test_*.py"
+powershell -ExecutionPolicy Bypass -File .\run_serine_qc_serine_only_cyclic_v7.ps1
+```
+
+成功终端必须同时显示：
+
+```text
+V7 ALL AUTOMATED GATES PASSED; MANUAL SCIENTIFIC REVIEW IS NEXT
+Target coverage:       17/17; no formal abstention
+Shang-ge handoff:      NOT CREATED
+```
+
+人工复核文件是：
+
+```text
+paper_clean_v28_outputs/serine_qc_serine_only_cyclic_v7/
+  serine_qc_serine_only_cyclic_v7_review_bundle.zip
+```
+
+任一关失败时，脚本退出非零并保留诊断；不会生成 ZIP，也不会打印最终绿色成功。
+`-ReviewOnly` 只适用于所有 V7 产物已经 PASS 后的快速重审和重新打包。
+
+## V5/V6 历史问题与证据（保留用于复现，不再作为当前运行说明）
 
 V5 已撤回。不要发送下面任何旧文件：
 
@@ -131,7 +183,7 @@ reserve seeds 共 12,000 条，合计 13,000 条，在冻结的循环表示平�
 `all_candidates.csv`、`unique_candidates.csv`、
 `methylated_new_candidates.csv` 的 SHA-256 在前后必须完全相同，否则立即失败。
 
-## Windows 一键运行
+## Windows 一键运行（历史 V6，仅供复现，不要作为当前命令执行）
 
 必须在真正的仓库目录运行，而不是上一层 `E:\ProteinMPNN_work`：
 
@@ -167,7 +219,7 @@ powershell -ExecutionPolicy Bypass -File .\run_serine_qc_cyclic_representation_v
   -Force -TrainingBatchSize 4 -AuditBatchSize 4 -GenerationBatchSize 4
 ```
 
-## 正常完成后看什么
+## 历史 V6 正常完成后看什么
 
 终端最后应显示：
 

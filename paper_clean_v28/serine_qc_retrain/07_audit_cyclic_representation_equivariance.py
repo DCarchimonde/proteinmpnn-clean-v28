@@ -83,6 +83,20 @@ REQUIRED_EXPERT_PROTOCOL = (
     "canonical_clean_v28_all_expert_heads_corrected_labels_"
     "cyclic_representation_augmented_v6"
 )
+SERINE_ONLY_EXPERT_PROTOCOL = (
+    "canonical_clean_v28_serine_only_corrected_labels_"
+    "cyclic_representation_augmented_v7"
+)
+V6_AUDIT_PROTOCOL = "cyclic_representation_equivariance_heldout_gate_v1"
+V7_AUDIT_PROTOCOL = (
+    "cyclic_representation_equivariance_heldout_gate_v2_serine_only"
+)
+V6_AUTHORIZATION = (
+    "REPRESENTATION_ENSEMBLE_VALIDATED_FOR_ISOLATED_V6_REGENERATION"
+)
+V7_AUTHORIZATION = (
+    "SERINE_ONLY_REPAIR_VALIDATED_FOR_ISOLATED_V7_REANNOTATION"
+)
 REQUIRED_TRAINING_REPRESENTATION_POLICY = (
     "all_physical_cyclic_starts_jointly_rotate_sequence_labels_and_"
     "backbone_coordinates_with_residue_index_reset"
@@ -602,7 +616,9 @@ def audit_native_targets(
     return detail_rows, summary_rows
 
 
-def checkpoint_metadata(model_path: Path) -> Dict[str, Any]:
+def checkpoint_metadata(
+    model_path: Path, required_protocol: str = REQUIRED_EXPERT_PROTOCOL
+) -> Dict[str, Any]:
     payload = torch.load(model_path, map_location="cpu")
     metadata = (
         dict(payload.get("expert_head_qc_metadata", {}))
@@ -611,7 +627,7 @@ def checkpoint_metadata(model_path: Path) -> Dict[str, Any]:
     )
     del payload
     if not (
-        str(metadata.get("protocol", "")) == REQUIRED_EXPERT_PROTOCOL
+        str(metadata.get("protocol", "")) == required_protocol
         and int(metadata.get("minimum_order_coverage_epochs", 0)) >= 30
         and bool(metadata.get("cyclic_representation_augmentation"))
         and str(metadata.get("training_cyclic_representation_policy", ""))
@@ -622,9 +638,15 @@ def checkpoint_metadata(model_path: Path) -> Dict[str, Any]:
         == REQUIRED_DEPLOYMENT_POLICY
     ):
         raise RuntimeError(
-            "Representation audit requires a promoted V6 checkpoint trained "
-            "with all physical cyclic starts; the decoder-order-only V3 "
-            "checkpoint is not sufficient"
+            "Representation audit requires the requested promoted checkpoint "
+            "trained with all physical cyclic starts"
+        )
+    if required_protocol == SERINE_ONLY_EXPERT_PROTOCOL and not (
+        str(metadata.get("expert_scope", "")) == "serine-only"
+        and list(metadata.get("active_expert_tokens", [])) == ["S"]
+    ):
+        raise RuntimeError(
+            "V7 representation audit requires an exactly Ser-only checkpoint"
         )
     return metadata
 
@@ -667,7 +689,14 @@ def run(args: argparse.Namespace) -> None:
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    metadata = checkpoint_metadata(model_path)
+    required_protocol = str(args.required_expert_protocol)
+    if required_protocol not in {
+        REQUIRED_EXPERT_PROTOCOL,
+        SERINE_ONLY_EXPERT_PROTOCOL,
+    }:
+        raise ValueError("Unsupported expert protocol for representation audit")
+    serine_only = required_protocol == SERINE_ONLY_EXPERT_PROTOCOL
+    metadata = checkpoint_metadata(model_path, required_protocol)
     plan = read_json(plan_path)
     targets = [str(row["target_name"]).upper() for row in plan["targets"]]
     frozen = {str(value).upper() for value in plan["frozen_targets"]}
@@ -681,7 +710,7 @@ def run(args: argparse.Namespace) -> None:
         raise RuntimeError("Missing selected peptide chains: " + ", ".join(missing_chains))
 
     print(
-        f"Loading promoted cyclic-representation V6 expert checkpoint: {model_path}",
+        f"Loading promoted cyclic-representation checkpoint: {model_path}",
         flush=True,
     )
     model = load_v28_model(str(model_path), device)
@@ -709,8 +738,15 @@ def run(args: argparse.Namespace) -> None:
     serine = representation_summary["serine"]
     proline = representation_summary["proline"]
     quality_checks = {
-        "v3_checkpoint_provenance_is_pinned": (
-            metadata.get("protocol") == REQUIRED_EXPERT_PROTOCOL
+        "checkpoint_provenance_and_expert_scope_are_pinned": (
+            metadata.get("protocol") == required_protocol
+            and (
+                not serine_only
+                or (
+                    metadata.get("expert_scope") == "serine-only"
+                    and list(metadata.get("active_expert_tokens", [])) == ["S"]
+                )
+            )
         ),
         "heldout_test_record_count_is_151": len(test_records) == 151,
         "heldout_test_position_count_is_1505": len(position_rows) == 1505,
@@ -752,9 +788,9 @@ def run(args: argparse.Namespace) -> None:
     }
     quality_gate = "PASS" if all(quality_checks.values()) else "FAIL"
     authorization = (
-        "REPRESENTATION_ENSEMBLE_VALIDATED_FOR_ISOLATED_V6_REGENERATION"
+        (V7_AUTHORIZATION if serine_only else V6_AUTHORIZATION)
         if quality_gate == "PASS"
-        else "BLOCKED_DO_NOT_REGENERATE_OR_RELEASE"
+        else "BLOCKED_DO_NOT_REANNOTATE_OR_RELEASE"
     )
 
     atomic_write_csv(
@@ -775,7 +811,7 @@ def run(args: argparse.Namespace) -> None:
     report = {
         "quality_gate": quality_gate,
         "release_authorization": authorization,
-        "protocol": "cyclic_representation_equivariance_heldout_gate_v1",
+        "protocol": V7_AUDIT_PROTOCOL if serine_only else V6_AUDIT_PROTOCOL,
         "scientific_scope": (
             "Outer ensemble jointly rotates sequence and N/CA/C/O coordinates, resets "
             "linear residue indices, maps probabilities back to physical residues, and "
@@ -806,7 +842,11 @@ def run(args: argparse.Namespace) -> None:
         "annotation_context_policy": ANNOTATION_CONTEXT,
         "regenerated_targets": targets,
         "frozen_methylated_targets": sorted(frozen),
-        "structure_handoff_status": "BLOCKED_PENDING_V6_RESULT_REVIEW",
+        "structure_handoff_status": (
+            "BLOCKED_PENDING_V7_RESULT_REVIEW"
+            if serine_only
+            else "BLOCKED_PENDING_V6_RESULT_REVIEW"
+        ),
     }
     atomic_write_json(out_dir / "cyclic_representation_audit.json", report)
 
@@ -831,6 +871,11 @@ def run(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", default=str(DEFAULT_MODEL))
+    parser.add_argument(
+        "--required-expert-protocol",
+        default=REQUIRED_EXPERT_PROTOCOL,
+        choices=(REQUIRED_EXPERT_PROTOCOL, SERINE_ONLY_EXPERT_PROTOCOL),
+    )
     parser.add_argument("--test-jsonl", default=str(DEFAULT_TEST))
     parser.add_argument("--native-jsonl", default=str(DEFAULT_NATIVE))
     parser.add_argument("--best-csv", default=str(DEFAULT_BEST))

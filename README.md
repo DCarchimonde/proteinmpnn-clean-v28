@@ -20,28 +20,21 @@ paper_clean_v28_outputs/generated_fasta_clean_auto_single/all_designs.csv
 paper_clean_v28_outputs/af3_manifest.csv
 ```
 
-## 当前恢复流程：Ser 来源质控、循环起点不变性、结构先行（V6）
+## 当前恢复流程：Ser 来源质控、循环起点不变性、结构先行（V7）
 
-若从未生成 V6，首次完整运行才使用：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\run_serine_qc_cyclic_representation_v6.ps1 -Force
-```
-
-若 V6 模型、19,500 条初始生成或后续补采样已经存在，**不要再用 `-Force`**。
-使用下面命令保留已有结果；达到累计补采样上限仍为零产出的靶点会登记为明确的
-模型弃权，而不会继续盲抽或降低阈值：
+当前只运行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\run_serine_qc_cyclic_representation_v6.ps1 -ResumeQuota
+powershell -ExecutionPolicy Bypass -File .\run_serine_qc_serine_only_cyclic_v7.ps1
 ```
 
-V5 已撤回：3AV9 的旧结构通过行没有甲基 token，且 V5 的甲基候选全部集中
-在数组第 7 位。V6 从 canonical V28 重新训练完整 20-expert 模块；训练和部署
-都联合轮换环肽序列、标签、N/CA/C/O 坐标及 residue index，并把概率映射回
-物理残基。旧 7 条不再冻结，全部 17 个靶点重新生成。独立 test、生成与三遍
-审计通过后仍只产出人工复核包，不自动创建尚哥 handoff；结构返回前也禁止
-透膜步骤。完整证据、门槛和输出说明见：
+V6 把只涉及 Ser 的来源标签修复错误地扩大到全部 20 个 experts，导致 3ZGC
+等非 Ser 预测退化。V7 从 canonical V28 只重训 Ser expert，并以逐张量 hash 和
+非 Ser held-out 概率零差异证明其余模型未被改动。它保留、hash 固定并直接
+重标注现有 31,500 条 V6 自然序列，不重采样、不降阈值，也不接受 3ZGC 弃权
+来换 PASS。只有 17/17 均有新颖候选且独立三审通过才打人工复核 ZIP；不会创建
+尚哥 handoff，结构返回前也禁止透膜步骤。V5/V6 脚本只保留用于历史复现。
+完整证据、门槛和输出说明见：
 
 ```text
 paper_clean_v28/serine_qc_retrain/README.md

@@ -152,8 +152,28 @@ Clean-repository ignore rules.
 Evidence for the Ser correction, the withdrawn non-methylated 3AV9 row, the
 fixed tensor-position-7 root cause, V6 quality gates, and exact commands.
 
+### `run_serine_qc_serine_only_cyclic_v7.ps1`
+Current Windows launcher. It retrains only the Ser expert from the canonical
+checkpoint, verifies bitwise preservation of every other tensor and exact
+preservation of non-Ser held-out probabilities, then reannotates the hash-pinned
+31,500-row V6 natural-sequence pool without resampling. It requires candidate
+coverage for all 17 targets, does not permit formal abstention, runs an
+independent three-pass audit (including 3AV physical-position alignment), and
+creates only a manual-review ZIP.
+
+### `paper_clean_v28/serine_qc_retrain/10_reannotate_v6_pool_serine_only_v7.py`
+Scores each unique target/natural sequence once with the Ser-only V7 cyclic
+representation ensemble, propagates one canonical annotation payload to repeats,
+recomputes novelty, and preserves all base-model sampling statistics.
+
+### `paper_clean_v28/serine_qc_retrain/11_triple_audit_serine_only_v7.py`
+Independently reconstructs strict-threshold annotations, aggregation, position
+and decoder-step distributions, novelty, and 17/17 coverage. It treats nearest
+held-out backbone similarity as a diagnostic rather than methylation truth; the
+actual returned structures remain subject to both frozen RMSD gates.
+
 ### `run_serine_qc_cyclic_representation_v6.ps1`
-Current Windows launcher. It retrains all 20 expert heads with every equivalent
+Historical V6 launcher; do not use for the current repair. It retrains all 20 expert heads with every equivalent
 cyclic sequence/coordinate start, runs the held-out test gate, regenerates all
 17 targets, and performs the independent three-pass result audit. It stops at a
 manual-review bundle and never creates a structure handoff. The older V5
