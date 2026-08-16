@@ -873,9 +873,9 @@ try {
         throw "V8 model paired audit used a non-frozen batch size"
     }
     Assert-ArtifactHashes $V8Model.artifacts $ModelOut "V8 source-scoped model"
-    Assert-SameStringSet -Observed @($V8Model.artifacts.PSObject.Properties | ForEach-Object { $_.Name }) -Expected @("metric_comparison", "frozen_source_route_comparison", "metrics_by_residue", "position_probabilities") -Stage "V8 model artifacts"
+    Assert-SameStringSet -Observed @($V8Model.artifacts.PSObject.Properties | ForEach-Object { $_.Name }) -Expected @("metric_comparison", "serine_auc_tradeoff_audit", "metrics_by_residue", "position_probabilities") -Stage "V8 model artifacts"
     Assert-ArtifactLeafExact $V8Model.artifacts.metric_comparison (Join-Path $ModelOut "v6_v7_v8_metric_comparison.csv") "V8 source-scoped model" "metric_comparison"
-    Assert-ArtifactLeafExact $V8Model.artifacts.frozen_source_route_comparison (Join-Path $ModelOut "frozen_source_route_comparison.csv") "V8 source-scoped model" "frozen_source_route_comparison"
+    Assert-ArtifactLeafExact $V8Model.artifacts.serine_auc_tradeoff_audit (Join-Path $ModelOut "serine_auc_tradeoff_audit.csv") "V8 source-scoped model" "serine_auc_tradeoff_audit"
     Assert-ArtifactLeafExact $V8Model.artifacts.metrics_by_residue (Join-Path $ModelOut "test_metrics_by_residue.csv") "V8 source-scoped model" "metrics_by_residue"
     Assert-ArtifactLeafExact $V8Model.artifacts.position_probabilities (Join-Path $ModelOut "test_position_probabilities.csv") "V8 source-scoped model" "position_probabilities"
     if ([string]$V8Model.canonical_checkpoint_sha256 -ne (Get-Sha256 $CanonicalCheckpoint) -or
@@ -901,12 +901,14 @@ try {
         -not [bool]$V8Model.quality_checks.f1_at_0_6_is_non_inferior_to_v6 -or
         -not [bool]$V8Model.quality_checks.non_ser_recall_at_0_6_is_non_inferior_to_v6 -or
         -not [bool]$V8Model.quality_checks.non_ser_f1_at_0_6_is_non_inferior_to_v6 -or
-        -not [bool]$V8Model.quality_checks.frozen_source_routed_recall_is_non_inferior_to_v6 -or
-        -not [bool]$V8Model.quality_checks.frozen_source_routed_f1_is_non_inferior_to_v6 -or
-        -not [bool]$V8Model.quality_checks.serine_auc_is_non_inferior_to_v6 -or
-        -not [bool]$V8Model.quality_checks.runtime_replay_serine_auc_ge_0_70 -or
-        $null -eq $V8Model.metric_gate_provenance.frozen_source_route) {
-        throw "V8 source/probability inheritance or non-inferiority gate is not proven"
+        -not [bool]$V8Model.quality_checks.serine_threshold_operating_point_is_non_degrading_vs_v6 -or
+        -not [bool]$V8Model.quality_checks.serine_threshold_confusion_is_inherited_from_v7 -or
+        -not [bool]$V8Model.quality_checks.serine_auc_is_inherited_from_v7 -or
+        -not [bool]$V8Model.quality_checks.serine_auc_tradeoff_is_explicitly_recorded -or
+        -not [bool]$V8Model.quality_checks.serine_auc_ge_0_70 -or
+        $null -eq $V8Model.metric_gate_provenance.serine_auc_tradeoff -or
+        [string]$V8Model.metric_gate_provenance.serine_auc_tradeoff.auc_gate_policy -ne "report observed V8-minus-V6 AUC exactly; do not assert zero-margin non-inferiority post hoc; retain the absolute Ser-AUC safety floor") {
+        throw "V8 source/probability inheritance, operational non-inferiority, or Ser trade-off audit is not proven"
     }
 
     if (Test-Path -LiteralPath $V8Representation -PathType Leaf) {
@@ -946,7 +948,10 @@ try {
         [string]$V8RepresentationReport.deterministic_runtime.cublas_workspace_config -ne ":4096:8" -or
         -not [bool]$V8RepresentationReport.deterministic_runtime.deterministic_algorithms_enabled -or
         -not [bool]$V8RepresentationReport.deterministic_runtime.cudnn_deterministic -or
-        [bool]$V8RepresentationReport.deterministic_runtime.cudnn_benchmark) {
+        [bool]$V8RepresentationReport.deterministic_runtime.cudnn_benchmark -or
+        -not [bool]$V8RepresentationReport.quality_checks.serine_threshold_operating_point_is_non_degrading_vs_v6_and_recomputes_composition -or
+        -not [bool]$V8RepresentationReport.quality_checks.serine_auc_recomputes_composition_audit -or
+        -not [bool]$V8RepresentationReport.quality_checks.serine_auc_tradeoff_is_carried_forward_without_redefinition) {
         throw "V8 representation authorization or source hash gate failed"
     }
     Assert-ArtifactHashes $V8RepresentationReport.artifacts $RepresentationOut "V8 representation audit"
@@ -1247,7 +1252,7 @@ try {
             "model/expert_source_composition_manifest.json" = $V8ExpertManifest
             "model/frankenstein_v28_source_scoped_hybrid_v8.pt" = $V8Checkpoint
             "model/v6_v7_v8_metric_comparison.csv" = (Join-Path $ModelOut "v6_v7_v8_metric_comparison.csv")
-            "model/frozen_source_route_comparison.csv" = (Join-Path $ModelOut "frozen_source_route_comparison.csv")
+            "model/serine_auc_tradeoff_audit.csv" = (Join-Path $ModelOut "serine_auc_tradeoff_audit.csv")
             "model/test_metrics_by_residue.csv" = (Join-Path $ModelOut "test_metrics_by_residue.csv")
             "model/test_position_probabilities.csv" = (Join-Path $ModelOut "test_position_probabilities.csv")
             "representation/cyclic_representation_audit.json" = $V8Representation

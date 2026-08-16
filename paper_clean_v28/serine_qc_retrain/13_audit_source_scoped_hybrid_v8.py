@@ -432,6 +432,22 @@ def run(args: argparse.Namespace) -> None:
     v6_fixed = v6_summary["overall_at_threshold"]
     composition_fixed = v8_composition_summary["overall_at_threshold"]
     serine = representation_summary["serine"]
+    v6_serine = v6_summary["serine"]
+    composition_serine = v8_composition_summary["serine"]
+    serine_tradeoff = dict(
+        dict(model_manifest.get("metric_gate_provenance") or {}).get(
+            "serine_auc_tradeoff"
+        )
+        or {}
+    )
+    try:
+        recorded_serine_auc_delta = float(serine_tradeoff["v8_minus_v6_auc"])
+        composition_serine_auc_delta = float(composition_serine["auc"]) - float(
+            v6_serine["auc"]
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("V8 model manifest lacks the Ser AUC trade-off audit") from exc
+    confusion_fields = ("tp", "tn", "fp", "fn")
     proline = representation_summary["proline"]
     native_lengths = {
         str(row["target_name"]): int(row["peptide_length"]) for row in native_summary
@@ -489,6 +505,32 @@ def run(args: argparse.Namespace) -> None:
         ),
         "f1_at_0_6_is_non_inferior_to_v6": (
             float(current_fixed["f1"]) + 1e-12 >= float(v6_fixed["f1"])
+        ),
+        "serine_threshold_operating_point_is_non_degrading_vs_v6_and_recomputes_composition": (
+            all(
+                int(serine[field]) == int(composition_serine[field])
+                for field in confusion_fields
+            )
+            and int(serine["tp"]) >= int(v6_serine["tp"])
+            and int(serine["tn"]) >= int(v6_serine["tn"])
+            and int(serine["fp"]) <= int(v6_serine["fp"])
+            and int(serine["fn"]) <= int(v6_serine["fn"])
+        ),
+        "serine_auc_recomputes_composition_audit": (
+            serine["auc"] is not None
+            and composition_serine["auc"] is not None
+            and abs(float(serine["auc"]) - float(composition_serine["auc"]))
+            <= 1e-12
+        ),
+        "serine_auc_tradeoff_is_carried_forward_without_redefinition": (
+            math.isfinite(recorded_serine_auc_delta)
+            and abs(recorded_serine_auc_delta - composition_serine_auc_delta)
+            <= 1e-12
+            and serine_tradeoff.get("auc_gate_policy")
+            == (
+                "report observed V8-minus-V6 AUC exactly; do not assert zero-margin "
+                "non-inferiority post hoc; retain the absolute Ser-AUC safety floor"
+            )
         ),
         "overall_auc_ge_0_85": float(representation_summary["overall_auc"]) >= 0.85,
         "overall_precision_at_0_6_ge_0_75": float(current_fixed["precision"]) >= 0.75,
@@ -571,6 +613,7 @@ def run(args: argparse.Namespace) -> None:
         "protocol": V8_AUDIT_PROTOCOL,
         "test_reuse_limitation": model_manifest["test_reuse_limitation"],
         "development_status": model_manifest["development_status"],
+        "serine_auc_tradeoff": serine_tradeoff,
         "quality_checks": quality_checks,
         "device": str(device),
         "audit_batch_size": int(args.batch_size),

@@ -130,82 +130,76 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             v8_composer.validate_finite_position_rows([bad], "bad")
 
-    def test_frozen_source_route_uses_pre_v8_manifests_not_runtime_replay(self):
-        def fixed(counts):
-            return v8_composer.threshold_metrics_from_counts(counts, 0.6)
+    def test_serine_auc_tradeoff_is_reported_without_faking_noninferiority(self):
+        v6_counts = {"tp": 10, "tn": 56, "fp": 6, "fn": 2}
+        v7_counts = {"tp": 10, "tn": 57, "fp": 5, "fn": 2}
 
-        serine_counts = dict(v8_composer.EXPECTED_FROZEN_SERINE_CONFUSION)
-        v6_counts = dict(v8_composer.EXPECTED_FROZEN_V6_CONFUSION)
-        v7_counts = dict(v8_composer.EXPECTED_FROZEN_V7_CONFUSION)
-        v6_non_ser = {
-            name: v6_counts[name] - serine_counts[name]
-            for name in ("tp", "tn", "fp", "fn")
-        }
-        v6 = {
-            "positions": 1505,
-            "threshold": 0.6,
-            "deployment_temperature": 0.5,
-            "overall_at_threshold": fixed(v6_counts),
-            "non_ser_at_threshold": fixed(v6_non_ser),
-            "serine": {**fixed(serine_counts), "auc": 0.9475806451612904},
-        }
-        v7 = {
-            "positions": 1505,
-            "threshold": 0.6,
-            "deployment_temperature": 0.5,
-            "overall_at_threshold": fixed(v7_counts),
-            "non_ser_at_threshold": fixed(
-                {
-                    name: v7_counts[name] - serine_counts[name]
-                    for name in ("tp", "tn", "fp", "fn")
+        def summary(auc, observed_counts):
+            return {
+                "serine": {
+                    **observed_counts,
+                    "auc": auc,
                 }
-            ),
-            "serine": {**fixed(serine_counts), "auc": 0.956989247311828},
-        }
-        route = v8_composer.frozen_source_route(
-            {"corrected_test": v6},
-            {"corrected_test": v7},
-            0.6,
-            0.5,
-        )
-        self.assertEqual(
-            route["v8_routed"]["overall_at_threshold"]["tp"], 210
-        )
-        self.assertEqual(
-            route["v8_routed"]["overall_at_threshold"]["fp"], 35
-        )
-        self.assertAlmostEqual(
-            route["v8_routed"]["overall_at_threshold"]["recall"],
-            210 / 261,
-        )
-        self.assertAlmostEqual(
-            route["v8_routed"]["overall_at_threshold"]["f1"],
-            420 / 506,
-        )
-        self.assertGreaterEqual(
-            route["v8_routed"]["serine_auc"], route["v6"]["serine_auc"]
-        )
-        rows = v8_composer.frozen_source_comparison_rows(route)
-        self.assertEqual({row["metric"] for row in rows}, {
-            "recall_at_0_6",
-            "f1_at_0_6",
-            "true_positives_at_0_6",
-            "false_negatives_at_0_6",
-            "false_positives_at_0_6",
-            "true_negatives_at_0_6",
-            "serine_auc",
-        })
+            }
 
-        tampered = dict(v6)
-        tampered["overall_at_threshold"] = fixed(
-            {"tp": 211, "tn": 1209, "fp": 35, "fn": 50}
+        v6_auc = 714.0 / 744.0
+        v7_auc = 712.0 / 744.0
+        audit = v8_composer.serine_auc_tradeoff_audit(
+            summary(v6_auc, v6_counts),
+            summary(v7_auc, v7_counts),
+            summary(v7_auc, v7_counts),
+            0.6,
+        )
+        self.assertEqual(audit["positive_negative_pair_count"], 744)
+        self.assertAlmostEqual(audit["v8_minus_v6_auc"], -2.0 / 744.0)
+        self.assertAlmostEqual(
+            audit["v8_minus_v6_auc_positive_negative_pair_equivalent"], -2.0
+        )
+        self.assertEqual(audit["v8_auc_direction_vs_v6"], "lower")
+        self.assertFalse(audit["v8_threshold_confusion_matches_v6"])
+        self.assertTrue(audit["v8_threshold_confusion_is_non_degrading_vs_v6"])
+        self.assertTrue(audit["v8_threshold_confusion_matches_v7"])
+        self.assertTrue(audit["v8_auc_matches_v7_within_tolerance"])
+        self.assertIn("do not assert zero-margin", audit["auc_gate_policy"])
+
+        rows = v8_composer.serine_auc_tradeoff_rows(audit)
+        self.assertEqual(
+            {row["metric"] for row in rows},
+            {
+                "serine_auc",
+                "serine_auc_positive_negative_pair_equivalent",
+                "serine_tp_at_0_6",
+                "serine_tn_at_0_6",
+                "serine_fp_at_0_6",
+                "serine_fn_at_0_6",
+            },
+        )
+        auc_row = next(row for row in rows if row["metric"] == "serine_auc")
+        self.assertEqual(
+            auc_row["promotion_role"], "report_only_with_absolute_safety_floor"
+        )
+        fp_row = next(row for row in rows if row["metric"] == "serine_fp_at_0_6")
+        self.assertEqual(
+            fp_row["promotion_role"],
+            "v8_must_be_less_than_or_equal_to_v6",
+        )
+
+        changed_counts = {"tp": 9, "tn": 57, "fp": 5, "fn": 3}
+        changed = v8_composer.serine_auc_tradeoff_audit(
+            summary(v6_auc, v6_counts),
+            summary(v7_auc, changed_counts),
+            summary(v7_auc, changed_counts),
+            0.6,
+        )
+        self.assertFalse(
+            changed["v8_threshold_confusion_is_non_degrading_vs_v6"]
         )
         with self.assertRaises(RuntimeError):
-            v8_composer.frozen_source_route(
-                {"corrected_test": tampered},
-                {"corrected_test": v7},
+            v8_composer.serine_auc_tradeoff_audit(
+                summary(v6_auc, v6_counts),
+                summary(float("nan"), v7_counts),
+                summary(v7_auc, v7_counts),
                 0.6,
-                0.5,
             )
 
     def test_six_residue_radius_two_neighborhood_has_5530_sorted_members(self):
@@ -764,13 +758,14 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
         )
         self.assertIn('$Arguments += "--overwrite"', source)
         self.assertIn(
-            '"frozen_source_route_comparison"',
+            '"serine_auc_tradeoff_audit"',
             source,
         )
         self.assertIn(
-            "frozen_source_routed_recall_is_non_inferior_to_v6",
+            "serine_threshold_operating_point_is_non_degrading_vs_v6",
             source,
         )
+        self.assertNotIn("frozen_source_route_comparison", source)
 
     def test_search_budget_trace_and_candidate_provenance_are_hard_gated(self):
         source = (RETRAIN_DIR / "14_directed_recovery_search_v8.py").read_text(

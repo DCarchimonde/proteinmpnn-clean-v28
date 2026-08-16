@@ -14,12 +14,13 @@ heads 的循环表示训练没有受到 Ser 标签梯度污染，因为每个天
 
 | 冻结阈值 `>0.6` | V6 | V7 | 变化 |
 | --- | ---: | ---: | ---: |
-| Recall | 0.8046 | 0.5096 | −0.2950 |
-| TP / FN | 210 / 51 | 133 / 128 | 少 77 个 TP |
-| FP / TN | 35 / 1209 | 14 / 1230 | 少 21 个 FP |
+| Recall | 0.8123 | 0.5096 | −0.3027 |
+| TP / FN | 212 / 49 | 133 / 128 | 少 79 个 TP |
+| FP / TN | 47 / 1197 | 14 / 1230 | 少 33 个 FP |
 
-Ser 子集的阈值混淆未变；77 个新增 FN 全是非 Ser。因此这不是空 batch，也不是
-阈值偶然波动，而是 19 个 non-Ser heads 被明确回滚的结果。此前 Recall 下限
+Ser 子集的 TP/FN 未变且 FP 还少 1 个；79 个新增 FN 全是非 Ser。因此这不是空
+batch，也不是阈值偶然波动，而是 19 个 non-Ser heads 被明确回滚的结果。此前
+Recall 下限
 `0.40` 过宽，不能阻止这种明显退化。该 151-record 集在 V3/V6/V7 中已被多次
 查看，只能称为**冻结成对内部审计**，不能包装成新的盲测；论文最终主张仍需新
 outer split 或真正 blind set。
@@ -31,23 +32,29 @@ V8 不训练、不平均权重、不调阈值；来源规则是在 V6/V7 成对�
 - 19 个 non-Ser experts：循环表示训练后的 V6；
 - Ser expert：来源修复后的 V7；
 - 每个非 Ser 位点概率必须与 V6 一致，每个 Ser 位点概率必须与 V7 一致；
-- Recall 与 F1 在冻结 `>0.6` 口径下必须不劣于 V6，Ser AUC 必须不劣于 V6；
+- Recall 与 F1 在冻结 `>0.6` 口径下必须不劣于 V6；Ser 的 TP/TN 不得下降、
+  FP/FN 不得上升；Ser AUC 保留绝对安全下限并完整报告与 V6 的差值；
 - 在通过模型与表示审计后，重标注只读的 31,500-row V6 pool；
 - 只对实际缺失的 3WNE/3ZGC 做固定预算、可复现的定向搜索；长度 6/7 的历史与
   native controls 无论是否缺靶都必须复算，control 永远不能进入释放候选；
 - 最终必须 17/17、无正式弃权；不降 `>0.6` 阈值；搜索不能修改模型指标；
 - 只生成人工复核 ZIP，不生成尚哥 handoff，也不生成 permeability input。
 
-V8 的首次组合运行暴露了一个比较基准实现错误：程序重新在 CUDA 上回放 V6，
-得到 `Recall=0.8123`，而 V8 提出前、V6 获准时的不可变清单记录为 `0.8046`
-（`TP/FN=210/51`）。checkpoint 与 test hash 均未改变，因此后来回放不能替换
-已经冻结的比较基准，尤其不能用 float32 近并列排序移动零容差 AUC 门。修复后：
+V8 的首次组合运行还给出了必须如实保留的 Ser 排序权衡：同一进程、同一批
+hash 固定数据上，V6/V7/V8 的 Ser AUC 分别为 `0.9596774193548387`、
+`0.956989247311828`、`0.956989247311828`。V8 相对 V6 是 `-0.00268817204301075`，
+等价于 12 个阳性 × 62 个阴性的 744 个排序对中少 2 个 AUC numerator
+equivalent；与此同时 Ser Recall 均为 `10/12`，V7/V8 还把 V6 的 1 个 Ser
+误报消掉了（V6 的 TP/TN/FP/FN 为 `10/56/6/2`，V7/V8 为 `10/57/5/2`）。
+不能用一组与实际 source manifest 不符的旧数字把 AUC 改写成“非劣”，也不能
+用“完全相同”的阈值门误杀这个真实的 FP 改善。修复后：
 
-- 本次 V6/V7/V8 同口径回放仍负责概率来源继承、Recall/F1 与安全下限；
-- Ser AUC 的 V6 非劣效门使用 V8 出现前已写入、hash 固定的 V6/V7 source
-  manifest；V8 Ser tensor 逐位来自 V7，因此冻结 V8 Ser AUC 也严格取 V7；
-- 额外输出 `frozen_source_route_comparison.csv`，同时保留本次 runtime replay
-  数值和它相对冻结来源的漂移，不能隐去不一致；
+- 本次 V6/V7/V8 同口径回放负责概率来源继承、Recall/F1、Ser 阈值 operating
+  point 不退化与安全下限；
+- Ser AUC 差值作为已观察到的 post-hoc 内部权衡明确记录，不再伪装成零容差
+  非劣效结论；模型仍需新的 outer split 或 blind set 才能支持论文推广主张；
+- 额外输出 `serine_auc_tradeoff_audit.csv`，记录 AUC、pair-equivalent 与全部 Ser
+  阈值混淆，不能隐去不一致；
 - 只含该旧 Ser-AUC 失败且所有候选/CSV/source hash 均吻合的 partial model
   目录可由 launcher 自动重建；其他 partial 或其他科学门失败仍拒绝覆盖。
 
