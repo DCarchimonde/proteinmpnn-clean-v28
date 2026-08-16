@@ -1,12 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Reannotate the preserved V6 natural-sequence pool with the Ser-only V7 model.
+"""Reannotate the preserved V6 natural-sequence pool with an audited expert model.
 
 V6 changed all twenty expert heads even though the provenance repair changed
 only Ser labels.  This recovery does not sample another base sequence.  It
 hash-pins and retains all 31,500 receptor-conditioned V6 natural sequences and
 their base-model path statistics, then scores each unique target/natural pair
-once with the V7 cyclic-representation ensemble in the peptide-only context.
+once with the supplied cyclic-representation ensemble in the peptide-only context.
+Defaults reproduce the original Ser-only V7 stage; explicit protocol/scope
+arguments authorize the source-scoped V8 reuse without duplicating scoring code.
 
 Formal target abstention is deliberately not supported.  The quality gate
 requires at least one strict-threshold, novelty-filtered methylated candidate
@@ -21,6 +23,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import platform
 import shutil
@@ -30,8 +33,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, MutableMapping, Sequence, Tuple
 
 
+CUBLAS_WORKSPACE_CONFIG = ":4096:8"
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = CUBLAS_WORKSPACE_CONFIG
+
+
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[2]
+COMMON_PATH = REPO_ROOT / "paper_clean_v28" / "clean_v28_common.py"
+MODEL_UTILS_PATH = REPO_ROOT / "model_utils.py"
+NMETHYL_CONFIG_PATH = REPO_ROOT / "nmethyl" / "utils" / "nmethyl_config.py"
 GENERATOR_PATH = (
     REPO_ROOT / "paper_clean_v28" / "rerun_t05" / "01_generate_t05_multiseed.py"
 )
@@ -79,6 +89,7 @@ ANNOTATION_CONTEXT = "peptide_chain_only_no_visible_receptor_chains"
 SAMPLING_CONTEXT = "native_complex_longest_receptor_visible"
 EXPECTED_SOURCE_RAW_ROWS = 31_500
 EXPECTED_SOURCE_TARGETS = 17
+EXPECTED_HISTORICAL_ROWS = 4_115
 EXPECTED_SOURCE_ALL_SHA256 = (
     "1ab4791c09a1b2428b1a84894d13bb8c4049ba580df05bebd93c263a2e4e634c"
 )
@@ -104,6 +115,18 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def paths_overlap(left: Path, right: Path) -> bool:
+    """Return whether either resolved path is equal to or contains the other."""
+
+    left_resolved = left.resolve()
+    right_resolved = right.resolve()
+    return (
+        left_resolved == right_resolved
+        or left_resolved in right_resolved.parents
+        or right_resolved in left_resolved.parents
+    )
 
 
 def read_json(path: Path) -> Dict[str, Any]:
@@ -181,7 +204,44 @@ def annotation_payload(
             representation_span,
         )
     ):
-        raise RuntimeError("V7 annotation vector length mismatch")
+        raise RuntimeError("Cyclic reannotation vector length mismatch")
+    if not all(
+        math.isfinite(value)
+        for values in (
+            probability,
+            order_std,
+            representation_std,
+            representation_min,
+            representation_max,
+            representation_span,
+        )
+        for value in values
+    ):
+        raise RuntimeError("Cyclic reannotation contains a non-finite value")
+    if any(
+        value < 0.0 or value > 1.0
+        for values in (probability, representation_min, representation_max)
+        for value in values
+    ):
+        raise RuntimeError("Cyclic reannotation probability is outside [0, 1]")
+    if any(
+        value < 0.0
+        for values in (order_std, representation_std, representation_span)
+        for value in values
+    ):
+        raise RuntimeError("Cyclic reannotation dispersion is negative")
+    if any(
+        minimum > mean + 1e-7
+        or mean > maximum + 1e-7
+        or abs((maximum - minimum) - span) > 2e-6
+        for mean, minimum, maximum, span in zip(
+            probability,
+            representation_min,
+            representation_max,
+            representation_span,
+        )
+    ):
+        raise RuntimeError("Cyclic reannotation min/mean/max/span is inconsistent")
 
     output_tokens: List[str] = []
     for token, value in zip(natural_sequence, probability):
@@ -321,6 +381,7 @@ def score_unique_sequences(
     batch_size: int,
     torch_module: Any,
     common: Mapping[str, Any],
+    run_label: str = "SERINE-ONLY V7",
 ) -> Dict[Tuple[str, str], Dict[str, Any]]:
     by_target: MutableMapping[str, set[str]] = defaultdict(set)
     for row in rows:
@@ -380,7 +441,7 @@ def score_unique_sequences(
                     common["NAT_TO_METHYL_ABS"],
                 )
         print(
-            f"[{target}] V7 annotations: {len(sequences)} unique natural sequences",
+            f"[{target}] {run_label} annotations: {len(sequences)} unique natural sequences",
             flush=True,
         )
     return result
@@ -391,7 +452,10 @@ def run(args: argparse.Namespace) -> None:
         import numpy as np
         import torch
     except ImportError as exc:
-        raise RuntimeError("V7 reannotation requires numpy and torch") from exc
+        raise RuntimeError(f"{args.run_label} reannotation requires numpy and torch") from exc
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     generator = load_generator_module()
     if str(REPO_ROOT) not in sys.path:
@@ -414,6 +478,27 @@ def run(args: argparse.Namespace) -> None:
     native_path = Path(args.native_jsonl).resolve()
     old_path = Path(args.old_designs_csv).resolve()
     prior_path = Path(args.prior_designs_csv).resolve()
+    immutable_inputs = (
+        plan_path,
+        model_path,
+        expert_manifest_path,
+        representation_audit_path,
+        source_run,
+        native_path,
+        old_path,
+        prior_path,
+        SCRIPT_PATH,
+        GENERATOR_PATH,
+        COMMON_PATH,
+        MODEL_UTILS_PATH,
+        NMETHYL_CONFIG_PATH,
+    )
+    overlapping = [path for path in immutable_inputs if paths_overlap(out_dir, path)]
+    if overlapping:
+        raise ValueError(
+            "Reannotation output overlaps an immutable input: "
+            + ", ".join(str(path) for path in overlapping)
+        )
     source_paths = {
         "all": source_run / "all_candidates.csv",
         "manifest": source_run / "generation_manifest.json",
@@ -427,6 +512,10 @@ def run(args: argparse.Namespace) -> None:
         native_path,
         old_path,
         prior_path,
+        GENERATOR_PATH,
+        COMMON_PATH,
+        MODEL_UTILS_PATH,
+        NMETHYL_CONFIG_PATH,
         *source_paths.values(),
     ):
         if not required.is_file():
@@ -434,7 +523,9 @@ def run(args: argparse.Namespace) -> None:
 
     if out_dir.exists() and any(out_dir.iterdir()):
         if not args.overwrite:
-            raise FileExistsError(f"V7 generation output already exists: {out_dir}")
+            raise FileExistsError(
+                f"{args.run_label} generation output already exists: {out_dir}"
+            )
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -470,24 +561,31 @@ def run(args: argparse.Namespace) -> None:
     expert_manifest = read_json(expert_manifest_path)
     representation_audit = read_json(representation_audit_path)
     checkpoint_sha256 = sha256_file(model_path)
+    expected_active_tokens = json.loads(str(args.expected_active_expert_tokens_json))
+    if not isinstance(expected_active_tokens, list) or not all(
+        isinstance(value, str) for value in expected_active_tokens
+    ):
+        raise ValueError("--expected-active-expert-tokens-json must be a JSON list")
     if not (
         expert_manifest.get("quality_gate") == "PASS"
-        and expert_manifest.get("protocol") == V7_EXPERT_PROTOCOL
-        and expert_manifest.get("expert_scope") == "serine-only"
-        and expert_manifest.get("active_expert_tokens") == ["S"]
+        and expert_manifest.get("protocol") == args.expected_expert_protocol
+        and expert_manifest.get("expert_scope") == args.expected_expert_scope
+        and expert_manifest.get("active_expert_tokens") == expected_active_tokens
         and expert_manifest.get("checkpoint_artifact_sha256") == checkpoint_sha256
     ):
-        raise RuntimeError("V7 model manifest is absent, failed, or not exactly Ser-only")
+        raise RuntimeError(
+            "Expert model manifest is absent, failed, stale, or wrong-scope"
+        )
     if not (
         representation_audit.get("quality_gate") == "PASS"
         and representation_audit.get("protocol")
-        == V7_REPRESENTATION_AUDIT_PROTOCOL
+        == args.expected_representation_protocol
         and representation_audit.get("release_authorization")
-        == V7_REPRESENTATION_AUTHORIZATION
+        == args.expected_representation_authorization
         and representation_audit.get("model_sha256") == checkpoint_sha256
         and representation_audit.get("plan_sha256") == sha256_file(plan_path)
     ):
-        raise RuntimeError("V7 cyclic-representation audit is absent, failed, or stale")
+        raise RuntimeError("Cyclic-representation audit is absent, failed, or stale")
 
     if args.device == "cuda":
         if not torch.cuda.is_available():
@@ -508,18 +606,33 @@ def run(args: argparse.Namespace) -> None:
     torch.manual_seed(0)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(0)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
     native_rows = generator.read_jsonl(native_path)
-    native_index = {
-        generator.record_name(row, index): row for index, row in enumerate(native_rows)
+    native_names = [
+        str(
+            row.get("name")
+            or row.get("pdb")
+            or row.get("pdb_id")
+            or row.get("id")
+            or ""
+        ).upper()
+        for row in native_rows
+    ]
+    expected_native_names = {
+        str(value).upper() for value in validated["target_names"]
     }
-    missing_targets = sorted(set(validated["target_names"]) - set(native_index))
-    if missing_targets:
-        raise RuntimeError("Targets missing from native JSONL: " + ", ".join(missing_targets))
+    if (
+        len(native_rows) != EXPECTED_SOURCE_TARGETS
+        or any(not name for name in native_names)
+        or len(set(native_names)) != len(native_names)
+        or set(native_names) != expected_native_names
+    ):
+        raise RuntimeError(
+            "Native JSONL must contain exactly one named record for each planned target"
+        )
+    native_index = dict(zip(native_names, native_rows))
 
-    print(f"Loading promoted Ser-only V7 checkpoint: {model_path}", flush=True)
+    print(f"Loading promoted {args.run_label} checkpoint: {model_path}", flush=True)
     model = load_v28_model(str(model_path), device)
     model.eval()
     common = {
@@ -542,6 +655,7 @@ def run(args: argparse.Namespace) -> None:
         int(args.batch_size),
         torch,
         common,
+        args.run_label,
     )
 
     raw_rows: List[Dict[str, Any]] = []
@@ -557,11 +671,27 @@ def run(args: argparse.Namespace) -> None:
             source.get("sampling_path_methyl_probabilities", "")
         )
         row.update(annotation_by_key[(target, natural)])
-        row["v7_reannotation_source"] = "PRESERVED_V6_NATURAL_SEQUENCE"
+        row[f"{args.summary_score_label}_reannotation_source"] = (
+            "PRESERVED_V6_NATURAL_SEQUENCE"
+        )
         row["length_match"] = int(len(natural) == int(row["native_length"]))
         row["valid_token_gate"] = 1
         raw_rows.append(row)
 
+    old_rows = generator.read_csv(old_path)
+    old_targets = {
+        str(row.get("target_name", "")).strip().upper() for row in old_rows
+    }
+    if (
+        len(old_rows) != EXPECTED_HISTORICAL_ROWS
+        or old_targets != {str(value).upper() for value in validated["target_names"]}
+        or any(
+            not str(row.get("target_name", "")).strip()
+            or not str(row.get("design_seq", "")).strip()
+            for row in old_rows
+        )
+    ):
+        raise RuntimeError("Historical 4,115-row design exclusion set changed")
     old_exact, old_natural = generator.old_design_keys(old_path)
     prior_rows, prior_exact, prior_natural = generator.validate_prior_handoff(prior_path)
     unique_rows = generator.aggregate_unique_candidates(
@@ -626,11 +756,11 @@ def run(args: argparse.Namespace) -> None:
                     for row in target_unique
                 ),
                 "novel_methylated_candidates": eligible_count[target],
-                "v7_maximum_recorded_probability": max(
+                f"{args.summary_score_label}_maximum_recorded_probability": max(
                     (float(row.get("methyl_probability_max", 0.0)) for row in target_unique),
                     default=0.0,
                 ),
-                "v7_methyl_residue_counts": json.dumps(
+                f"{args.summary_score_label}_methyl_residue_counts": json.dumps(
                     dict(sorted(methyl_residue_counts.items()))
                 ),
                 "minimum_signature_candidate_required": 1,
@@ -677,7 +807,7 @@ def run(args: argparse.Namespace) -> None:
     quality_checks = {
         **dict(annotation_audit["quality_checks"]),
         "source_v6_pool_hash_count_and_target_set_are_pinned": True,
-        "v7_checkpoint_is_serine_only_and_passed_heldout_gate": True,
+        "expert_checkpoint_scope_protocol_and_representation_audit_pass": True,
         "every_unique_target_natural_sequence_scored_exactly_once": (
             len(annotation_by_key)
             == int(source_validation["unique_target_natural_sequence_groups"])
@@ -691,6 +821,20 @@ def run(args: argparse.Namespace) -> None:
         ),
     }
     quality_gate = "PASS" if all(quality_checks.values()) else "FAIL"
+    noncoverage_checks = {
+        name: passed
+        for name, passed in quality_checks.items()
+        if name
+        != "every_target_has_at_least_one_novel_methylated_signature_candidate"
+    }
+    recovery_eligible = bool(
+        args.permit_missing_targets_for_recovery
+        and uncovered_targets
+        and all(noncoverage_checks.values())
+        and not quality_checks[
+            "every_target_has_at_least_one_novel_methylated_signature_candidate"
+        ]
+    )
     artifacts = {
         name: {
             "path": str(out_dir / filename),
@@ -709,29 +853,47 @@ def run(args: argparse.Namespace) -> None:
         "release_status": (
             "READY_FOR_MANUAL_SCIENTIFIC_REVIEW_NO_STRUCTURE_HANDOFF"
             if quality_gate == "PASS"
-            else "BLOCKED_MODEL_REPAIR_REQUIRED_DO_NOT_RELEASE"
+            else (
+                "BLOCKED_BASELINE_VALID_DIRECTED_RECOVERY_REQUIRED"
+                if recovery_eligible
+                else "BLOCKED_MODEL_OR_INTEGRITY_FAILURE_DO_NOT_SEARCH"
+            )
         ),
         "quality_checks": quality_checks,
-        "protocol": V7_GENERATION_PROTOCOL,
-        "recovery_mode": (
-            "SERINE_ONLY_RETRAIN_THEN_REANNOTATE_PRESERVED_V6_NATURAL_POOL_"
-            "NO_RESAMPLING_NO_ABSTENTION"
-        ),
-        "scientific_reason": (
-            "The provenance correction changed only Ser labels. V7 restores the "
-            "canonical parent for every non-Ser expert and retrains only Ser."
-        ),
+        "protocol": args.output_protocol,
+        "recovery_mode": str(args.recovery_mode),
+        "scientific_reason": str(args.scientific_reason),
         "temperature": float(plan["temperature"]),
         "methyl_threshold": float(plan["methyl_threshold"]),
         "strict_threshold_operator": ">",
         "device": str(device),
+        "scoring_batch_size": int(args.batch_size),
         "python_version": platform.python_version(),
         "torch_version": str(torch.__version__),
         "numpy_version": str(np.__version__),
+        "deterministic_runtime": {
+            "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+            "deterministic_algorithms_enabled": bool(
+                torch.are_deterministic_algorithms_enabled()
+            ),
+            "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+            "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+            "cudnn_version": (
+                int(torch.backends.cudnn.version())
+                if torch.backends.cudnn.version() is not None
+                else None
+            ),
+        },
         "model_path": str(model_path),
         "model_sha256": checkpoint_sha256,
-        "model_expert_qc_protocol": V7_EXPERT_PROTOCOL,
-        "expert_scope": "serine-only",
+        "reannotator_program_sha256": sha256_file(SCRIPT_PATH),
+        "generator_program_sha256": sha256_file(GENERATOR_PATH),
+        "common_program_sha256": sha256_file(COMMON_PATH),
+        "model_utils_program_sha256": sha256_file(MODEL_UTILS_PATH),
+        "nmethyl_config_program_sha256": sha256_file(NMETHYL_CONFIG_PATH),
+        "model_expert_qc_protocol": args.expected_expert_protocol,
+        "expert_scope": args.expected_expert_scope,
+        "summary_score_label": args.summary_score_label,
         "expert_manifest": str(expert_manifest_path),
         "expert_manifest_sha256": sha256_file(expert_manifest_path),
         "cyclic_representation_heldout_audit": {
@@ -757,6 +919,7 @@ def run(args: argparse.Namespace) -> None:
         "expected_target_count": EXPECTED_SOURCE_TARGETS,
         "targets_with_signature_candidate": EXPECTED_SOURCE_TARGETS - len(uncovered_targets),
         "targets_without_signature_candidate": uncovered_targets,
+        "directed_recovery_eligible": recovery_eligible,
         "targets_below_planned_structure_quota_diagnostic": targets_below_quota,
         "targets_formally_abstained": [],
         "effective_structure_target_count": EXPECTED_SOURCE_TARGETS - len(uncovered_targets),
@@ -771,14 +934,23 @@ def run(args: argparse.Namespace) -> None:
         "base_sampling_reused": True,
         "expert_sampling_path_probabilities_reused": False,
         "annotation_stability_audit": annotation_audit,
+        "plan": str(plan_path),
+        "plan_sha256": sha256_file(plan_path),
+        "plan_target_count": len(validated["target_names"]),
+        "native_jsonl": str(native_path),
+        "native_jsonl_sha256": sha256_file(native_path),
+        "native_jsonl_records": len(native_rows),
         "historical_design_csv": str(old_path),
+        "historical_design_csv_sha256": sha256_file(old_path),
+        "historical_design_rows": len(old_rows),
         "prior_handoff_csv": str(prior_path),
+        "prior_handoff_csv_sha256": sha256_file(prior_path),
         "prior_handoff_rows": len(prior_rows),
         "candidate_artifacts": artifacts,
     }
     generator.atomic_write_json(out_dir / "generation_manifest.json", manifest)
 
-    print("===== SERINE-ONLY V7 REANNOTATION COMPLETE =====", flush=True)
+    print(f"===== {args.run_label} REANNOTATION COMPLETE =====", flush=True)
     print(f"V6 natural rows retained: {len(raw_rows)}", flush=True)
     print(f"Unique target/natural sequences rescored: {len(annotation_by_key)}", flush=True)
     print(f"Novel methylated candidates: {len(eligible_rows)}", flush=True)
@@ -788,11 +960,17 @@ def run(args: argparse.Namespace) -> None:
         flush=True,
     )
     print(f"Quality gate: {quality_gate}", flush=True)
-    if quality_gate != "PASS":
+    if quality_gate != "PASS" and not recovery_eligible:
         failed = [name for name, passed in quality_checks.items() if not passed]
         raise RuntimeError(
-            "V7 reannotation is blocked; no abstention or release was created. "
+            f"{args.run_label} reannotation is blocked; no abstention or release was created. "
             "Failed checks: " + ", ".join(failed)
+        )
+    if recovery_eligible:
+        print(
+            "Baseline integrity passed; directed recovery is required for: "
+            + ", ".join(uncovered_targets),
+            flush=True,
         )
 
 
@@ -820,6 +998,37 @@ def parse_args() -> argparse.Namespace:
         "--expected-source-manifest-sha256",
         default=EXPECTED_SOURCE_MANIFEST_SHA256,
     )
+    parser.add_argument("--expected-expert-protocol", default=V7_EXPERT_PROTOCOL)
+    parser.add_argument("--expected-expert-scope", default="serine-only")
+    parser.add_argument(
+        "--expected-active-expert-tokens-json", default='["S"]'
+    )
+    parser.add_argument(
+        "--expected-representation-protocol",
+        default=V7_REPRESENTATION_AUDIT_PROTOCOL,
+    )
+    parser.add_argument(
+        "--expected-representation-authorization",
+        default=V7_REPRESENTATION_AUTHORIZATION,
+    )
+    parser.add_argument("--output-protocol", default=V7_GENERATION_PROTOCOL)
+    parser.add_argument(
+        "--recovery-mode",
+        default=(
+            "SERINE_ONLY_RETRAIN_THEN_REANNOTATE_PRESERVED_V6_NATURAL_POOL_"
+            "NO_RESAMPLING_NO_ABSTENTION"
+        ),
+    )
+    parser.add_argument("--run-label", default="SERINE-ONLY V7")
+    parser.add_argument("--summary-score-label", default="v7")
+    parser.add_argument(
+        "--scientific-reason",
+        default=(
+            "The provenance correction changed only Ser labels. V7 restores the "
+            "canonical parent for every non-Ser expert and retrains only Ser."
+        ),
+    )
+    parser.add_argument("--permit-missing-targets-for-recovery", action="store_true")
     return parser.parse_args()
 
 
@@ -827,6 +1036,8 @@ def main() -> None:
     args = parse_args()
     if int(args.batch_size) <= 0:
         raise ValueError("--batch-size must be positive")
+    if not str(args.summary_score_label).replace("_", "").isalnum():
+        raise ValueError("--summary-score-label must be alphanumeric/underscore")
     run(args)
 
 

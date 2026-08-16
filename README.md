@@ -20,20 +20,26 @@ paper_clean_v28_outputs/generated_fasta_clean_auto_single/all_designs.csv
 paper_clean_v28_outputs/af3_manifest.csv
 ```
 
-## 当前恢复流程：Ser 来源质控、循环起点不变性、结构先行（V7）
+## 当前恢复流程：Ser 来源质控、循环起点不变性、结构先行（V8）
 
 当前只运行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\run_serine_qc_serine_only_cyclic_v7.ps1
+powershell -ExecutionPolicy Bypass -File .\paper_clean_v28\run_serine_qc_source_scoped_hybrid_v8.ps1
 ```
 
-V6 把只涉及 Ser 的来源标签修复错误地扩大到全部 20 个 experts，导致 3ZGC
-等非 Ser 预测退化。V7 从 canonical V28 只重训 Ser expert，并以逐张量 hash 和
-非 Ser held-out 概率零差异证明其余模型未被改动。它保留、hash 固定并直接
-重标注现有 31,500 条 V6 自然序列，不重采样、不降阈值，也不接受 3ZGC 弃权
-来换 PASS。只有 17/17 均有新颖候选且独立三审通过才打人工复核 ZIP；不会创建
-尚哥 handoff，结构返回前也禁止透膜步骤。V5/V6 脚本只保留用于历史复现。
+V7 的 Ser 来源修复正确，但把另外 19 个 experts 退回 canonical 后，冻结
+Recall@0.6 从 0.8046 降到 0.5096：少 77 个 TP，只少 21 个 FP。V8 不再训练，按
+固定来源规则组合 canonical shared tensors、V6 non-Ser experts 和 V7 Ser
+expert；必须逐位证明 non-Ser 概率继承 V6、Ser 概率继承 V7，并在内部冻结审计
+上对 V6 的 Recall/F1 非劣后才继续。之后只读重标注现有 31,500 条 V6 自然
+序列，对实际缺失的 3WNE/3ZGC 做固定预算确定性搜索，再做独立 overlay 三审。
+只有 17/17、无正式弃权才打 checksum-indexed 人工复核 ZIP；不会创建尚哥
+handoff，结构返回并同时通过两项 `<3 Å` RMSD 门前也禁止透膜步骤。V5/V6/V7
+launcher 仅保留用于历史复现与失败诊断。
+
+这里使用过的 151-record / 1,505-position 集合不是新的盲测，只能作为 V6/V7/V8
+成对内部审计；论文最终主张仍需要新的 outer split 或真正 blind set。
 完整证据、门槛和输出说明见：
 
 ```text

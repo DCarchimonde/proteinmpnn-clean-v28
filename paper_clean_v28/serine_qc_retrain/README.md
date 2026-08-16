@@ -1,29 +1,45 @@
-# Ser 来源质控与循环起点不变性恢复（V7）
+# Ser 来源质控与循环起点不变性恢复（V8）
 
 ## 先说结论
 
-V7 取代 V6。**不要再运行 V6 的 `-Force` 或 `-ResumeQuota`，也不要把 3ZGC 的
-`MODEL_ABSTAINS` 当最终科学结论。** V6 的 31,500 条自然序列和 base-head
-采样统计保留为只读输入；V7 不再抽样，而是修正模型训练范围后统一重新标注。
+V8 取代 V7 作为当前恢复流程。**不要重训，也不要运行 V6 的 `-Force` 或
+`-ResumeQuota`。** canonical、已通过的 V6/V7 checkpoint 与 representation
+audit，以及 V6 的 31,500 条自然序列池，全部作为 hash 固定的只读输入。
 
-根因是训练范围扩大错了：PDB 来源修复只把普通 `ATOM-SER` 的错误小写 `s`
-改回天然 `S`，没有改变 R、G、L 等另外 19 个专家的标签；V3/V6 却重训了全部
-20 个 expert heads。3ZGC 在 V6 中 13,000 次抽样零产出（最高概率约 0.195）
-不是“种子不够”，而是非 Ser 专家也被不必要地改写了。历史上 3ZGC 的结构
-通过候选 `rEGGQNR` 和 3WNE 的 `GrKWNC` 都依赖 R 专家，这与退化方向一致。
+V7 的 Ser 来源修复本身是对的，但“只改了 Ser 标签”不等于“部署时另外 19 个
+expert 应退回 canonical”。全部 expert 都要在新的循环表示下部署；V6 对非 Ser
+heads 的循环表示训练没有受到 Ser 标签梯度污染，因为每个天然母体残基选择独立
+的线性 head。V7 把 19 个非 Ser heads 退回 canonical，实际形成训练/部署表示不
+匹配。冻结的 1,505 位点成对审计给出了直接证据：
 
-V7 的硬约束是：
+| 冻结阈值 `>0.6` | V6 | V7 | 变化 |
+| --- | ---: | ---: | ---: |
+| Recall | 0.8046 | 0.5096 | −0.2950 |
+| TP / FN | 210 / 51 | 133 / 128 | 少 77 个 TP |
+| FP / TN | 35 / 1209 | 14 / 1230 | 少 21 个 FP |
 
-- 从 canonical `frankenstein_v28.pt` 开始，只训练 Ser expert 的 weight/bias；
-- 共享 trunk、base head 和其余 19 个 experts 必须逐张量 SHA-256 不变；
-- 独立 test 上所有非 Ser 概率必须与 parent **精确相等**；
-- 继续使用“所有循环起点 × 所有 decoder order，再映射回物理残基”的口径；
-- 直接重标注已审计的 31,500 条 V6 自然序列，不重新生成、不降低 `>0.6`
-  阈值、不继承 V6 的 sampling-path expert 概率；
-- 不允许正式弃权来换 PASS：17 个靶点都至少要有 1 个新颖甲基候选；
-- 只生成人工复核包，不生成尚哥 handoff；结构返回前不跑透膜性。
+Ser 子集的阈值混淆未变；77 个新增 FN 全是非 Ser。因此这不是空 batch，也不是
+阈值偶然波动，而是 19 个 non-Ser heads 被明确回滚的结果。此前 Recall 下限
+`0.40` 过宽，不能阻止这种明显退化。该 151-record 集在 V3/V6/V7 中已被多次
+查看，只能称为**冻结成对内部审计**，不能包装成新的盲测；论文最终主张仍需新
+outer split 或真正 blind set。
 
-一次运行（脚本会自动复用已经 PASS 的阶段，避免重复长跑）：
+V8 不训练、不平均权重、不调阈值；来源规则是在 V6/V7 成对审计暴露问题后提出、
+在组合并评估 V8 前冻结的。因此它是 post-hoc 内部恢复候选，不是新的盲测模型：
+
+- shared trunk、embedding、decoder 与 base head：canonical clean V28；
+- 19 个 non-Ser experts：循环表示训练后的 V6；
+- Ser expert：来源修复后的 V7；
+- 每个非 Ser 位点概率必须与 V6 一致，每个 Ser 位点概率必须与 V7 一致；
+- Recall 与 F1 在冻结 `>0.6` 口径下必须不劣于 V6，Ser AUC 必须不劣于 V6；
+- 在通过模型与表示审计后，重标注只读的 31,500-row V6 pool；
+- 只对实际缺失的 3WNE/3ZGC 做固定预算、可复现的定向搜索；长度 6/7 的历史与
+  native controls 无论是否缺靶都必须复算，control 永远不能进入释放候选；
+- 最终必须 17/17、无正式弃权；不降 `>0.6` 阈值；搜索不能修改模型指标；
+- 只生成人工复核 ZIP，不生成尚哥 handoff，也不生成 permeability input。
+
+一次运行（已 PASS 的 V8 stage 会按 manifest/hash 复用；普通 partial 目录原样
+保留并停止，只有带配置 hash 的定向搜索 checkpoint 可以继续）：
 
 ```powershell
 cd E:\ProteinMPNN_work\proteinmpnn-clean-v28
@@ -31,26 +47,28 @@ git fetch origin
 git switch fix/serine-provenance-retrain-2026
 git pull --ff-only origin fix/serine-provenance-retrain-2026
 python -m unittest discover -s tests -p "test_*.py"
-powershell -ExecutionPolicy Bypass -File .\run_serine_qc_serine_only_cyclic_v7.ps1
+powershell -ExecutionPolicy Bypass -File .\paper_clean_v28\run_serine_qc_source_scoped_hybrid_v8.ps1
 ```
 
 成功终端必须同时显示：
 
 ```text
-V7 ALL AUTOMATED GATES PASSED; MANUAL SCIENTIFIC REVIEW IS NEXT
-Target coverage:       17/17; no formal abstention
+V8 ALL AUTOMATED GATES PASSED; MANUAL SCIENTIFIC REVIEW IS NEXT
+Final coverage:       17/17; no formal abstention
 Shang-ge handoff:      NOT CREATED
 ```
 
 人工复核文件是：
 
 ```text
-paper_clean_v28_outputs/serine_qc_serine_only_cyclic_v7/
-  serine_qc_serine_only_cyclic_v7_review_bundle.zip
+paper_clean_v28_outputs/serine_qc_source_scoped_hybrid_v8/
+  serine_qc_source_scoped_hybrid_v8_review_bundle.zip
 ```
 
-任一关失败时，脚本退出非零并保留诊断；不会生成 ZIP，也不会打印最终绿色成功。
-`-ReviewOnly` 只适用于所有 V7 产物已经 PASS 后的快速重审和重新打包。
+ZIP 同时保留既有 V7 `15/17` 失败诊断、V8 模型三方比较、表示审计、V8 baseline
+真实覆盖、长度 6/7 controls、搜索 trace/压缩 ledger/checkpoint/候选、最终三审
+以及 before/after SHA-256。任一关失败时脚本退出非零并保留诊断；不会打印最终
+绿色成功，也不会创建任何结构交接或透膜输入。
 
 ## V5/V6 历史问题与证据（保留用于复现，不再作为当前运行说明）
 
@@ -266,7 +284,7 @@ audit、全部候选和固定预算。若已经保留 12,000 条补采样且目�
 
 Windows 全量单测中的两个 Torch 数值测试使用干净的 Python 子进程，避免已经
 导入 NumPy 的测试进程再加载 `libomp.dll`/`libiomp5md.dll`。不要设置不安全的
-`KMP_DUPLICATE_LIB_OK=TRUE`。当前恢复命令为：
+`KMP_DUPLICATE_LIB_OK=TRUE`。历史 V6 配额恢复命令为：
 
 ```powershell
 python -m unittest discover -s tests -p "test_*.py"
