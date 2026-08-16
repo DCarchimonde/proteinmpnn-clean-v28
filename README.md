@@ -22,10 +22,18 @@ paper_clean_v28_outputs/af3_manifest.csv
 
 ## 当前恢复流程：Ser 来源质控、循环起点不变性、结构先行（V6）
 
-当前应运行：
+若从未生成 V6，首次完整运行才使用：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\run_serine_qc_cyclic_representation_v6.ps1 -Force
+```
+
+若 V6 模型、19,500 条初始生成或后续补采样已经存在，**不要再用 `-Force`**。
+使用下面命令保留已有结果；达到累计补采样上限仍为零产出的靶点会登记为明确的
+模型弃权，而不会继续盲抽或降低阈值：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_serine_qc_cyclic_representation_v6.ps1 -ResumeQuota
 ```
 
 V5 已撤回：3AV9 的旧结构通过行没有甲基 token，且 V5 的甲基候选全部集中

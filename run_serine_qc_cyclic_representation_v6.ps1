@@ -33,10 +33,12 @@ $Plan = Join-Path $RepoRoot "paper_clean_v28\serine_qc_retrain\target_plan_cycli
 $Trainer = Join-Path $RepoRoot "paper_clean_v28\serine_qc_retrain\02_retrain_canonical_expert_heads.py"
 $RepresentationAuditor = Join-Path $RepoRoot "paper_clean_v28\serine_qc_retrain\07_audit_cyclic_representation_equivariance.py"
 $QuotaResumer = Join-Path $RepoRoot "paper_clean_v28\serine_qc_retrain\08_resume_cyclic_representation_v6_quota.py"
+$QuotaFinalizer = Join-Path $RepoRoot "paper_clean_v28\serine_qc_retrain\09_finalize_cyclic_representation_v6_exhaustion.py"
 $Generator = Join-Path $RepoRoot "paper_clean_v28\rerun_t05\01_generate_t05_multiseed.py"
 $TripleAuditor = Join-Path $RepoRoot "paper_clean_v28\serine_qc_retrain\04_triple_audit_generation.py"
 $RepresentationAuditReport = Join-Path $RepresentationAuditOut "cyclic_representation_audit.json"
 $GenerationManifest = Join-Path $GenerationOut "generation_manifest.json"
+$FormalAbstentionAudit = Join-Path $GenerationOut "formal_target_abstention_audit.json"
 
 function Assert-LastExitCode {
     param([string]$Step)
@@ -159,6 +161,7 @@ $RequiredInputs = @(
     $Trainer,
     $RepresentationAuditor,
     $QuotaResumer,
+    $QuotaFinalizer,
     $Generator,
     $TripleAuditor
 )
@@ -204,7 +207,7 @@ Write-Host "Release:    review bundle only; structure handoff remains blocked"
 if ($ReviewOnly) {
     Write-Host "Mode:       re-audit/package existing V6; no GPU scoring or sampling"
 } elseif ($ResumeQuota) {
-    Write-Host "Mode:       preserve trained V6 + 19,500 draws; top up quota-shortfall targets only"
+    Write-Host "Mode:       preserve every V6 row; finalize exhausted zero-yield targets before any top-up"
 } else {
     Write-Host "Mode:       representation-augmented retraining, held-out gate, then full regeneration"
 }
@@ -278,28 +281,55 @@ try {
         & $ResolvedPython @GenerationArguments
         Assert-LastExitCode "Full 17-target V6 regeneration"
     } elseif ($ResumeQuota) {
-        $ProbeCode = 'import json, torch; print(json.dumps({"torch": torch.__version__, "cuda": bool(torch.cuda.is_available()), "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None}))'
-        Invoke-PythonProgram $ResolvedPython $ProbeCode "Python/PyTorch quota-resume preflight"
-        if (-not $AllowCpu) {
-            $CudaCode = 'import sys, torch; sys.exit(0 if torch.cuda.is_available() else 3)'
-            Invoke-PythonProgram $ResolvedPython $CudaCode "CUDA quota-resume preflight"
-        }
-        $ResumeArguments = @(
-            $QuotaResumer,
+        $FinalizeArguments = @(
+            $QuotaFinalizer,
             "--plan", $Plan,
             "--model-path", $Checkpoint,
-            "--source-run-dir", $GenerationOut,
-            "--out-dir", $GenerationOut,
+            "--run-dir", $GenerationOut,
             "--representation-audit-json", $RepresentationAuditReport,
-            "--native-jsonl", $NativeJsonl,
             "--old-designs-csv", $HistoricalCsv,
-            "--prior-designs-csv", $PriorHandoff,
-            "--batch-size", $GenerationBatchSize
+            "--prior-designs-csv", $PriorHandoff
         )
-        if ($AllowCpu) { $ResumeArguments += @("--device", "auto", "--allow-cpu") }
-        else { $ResumeArguments += @("--device", "cuda") }
-        & $ResolvedPython @ResumeArguments
-        Assert-LastExitCode "V6 shortfall-target quota resume"
+        & $ResolvedPython @FinalizeArguments
+        $FinalizeExitCode = $LASTEXITCODE
+        $QuotaResolvedWithoutSampling = ($FinalizeExitCode -eq 0)
+        if ($FinalizeExitCode -ne 0 -and $FinalizeExitCode -ne 20) {
+            throw "V6 fixed-budget abstention preflight failed with exit code $FinalizeExitCode"
+        }
+
+        if (-not $QuotaResolvedWithoutSampling) {
+            $ProbeCode = 'import json, torch; print(json.dumps({"torch": torch.__version__, "cuda": bool(torch.cuda.is_available()), "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None}))'
+            Invoke-PythonProgram $ResolvedPython $ProbeCode "Python/PyTorch quota-resume preflight"
+            if (-not $AllowCpu) {
+                $CudaCode = 'import sys, torch; sys.exit(0 if torch.cuda.is_available() else 3)'
+                Invoke-PythonProgram $ResolvedPython $CudaCode "CUDA quota-resume preflight"
+            }
+            $ResumeArguments = @(
+                $QuotaResumer,
+                "--plan", $Plan,
+                "--model-path", $Checkpoint,
+                "--source-run-dir", $GenerationOut,
+                "--out-dir", $GenerationOut,
+                "--representation-audit-json", $RepresentationAuditReport,
+                "--native-jsonl", $NativeJsonl,
+                "--old-designs-csv", $HistoricalCsv,
+                "--prior-designs-csv", $PriorHandoff,
+                "--batch-size", $GenerationBatchSize
+            )
+            if ($AllowCpu) { $ResumeArguments += @("--device", "auto", "--allow-cpu") }
+            else { $ResumeArguments += @("--device", "cuda") }
+            & $ResolvedPython @ResumeArguments
+            $ResumeExitCode = $LASTEXITCODE
+            if ($ResumeExitCode -ne 0) {
+                Write-Host "Adaptive budget ended below quota; validating formal model abstention without more sampling" -ForegroundColor Yellow
+                & $ResolvedPython @FinalizeArguments
+                if ($LASTEXITCODE -ne 0) {
+                    throw "V6 shortfall recovery failed and did not qualify for fixed-budget abstention"
+                }
+            }
+        } else {
+            Write-Host "GPU step:   skipped; preserved V6 coverage state passed metadata-only validation"
+        }
     } else {
         Write-Host "GPU step:   skipped; reusing existing V6 rows"
     }
@@ -341,6 +371,9 @@ try {
         "historical_4115_all_designs.csv" = $HistoricalCsv
         "prior_1333_methylated_new_candidates.csv" = $PriorHandoff
     }
+    if (Test-Path -LiteralPath $FormalAbstentionAudit -PathType Leaf) {
+        $BundleFileMap["v6_formal_target_abstention_audit.json"] = $FormalAbstentionAudit
+    }
     try {
         $ReviewContents = @()
         foreach ($Entry in $BundleFileMap.GetEnumerator()) {
@@ -366,6 +399,8 @@ try {
             generation_quality_gate = $Generation.quality_gate
             independent_audit_quality_gate = $Triple.quality_gate
             release_status = "HOLD_FOR_MANUAL_SCIENTIFIC_REVIEW_NO_STRUCTURE_HANDOFF"
+            coverage_resolution_mode = $Generation.coverage_resolution_mode
+            targets_formally_abstained = @($Generation.targets_formally_abstained)
             content_file_count = $ReviewContents.Count
             contents = $ReviewContents
         }
@@ -394,5 +429,9 @@ Write-Host "V6 AUTOMATED GATES PASSED; MANUAL REVIEW IS STILL REQUIRED" -Foregro
 Write-Host "Representation audit: $RepresentationAuditReport"
 Write-Host "Final candidates:     $(Join-Path $GenerationOut 'methylated_new_candidates.csv')"
 Write-Host "Manual-review bundle: $ReviewBundle"
+if (@($Generation.targets_formally_abstained).Count -gt 0) {
+    Write-Host "Formal abstention:    $(@($Generation.targets_formally_abstained) -join ', ') (no candidate or structure task released)" -ForegroundColor Yellow
+    Write-Host "Effective coverage:   $($Generation.effective_structure_target_count)/17 targets; $($Generation.effective_planned_structure_handoff) planned structure reviews"
+}
 Write-Host "Shang-ge handoff:     NOT CREATED" -ForegroundColor Yellow
 Write-Host "Next step:             upload the V6 review ZIP here; do not send V5 or V6 candidates yet" -ForegroundColor Yellow

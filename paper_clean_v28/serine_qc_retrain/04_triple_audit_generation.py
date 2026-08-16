@@ -87,6 +87,10 @@ REPRESENTATION_AUDIT_PROTOCOL = "cyclic_representation_equivariance_heldout_gate
 REPRESENTATION_AUDIT_AUTHORIZATION = (
     "REPRESENTATION_ENSEMBLE_VALIDATED_FOR_ISOLATED_V6_REGENERATION"
 )
+FORMAL_ABSTENTION_PROTOCOL = (
+    "cyclic_representation_v6_fixed_budget_target_abstention_v1"
+)
+FORMAL_ABSTENTION_MINIMUM_TOPUP_DRAWS = 12_000
 
 
 def read_csv(path: Path) -> List[Dict[str, str]]:
@@ -240,6 +244,59 @@ def audit(
     is_adaptive_v6 = (
         str(manifest.get("recovery_mode", ""))
         == "RETAIN_COMPLETE_V6_RUN_AND_ADAPTIVELY_SAMPLE_ONLY_QUOTA_SHORTFALL_TARGETS"
+    )
+    formal_abstention_rows = [
+        dict(row) for row in manifest.get("formal_target_abstentions", [])
+    ]
+    formal_abstention_index = {
+        str(row.get("target_name", "")).upper(): row
+        for row in formal_abstention_rows
+    }
+    formal_abstention_targets = set(formal_abstention_index)
+    formal_audit_path = run_dir / "formal_target_abstention_audit.json"
+    formal_audit_payload = (
+        read_json(formal_audit_path) if formal_audit_path.is_file() else {}
+    )
+    formal_audit_rows = [
+        dict(row)
+        for row in formal_audit_payload.get("formal_target_abstentions", [])
+    ]
+    reported_abstained_targets = {
+        str(value).upper()
+        for value in manifest.get("targets_formally_abstained", [])
+    }
+    recorded_candidate_hashes = dict(
+        manifest.get("candidate_artifact_sha256_unchanged_by_abstention") or {}
+    )
+    audited_candidate_hashes = dict(
+        formal_audit_payload.get("candidate_artifacts_before_and_after") or {}
+    )
+    formal_abstention_metadata_pass = (
+        not formal_abstention_rows
+        or (
+            len(formal_abstention_rows) == len(formal_abstention_index)
+            and formal_abstention_targets <= target_names
+            and formal_abstention_targets == reported_abstained_targets
+            and all(
+                bool(row.get("formal_abstention_approved"))
+                and str(row.get("quality_gate", "")) == "PASS"
+                and all(bool(value) for value in dict(row.get("checks") or {}).values())
+                for row in formal_abstention_rows
+            )
+            and formal_audit_path.is_file()
+            and str(formal_audit_payload.get("quality_gate", "")) == "PASS"
+            and str(formal_audit_payload.get("protocol", ""))
+            == FORMAL_ABSTENTION_PROTOCOL
+            and formal_audit_rows == formal_abstention_rows
+            and sha256_file(formal_audit_path)
+            == str(manifest.get("formal_target_abstention_audit_sha256", ""))
+            and all(
+                str(dict(recorded_candidate_hashes.get(name) or {}).get("sha256", ""))
+                == sha256_file(paths[name])
+                == str(dict(audited_candidate_hashes.get(name) or {}).get("sha256", ""))
+                for name in ("all", "unique", "eligible")
+            )
+        )
     )
     v6_backup_diagnostics: Dict[str, Any] = {"applicable": is_adaptive_v6}
     v6_backup_preservation_pass = True
@@ -679,6 +736,9 @@ def audit(
         "adaptive_v6_initial_backup_is_hash_pinned_and_fully_retained": (
             v6_backup_preservation_pass
         ),
+        "formal_target_abstention_metadata_and_candidate_hashes_are_valid": (
+            formal_abstention_metadata_pass
+        ),
         "generation_manifest_counts_match_files": (
             int(manifest.get("raw_candidates_generated", -1)) == len(raw_rows)
             and int(manifest.get("unique_candidates", -1)) == len(unique_rows)
@@ -838,16 +898,155 @@ def audit(
         for target, config in target_plan.items()
         if candidates_by_target[target] < int(config["structure_quota"])
     ]
+    initial_rows_by_target = Counter(
+        str(row["target_name"]).upper()
+        for row in raw_rows
+        if str(row.get("source_recovery_stage", ""))
+        == "V6_INITIAL_FULL_REGENERATION"
+    )
+    topup_rows_by_target = Counter(
+        str(row["target_name"]).upper()
+        for row in raw_rows
+        if str(row.get("source_recovery_stage", "")) == "V6_ADAPTIVE_QUOTA_TOPUP"
+    )
+    topup_seed_counts_by_target: MutableMapping[str, Counter[int]] = defaultdict(
+        Counter
+    )
+    for row in raw_rows:
+        if str(row.get("source_recovery_stage", "")) != "V6_ADAPTIVE_QUOTA_TOPUP":
+            continue
+        topup_seed_counts_by_target[str(row["target_name"]).upper()][
+            int(row["seed"])
+        ] += 1
+    adaptive_budget = dict(manifest.get("adaptive_topup_budget") or {})
+    adaptive_draws_per_seed = int(
+        adaptive_budget.get("draws_per_reserve_seed", 0)
+    )
+    required_abstention_seed_count = (
+        math.ceil(
+            FORMAL_ABSTENTION_MINIMUM_TOPUP_DRAWS / adaptive_draws_per_seed
+        )
+        if adaptive_draws_per_seed > 0
+        else -1
+    )
+    initial_plan_seeds = {int(value) for value in plan["seeds"]}
+    formal_abstention_errors: List[str] = []
+    independently_verified_abstentions = set()
+    for target, row in sorted(formal_abstention_index.items()):
+        if target not in target_plan:
+            formal_abstention_errors.append(f"{target}: target is outside the plan")
+            continue
+        expected_initial = int(target_plan[target]["sequences_per_seed"]) * len(
+            plan["seeds"]
+        )
+        fully_exhausted_seeds = {
+            seed
+            for seed, count in topup_seed_counts_by_target[target].items()
+            if adaptive_draws_per_seed > 0 and count >= adaptive_draws_per_seed
+        }
+        checks = {
+            "target_is_a_recomputed_quota_shortfall": target in quota_shortfalls,
+            "target_releases_zero_candidates": candidates_by_target[target] == 0,
+            "complete_initial_target_pool_is_present": (
+                initial_rows_by_target[target] == expected_initial
+            ),
+            "fixed_12000_draw_topup_budget_is_present": (
+                topup_rows_by_target[target]
+                >= FORMAL_ABSTENTION_MINIMUM_TOPUP_DRAWS
+            ),
+            "enough_full_disjoint_reserve_seeds_are_independently_present": (
+                required_abstention_seed_count > 0
+                and len(fully_exhausted_seeds) >= required_abstention_seed_count
+                and not (fully_exhausted_seeds & initial_plan_seeds)
+            ),
+            "recorded_counts_match_rows": (
+                int(row.get("initial_v6_raw_draws", -1))
+                == initial_rows_by_target[target]
+                and int(row.get("adaptive_topup_raw_draws", -1))
+                == topup_rows_by_target[target]
+                and int(row.get("novel_v6_methylated_candidates", -1))
+                == candidates_by_target[target]
+            ),
+            "recorded_quota_and_effective_abstention_quota_are_exact": (
+                int(row.get("planned_structure_quota", -1))
+                == int(target_plan[target]["structure_quota"])
+                and int(row.get("effective_structure_quota_after_abstention", -1))
+                == 0
+            ),
+            "recorded_release_action_blocks_candidate_and_threshold_fallback": (
+                "MODEL_ABSTAINS" in str(row.get("release_action", ""))
+                and "DO_NOT_LOWER_THRESHOLD" in str(row.get("release_action", ""))
+                and "DO_NOT_CREATE_STRUCTURE_TASK" in str(
+                    row.get("release_action", "")
+                )
+            ),
+        }
+        failed = [name for name, passed in checks.items() if not passed]
+        if failed:
+            formal_abstention_errors.append(f"{target}: {', '.join(failed)}")
+        else:
+            independently_verified_abstentions.add(target)
+    unresolved_quota_shortfalls = sorted(
+        set(quota_shortfalls) - independently_verified_abstentions
+    )
     summary_index = {
         str(row["target_name"]).upper(): row for row in target_summary_rows
     }
+    target_manifest_index = {
+        str(row["target_name"]).upper(): row for row in target_manifest_rows
+    }
     summary_mismatches = []
+    target_manifest_mismatches = []
     for target in sorted(target_names):
         if target not in summary_index:
             summary_mismatches.append(f"missing summary for {target}")
             continue
         if int(summary_index[target]["new_methylated_for_permeability"]) != candidates_by_target[target]:
             summary_mismatches.append(f"candidate summary mismatch for {target}")
+        if target in formal_abstention_targets:
+            if not (
+                int(summary_index[target].get("formal_target_abstention", 0)) == 1
+                and int(summary_index[target].get("effective_structure_quota", -1))
+                == 0
+                and int(
+                    summary_index[target].get(
+                        "quota_satisfied_or_formally_abstained", 0
+                    )
+                )
+                == 1
+            ):
+                summary_mismatches.append(
+                    f"formal abstention summary mismatch for {target}"
+                )
+        if target in formal_abstention_targets:
+            target_manifest_row = target_manifest_index.get(target, {})
+            if not (
+                int(target_manifest_row.get("formal_target_abstention", 0)) == 1
+                and int(target_manifest_row.get("effective_structure_quota", -1))
+                == 0
+                and "MODEL_ABSTAINS"
+                in str(target_manifest_row.get("structure_release_action", ""))
+            ):
+                target_manifest_mismatches.append(
+                    f"formal abstention target-manifest mismatch for {target}"
+                )
+
+    expected_effective_handoff = sum(
+        int(config["structure_quota"])
+        for target, config in target_plan.items()
+        if target not in formal_abstention_targets
+    )
+    effective_coverage_metadata_pass = (
+        not formal_abstention_targets
+        or (
+            int(manifest.get("effective_planned_structure_handoff", -1))
+            == expected_effective_handoff
+            and int(manifest.get("effective_structure_target_count", -1))
+            == len(target_names) - len(formal_abstention_targets)
+            and str(manifest.get("release_status", ""))
+            == "READY_FOR_MANUAL_SCIENTIFIC_REVIEW_WITH_FORMAL_TARGET_ABSTENTION"
+        )
+    )
 
     deferred = manifest.get("permeability_status") == "DEFERRED_UNTIL_STRUCTURE_RETURNS"
     permeability_files_absent = not any(
@@ -873,8 +1072,24 @@ def audit(
             {str(row["target_name"]).upper() for row in eligible_rows} <= target_names
             and not ({str(row["target_name"]).upper() for row in eligible_rows} & frozen_targets)
         ),
-        "every_target_meets_structure_quota": not quota_shortfalls,
+        "every_target_meets_structure_quota_or_has_verified_fixed_budget_abstention": (
+            not unresolved_quota_shortfalls and not formal_abstention_errors
+        ),
+        "manifest_unresolved_shortfalls_recompute": (
+            sorted(
+                str(value).upper()
+                for value in manifest.get(
+                    "unresolved_targets_below_pre_permeability_quota",
+                    quota_shortfalls,
+                )
+            )
+            == unresolved_quota_shortfalls
+        ),
         "target_summaries_recompute": not summary_mismatches,
+        "target_manifest_formal_abstentions_recompute": (
+            not target_manifest_mismatches
+        ),
+        "effective_coverage_metadata_recomputes": effective_coverage_metadata_pass,
         "permeability_is_still_deferred": deferred and permeability_files_absent,
     }
 
@@ -885,7 +1100,11 @@ def audit(
     report = {
         "quality_gate": quality_gate,
         "release_status": (
-            "READY_FOR_MANUAL_SCIENTIFIC_REVIEW"
+            (
+                "READY_FOR_MANUAL_SCIENTIFIC_REVIEW_WITH_FORMAL_TARGET_ABSTENTION"
+                if formal_abstention_targets
+                else "READY_FOR_MANUAL_SCIENTIFIC_REVIEW"
+            )
             if quality_gate == "PASS"
             else "BLOCKED_DO_NOT_SEND_TO_SHANGGE"
         ),
@@ -933,7 +1152,14 @@ def audit(
             "quality_gate": pass_3,
             "checks": pass_3_checks,
             "quota_shortfalls": quota_shortfalls,
+            "formal_target_abstentions": sorted(formal_abstention_targets),
+            "independently_verified_formal_target_abstentions": sorted(
+                independently_verified_abstentions
+            ),
+            "formal_abstention_errors": formal_abstention_errors,
+            "unresolved_quota_shortfalls": unresolved_quota_shortfalls,
             "summary_mismatches": summary_mismatches,
+            "target_manifest_mismatches": target_manifest_mismatches,
             "prior_exact_overlaps": len(eligible_exact & prior_exact),
             "prior_natural_overlaps": len(eligible_natural & prior_natural),
             "historical_exact_overlaps": len(eligible_exact & historical_exact),

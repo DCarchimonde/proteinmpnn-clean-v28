@@ -110,6 +110,27 @@ V6 对全部 17 个靶点计划生成 19,500 条 raw draws。最终
 计划里的 245 只是将来人工放行后用于检查每个靶点是否有足够结构覆盖的最低
 配额总和，本次命令不会生成尚哥交接包，也不会把候选截成 245 条。
 
+## 3ZGC 的固定预算耗尽不是“再换种子就会好”
+
+完整 V6 运行中，3ZGC 的 5 个初始种子共 1,000 条，加上 12 个互不重叠的
+reserve seeds 共 12,000 条，合计 13,000 条，在冻结的循环表示平均和严格
+`>0.6` 阈值下仍为 0 个可释放的新甲基候选。这个结果不能用下面任何办法“补齐”：
+
+- 继续一轮又一轮盲抽新种子；
+- 把阈值从 0.6 降低；
+- 恢复 V6 以前依赖数组起点的旧甲基标注；
+- 伪造 3ZGC 已满足 `10` 条结构配额。
+
+这里的 `10` 是结构筛查覆盖目标，不是要求模型必须给出阳性的真实标签。固定
+12,000 条补采样预算用尽且独立复算仍为 0 后，科学上正确的终态是
+`MODEL_ABSTAINS`：明确记录 3ZGC 无可释放候选，不为它创建结构任务；其余 16 个
+靶点按各自冻结配额继续人工复核。对当前这批结果，这等价于 17 个靶点中 16 个
+有候选覆盖、有效结构复核计划由 245 降为 235；不是宣称“17/17 全部达标”。
+
+该终态只更新 summary、target manifest、generation manifest 和独立审计文件。
+`all_candidates.csv`、`unique_candidates.csv`、
+`methylated_new_candidates.csv` 的 SHA-256 在前后必须完全相同，否则立即失败。
+
 ## Windows 一键运行
 
 必须在真正的仓库目录运行，而不是上一层 `E:\ProteinMPNN_work`：
@@ -183,11 +204,22 @@ CSV。把完整终端日志和当时已有的 V6 review ZIP（若已生成）发
 powershell -ExecutionPolicy Bypass -File .\run_serine_qc_cyclic_representation_v6.ps1 -ResumeQuota
 ```
 
-该模式会先核对 checkpoint、plan、representation audit 和原始生成 SHA/协议，
-自动读取缺额靶点，每 200 条重新计算一次冻结配额；阈值仍严格为 `>0.6`。原始
-19,500 行会备份并逐行保留。补齐后才继续三遍独立审计和打人工复核 ZIP，不会
-重训、重跑已完成的 17 靶点，也不会创建尚哥 handoff。`-ResumeQuota` 与
-`-Force` 禁止同时使用。
+该模式会先用不导入 Torch 的 finalizer 核对 checkpoint、plan、representation
+audit、全部候选和固定预算。若已经保留 12,000 条补采样且目标仍是零产出，它
+会直接登记正式模型弃权，跳过 GPU；若预算尚未用尽，才自动读取缺额靶点，每
+200 条重新计算一次冻结配额。12,000 是**每靶点累计总上限**，不是每次命令都
+能再抽 12,000。阈值仍严格为 `>0.6`，原始 19,500 行会备份并逐行保留。之后
+继续三遍独立审计和打人工复核 ZIP，不会重训、重跑已完成的 17 靶点，也不会
+创建尚哥 handoff。`-ResumeQuota` 与 `-Force` 禁止同时使用。
+
+Windows 全量单测中的两个 Torch 数值测试使用干净的 Python 子进程，避免已经
+导入 NumPy 的测试进程再加载 `libomp.dll`/`libiomp5md.dll`。不要设置不安全的
+`KMP_DUPLICATE_LIB_OK=TRUE`。当前恢复命令为：
+
+```powershell
+python -m unittest discover -s tests -p "test_*.py"
+powershell -ExecutionPolicy Bypass -File .\run_serine_qc_cyclic_representation_v6.ps1 -ResumeQuota
+```
 
 已经完成一次 V6 后，仅重新审计和打包可运行：
 

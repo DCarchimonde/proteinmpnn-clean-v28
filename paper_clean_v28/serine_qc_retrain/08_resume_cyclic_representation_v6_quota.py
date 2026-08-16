@@ -651,15 +651,19 @@ def run(args: argparse.Namespace) -> None:
 
         current_count = initial_counts[target]
         target_draws_this_run = 0
+        remaining_target_budget = max(
+            0,
+            int(args.max_topup_draws_per_target)
+            - int(topup_rows_by_target[target]),
+        )
         used_seeds = set(topup_seeds_by_target[target])
         print(
-            f"[{target}] existing eligible={current_count}, quota={quota}, goal={goal}",
+            f"[{target}] existing eligible={current_count}, quota={quota}, goal={goal}, "
+            f"remaining fixed budget={remaining_target_budget}",
             flush=True,
         )
         for reserve_seed in reserve_seeds:
-            if current_count >= goal or target_draws_this_run >= int(
-                args.max_topup_draws_per_target
-            ):
+            if current_count >= goal or target_draws_this_run >= remaining_target_budget:
                 break
             if reserve_seed in used_seeds:
                 continue
@@ -670,13 +674,13 @@ def run(args: argparse.Namespace) -> None:
             produced_for_seed = 0
             while (
                 produced_for_seed < int(args.draws_per_reserve_seed)
-                and target_draws_this_run < int(args.max_topup_draws_per_target)
+                and target_draws_this_run < remaining_target_budget
                 and current_count < goal
             ):
                 checkpoint_draws = min(
                     int(args.check_interval_draws),
                     int(args.draws_per_reserve_seed) - produced_for_seed,
-                    int(args.max_topup_draws_per_target) - target_draws_this_run,
+                    remaining_target_budget - target_draws_this_run,
                 )
                 checkpoint_produced = 0
                 while checkpoint_produced < checkpoint_draws:
@@ -983,6 +987,9 @@ def run(args: argparse.Namespace) -> None:
             "adaptive_topup_budget": {
                 "reserve_seeds": reserve_seeds,
                 "draws_per_reserve_seed": int(args.draws_per_reserve_seed),
+                "maximum_draws_per_target_total": int(
+                    args.max_topup_draws_per_target
+                ),
                 "maximum_draws_per_target_per_resume": int(
                     args.max_topup_draws_per_target
                 ),

@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +44,20 @@ v6_quota_resumer = load_module(
     / "paper_clean_v28"
     / "serine_qc_retrain"
     / "08_resume_cyclic_representation_v6_quota.py",
+)
+v6_exhaustion_finalizer = load_module(
+    "serine_qc_v6_exhaustion_finalizer",
+    ROOT
+    / "paper_clean_v28"
+    / "serine_qc_retrain"
+    / "09_finalize_cyclic_representation_v6_exhaustion.py",
+)
+triple_auditor = load_module(
+    "serine_qc_v6_triple_auditor",
+    ROOT
+    / "paper_clean_v28"
+    / "serine_qc_retrain"
+    / "04_triple_audit_generation.py",
 )
 
 from nmethyl.utils import nmethyl_config  # noqa: E402
@@ -256,9 +271,15 @@ class FrozenRecoveryPlanTests(unittest.TestCase):
         self.assertIn("[switch]$ResumeQuota", launcher)
         self.assertIn("Do not combine -ResumeQuota with -Force", launcher)
         self.assertIn("08_resume_cyclic_representation_v6_quota.py", launcher)
+        self.assertIn("09_finalize_cyclic_representation_v6_exhaustion.py", launcher)
         self.assertIn("& $ResolvedPython @ResumeArguments", launcher)
+        self.assertIn("GPU step:   skipped; preserved V6 coverage state", launcher)
+        self.assertNotIn("KMP_DUPLICATE_LIB_OK", launcher)
+        finalize_call = launcher.index("& $ResolvedPython @FinalizeArguments")
+        resume_call = launcher.index("& $ResolvedPython @ResumeArguments")
+        self.assertLess(finalize_call, resume_call)
         self.assertLess(
-            launcher.index("& $ResolvedPython @ResumeArguments"),
+            resume_call,
             launcher.index("& $ResolvedPython $TripleAuditor"),
         )
 
@@ -277,12 +298,422 @@ class FrozenRecoveryPlanTests(unittest.TestCase):
         self.assertIn('TOPUP_STAGE = "V6_ADAPTIVE_QUOTA_TOPUP"', resumer)
         self.assertIn('threshold = float(plan["methyl_threshold"])', resumer)
         self.assertNotIn("threshold = 0.5", resumer)
+        self.assertIn("remaining_target_budget = max(", resumer)
+        self.assertIn("maximum_draws_per_target_total", resumer)
         self.assertEqual(
             v6_quota_resumer.false_checks(
                 {"ok": True, "quota": False, "also_ok": 1}
             ),
             ["quota"],
         )
+
+    def test_v6_fixed_budget_zero_yield_becomes_explicit_model_abstention(self):
+        class ResumerFixture:
+            INITIAL_STAGE = v6_quota_resumer.INITIAL_STAGE
+            TOPUP_STAGE = v6_quota_resumer.TOPUP_STAGE
+
+        initial_rows = [
+            {
+                "target_name": "3ZGC",
+                "source_recovery_stage": ResumerFixture.INITIAL_STAGE,
+                "seed": seed,
+                "design_methyl_count": 0,
+                "methyl_probabilities": "[]",
+                "methyl_threshold": "0.6",
+            }
+            for seed in (101, 202)
+        ]
+        reserve_seeds = [
+            606,
+            707,
+            808,
+            909,
+            1111,
+            1212,
+            1313,
+            1414,
+            1515,
+            1616,
+            1717,
+            1818,
+        ]
+        topup_rows = [
+            {
+                "target_name": "3ZGC",
+                "source_recovery_stage": ResumerFixture.TOPUP_STAGE,
+                "seed": seed,
+                "design_methyl_count": 0,
+                "methyl_probabilities": "[]",
+                "methyl_threshold": "0.6",
+            }
+            for seed in reserve_seeds
+            for _ in range(1_000)
+        ]
+        manifest = {
+            "methyl_threshold": 0.6,
+            "adaptive_topup_budget": {
+                "maximum_draws_per_target_total": 12_000,
+                "draws_per_reserve_seed": 1_000,
+            },
+        }
+        target_plan = {"sequences_per_seed": 1, "structure_quota": 10}
+        unique_rows = [
+            {
+                "target_name": "3ZGC",
+                "design_methyl_count": 0,
+                "passes_methylation_hard_gate": 0,
+            }
+        ]
+
+        approved = v6_exhaustion_finalizer.evaluate_exhausted_target(
+            "3ZGC",
+            target_plan,
+            [101, 202],
+            initial_rows + topup_rows,
+            unique_rows,
+            [],
+            manifest,
+            ResumerFixture,
+        )
+        self.assertTrue(approved["formal_abstention_approved"])
+        self.assertEqual(approved["adaptive_topup_raw_draws"], 12_000)
+        self.assertEqual(approved["novel_v6_methylated_candidates"], 0)
+        self.assertIn("DO_NOT_LOWER_THRESHOLD", approved["release_action"])
+        self.assertIn("DO_NOT_CREATE_STRUCTURE_TASK", approved["release_action"])
+
+        under_budget = v6_exhaustion_finalizer.evaluate_exhausted_target(
+            "3ZGC",
+            target_plan,
+            [101, 202],
+            initial_rows + topup_rows[:-1],
+            unique_rows,
+            [],
+            manifest,
+            ResumerFixture,
+        )
+        self.assertFalse(under_budget["formal_abstention_approved"])
+        self.assertFalse(
+            under_budget["checks"]["at_least_12000_adaptive_rows_are_present"]
+        )
+
+    def test_v6_triple_audit_recomputes_formal_abstention_independently(self):
+        auditor = (
+            ROOT
+            / "paper_clean_v28"
+            / "serine_qc_retrain"
+            / "04_triple_audit_generation.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "every_target_meets_structure_quota_or_has_verified_fixed_budget_abstention",
+            auditor,
+        )
+        self.assertIn("fixed_12000_draw_topup_budget_is_present", auditor)
+        self.assertIn("formal_abstention_errors", auditor)
+        self.assertIn("candidate_artifact_sha256_unchanged_by_abstention", auditor)
+        self.assertNotIn("KMP_DUPLICATE_LIB_OK", auditor)
+
+    def test_v6_exhaustion_finalizer_is_idempotent_and_never_rewrites_candidates(self):
+        def write_csv(path, rows, fields=None):
+            fields = list(fields or rows[0])
+            with path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+
+        annotation_mode = v6_quota_resumer.ANNOTATION_MODE
+        annotation_context = v6_quota_resumer.ANNOTATION_CONTEXT
+        initial_seeds = [101, 202]
+        reserve_seeds = [
+            606,
+            707,
+            808,
+            909,
+            1111,
+            1212,
+            1313,
+            1414,
+            1515,
+            1616,
+            1717,
+            1818,
+        ]
+
+        def candidate(candidate_id, seed, draw_index, stage):
+            return {
+                "candidate_id": candidate_id,
+                "target_name": "3ZGC",
+                "design_seq": "GDEETGE",
+                "design_natural_seq": "GDEETGE",
+                "native_length": 7,
+                "design_length": 7,
+                "length_match": 1,
+                "valid_token_gate": 1,
+                "seed": seed,
+                "draw_index_within_seed": draw_index,
+                "base_log_probability_mean": -1.0,
+                "design_methyl_count": 0,
+                "design_methyl_rate": 0.0,
+                "methyl_positions_1based": "[]",
+                "methyl_probabilities": json.dumps([0.1] * 7),
+                "methyl_probability_order_std": json.dumps([0.0] * 7),
+                "methyl_probability_order_std_max": 0.0,
+                "decoding_order_absolute": json.dumps(list(range(7))),
+                "methyl_threshold": 0.6,
+                "annotation_mode": annotation_mode,
+                "annotation_context_policy": annotation_context,
+                "annotation_visible_receptor_chains": 0,
+                "annotation_order_ensemble_size": 7,
+                "annotation_decoder_order_ensemble_size": 7,
+                "annotation_representation_ensemble_size": 7,
+                "source_recovery_stage": stage,
+            }
+
+        raw_rows = [
+            candidate(
+                f"initial_{seed}",
+                seed,
+                1,
+                v6_quota_resumer.INITIAL_STAGE,
+            )
+            for seed in initial_seeds
+        ]
+        raw_rows.extend(
+            candidate(
+                f"topup_{seed}_{draw_index:04d}",
+                seed,
+                draw_index,
+                v6_quota_resumer.TOPUP_STAGE,
+            )
+            for seed in reserve_seeds
+            for draw_index in range(1, 1_001)
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_name:
+            temporary = Path(temporary_name)
+            run_dir = temporary / "generation"
+            run_dir.mkdir()
+            model_path = temporary / "model.pt"
+            model_path.write_bytes(b"hash-pinned-test-checkpoint")
+            model_sha = v6_quota_resumer.sha256_file(model_path)
+            plan_path = temporary / "plan.json"
+            plan = {
+                "protocol": "synthetic_cyclic_representation_v6",
+                "temperature": 0.5,
+                "methyl_threshold": 0.6,
+                "seeds": initial_seeds,
+                "expected_target_count": 1,
+                "frozen_targets": [],
+                "targets": [
+                    {
+                        "target_name": "3ZGC",
+                        "sequences_per_seed": 1,
+                        "structure_quota": 10,
+                        "current_problem": "synthetic_zero_yield",
+                    }
+                ],
+            }
+            plan_path.write_text(json.dumps(plan), encoding="utf-8")
+            audit_path = temporary / "representation_audit.json"
+            representation_audit = {
+                "quality_gate": "PASS",
+                "protocol": v6_quota_resumer.REPRESENTATION_AUDIT_PROTOCOL,
+                "release_authorization": (
+                    v6_quota_resumer.REPRESENTATION_AUDIT_AUTHORIZATION
+                ),
+                "model_sha256": model_sha,
+                "plan_sha256": v6_quota_resumer.sha256_file(plan_path),
+                "annotation_mode": annotation_mode,
+            }
+            audit_path.write_text(
+                json.dumps(representation_audit), encoding="utf-8"
+            )
+            old_path = temporary / "historical.csv"
+            write_csv(
+                old_path,
+                [{"target_name": "OLD", "design_seq": "AAAAAAA"}],
+            )
+            prior_path = temporary / "prior.csv"
+            write_csv(
+                prior_path,
+                [
+                    {
+                        "candidate_id": f"prior_{index}",
+                        "target_name": "OLD",
+                        "design_seq": f"OLD{index}",
+                    }
+                    for index in range(1_333)
+                ],
+            )
+
+            old_exact, old_natural = generator.old_design_keys(old_path)
+            _, prior_exact, prior_natural = generator.validate_prior_handoff(
+                prior_path
+            )
+            unique_rows = generator.aggregate_unique_candidates(
+                raw_rows,
+                old_exact,
+                old_natural,
+                prior_exact,
+                prior_natural,
+            )
+            eligible_rows = [
+                row
+                for row in unique_rows
+                if int(row["eligible_for_new_permeability_screen"])
+            ]
+            self.assertEqual(eligible_rows, [])
+            write_csv(run_dir / "all_candidates.csv", raw_rows)
+            write_csv(run_dir / "unique_candidates.csv", unique_rows)
+            write_csv(
+                run_dir / "methylated_new_candidates.csv",
+                eligible_rows,
+                unique_rows[0].keys(),
+            )
+            write_csv(
+                run_dir / "generation_summary_by_target.csv",
+                [
+                    {
+                        "target_name": "3ZGC",
+                        "new_methylated_for_permeability": 0,
+                        "planned_structure_quota": 10,
+                        "enough_candidates_before_permeability": 0,
+                    }
+                ],
+            )
+            write_csv(
+                run_dir / "target_manifest.csv",
+                [{"target_name": "3ZGC", "selected_chain": "C"}],
+            )
+            embedded_audit = generator.audit_annotation_stability(raw_rows, [])
+            self.assertEqual(embedded_audit["quality_gate"], "PASS")
+            backup_dir = run_dir / "pre_quota_resume_backup"
+            backup_dir.mkdir()
+            write_csv(backup_dir / "all_candidates.csv", raw_rows[:2])
+            (backup_dir / "generation_manifest.json").write_text(
+                json.dumps({"quality_gate": "FAIL", "synthetic": True}),
+                encoding="utf-8",
+            )
+            manifest = {
+                "quality_gate": "FAIL",
+                "quality_checks": {
+                    "source_integrity": True,
+                    "every_target_meets_pre_structure_candidate_quota": False,
+                },
+                "protocol": plan["protocol"],
+                "model_sha256": model_sha,
+                "model_expert_qc_protocol": (
+                    v6_quota_resumer.REQUIRED_EXPERT_PROTOCOL
+                ),
+                "methyl_threshold": 0.6,
+                "annotation_mode": annotation_mode,
+                "annotation_context_policy": annotation_context,
+                "annotation_visible_receptor_chains": 0,
+                "train_deployment_context_match": True,
+                "cyclic_representation_ensemble_enabled": True,
+                "cyclic_representation_heldout_audit": {
+                    **representation_audit,
+                    "sha256": v6_quota_resumer.sha256_file(audit_path),
+                },
+                "raw_candidates_generated": len(raw_rows),
+                "unique_candidates": len(unique_rows),
+                "new_methylated_candidates_for_permeability": 0,
+                "recovery_mode": v6_quota_resumer.RECOVERY_MODE,
+                "source_v6_raw_candidates_retained": 2,
+                "adaptive_topup_raw_candidates": 12_000,
+                "adaptive_topup_budget": {
+                    "reserve_seeds": reserve_seeds,
+                    "draws_per_reserve_seed": 1_000,
+                    "maximum_draws_per_target_per_resume": 12_000,
+                },
+                "raw_candidates_expected": len(raw_rows),
+                "targets_below_pre_permeability_quota": ["3ZGC"],
+                "annotation_stability_audit": embedded_audit,
+                "historical_design_csv": str(old_path),
+                "source_v6_initial_backup_manifest_sha256": (
+                    v6_quota_resumer.sha256_file(
+                        backup_dir / "generation_manifest.json"
+                    )
+                ),
+                "source_v6_initial_backup_all_candidates_sha256": (
+                    v6_quota_resumer.sha256_file(
+                        backup_dir / "all_candidates.csv"
+                    )
+                ),
+                "permeability_status": "DEFERRED_UNTIL_STRUCTURE_RETURNS",
+            }
+            (run_dir / "generation_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            args = SimpleNamespace(
+                plan=str(plan_path),
+                model_path=str(model_path),
+                run_dir=str(run_dir),
+                representation_audit_json=str(audit_path),
+                old_designs_csv=str(old_path),
+                prior_designs_csv=str(prior_path),
+            )
+            candidate_paths = [
+                run_dir / "all_candidates.csv",
+                run_dir / "unique_candidates.csv",
+                run_dir / "methylated_new_candidates.csv",
+            ]
+            hashes_before = [
+                v6_quota_resumer.sha256_file(path) for path in candidate_paths
+            ]
+
+            self.assertEqual(v6_exhaustion_finalizer.run(args), 0)
+            self.assertEqual(v6_exhaustion_finalizer.run(args), 0)
+
+            hashes_after = [
+                v6_quota_resumer.sha256_file(path) for path in candidate_paths
+            ]
+            finalized = json.loads(
+                (run_dir / "generation_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(hashes_after, hashes_before)
+            self.assertEqual(finalized["quality_gate"], "PASS")
+            self.assertEqual(finalized["targets_formally_abstained"], ["3ZGC"])
+            self.assertEqual(
+                finalized["unresolved_targets_below_pre_permeability_quota"],
+                [],
+            )
+            self.assertEqual(finalized["effective_structure_target_count"], 0)
+            self.assertEqual(finalized["effective_planned_structure_handoff"], 0)
+
+            independent_report = triple_auditor.audit(
+                run_dir,
+                plan_path,
+                prior_path,
+                temporary / "triple_audit",
+            )
+            self.assertEqual(independent_report["quality_gate"], "PASS")
+            self.assertEqual(
+                independent_report["release_status"],
+                "READY_FOR_MANUAL_SCIENTIFIC_REVIEW_WITH_FORMAL_TARGET_ABSTENTION",
+            )
+            pass_3 = independent_report[
+                "pass_3_novelty_coverage_workflow"
+            ]
+            self.assertEqual(
+                pass_3["independently_verified_formal_target_abstentions"],
+                ["3ZGC"],
+            )
+            self.assertEqual(pass_3["unresolved_quota_shortfalls"], [])
+
+            eligible_path = run_dir / "methylated_new_candidates.csv"
+            eligible_path.write_bytes(eligible_path.read_bytes() + b"\n")
+            tampered_report = triple_auditor.audit(
+                run_dir,
+                plan_path,
+                prior_path,
+                temporary / "triple_audit_after_hash_tamper",
+            )
+            self.assertEqual(tampered_report["quality_gate"], "FAIL")
+            self.assertFalse(
+                tampered_report["pass_1_integrity"]["checks"][
+                    "formal_target_abstention_metadata_and_candidate_hashes_are_valid"
+                ]
+            )
 
     def test_v6_quota_resume_validates_complete_source_rows_before_sampling(self):
         validated = {
