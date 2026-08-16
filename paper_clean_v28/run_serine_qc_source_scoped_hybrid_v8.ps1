@@ -83,7 +83,7 @@ $V8BaselineProtocol = "temperature_0.5_source_scoped_hybrid_v8_reannotation_of_p
 $V8SearchProtocol = "deterministic_missing_target_directed_recovery_v8"
 $V8RecoveredProtocol = "immutable_baseline_plus_directed_recovery_overlay_v8"
 $V8RecoveredAuditProtocol = "independent_three_pass_source_scoped_recovery_v8"
-$NaturalExpertTokensJson = '["A","C","D","E","F","G","H","I","K","L","M","N","P","Q","R","S","T","V","W","Y"]'
+$NaturalExpertTokensCsv = "A,C,D,E,F,G,H,I,K,L,M,N,P,Q,R,S,T,V,W,Y"
 $ExpectedV6AllSha = "1ab4791c09a1b2428b1a84894d13bb8c4049ba580df05bebd93c263a2e4e634c"
 $ExpectedV6ManifestSha = "067a22a2175c97cf483e64967168eefc676389e302c9acc79a66c70e8290711f"
 
@@ -142,6 +142,41 @@ function Invoke-PythonStage {
     & $PythonPath @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "$Stage failed with exit code $LASTEXITCODE"
+    }
+}
+
+function Invoke-PythonProgram {
+    param(
+        [string]$PythonPath,
+        [string]$Program,
+        [string]$Stage
+    )
+    # Windows PowerShell 5.1 strips nested quotes from some `python -c`
+    # arguments and can promote native stderr into a terminating error.  Run
+    # embedded probes from a temporary .py file and preserve their full output.
+    $Stem = "proteinmpnn_serine_v8_$([Guid]::NewGuid().ToString('N'))"
+    $ProgramPath = Join-Path ([System.IO.Path]::GetTempPath()) ($Stem + ".py")
+    $StdoutPath = Join-Path ([System.IO.Path]::GetTempPath()) ($Stem + ".stdout.txt")
+    $StderrPath = Join-Path ([System.IO.Path]::GetTempPath()) ($Stem + ".stderr.txt")
+    try {
+        $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($ProgramPath, $Program, $Utf8NoBom)
+        & $PythonPath $ProgramPath 1> $StdoutPath 2> $StderrPath
+        $ProgramExitCode = $LASTEXITCODE
+        foreach ($OutputPath in @($StdoutPath, $StderrPath)) {
+            if (Test-Path -LiteralPath $OutputPath -PathType Leaf) {
+                Get-Content -LiteralPath $OutputPath | ForEach-Object { Write-Host $_ }
+            }
+        }
+        if ($ProgramExitCode -ne 0) {
+            throw "$Stage failed with exit code $ProgramExitCode"
+        }
+    } finally {
+        foreach ($TemporaryPath in @($ProgramPath, $StdoutPath, $StderrPath)) {
+            if (Test-Path -LiteralPath $TemporaryPath) {
+                Remove-Item -LiteralPath $TemporaryPath -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
 }
 
@@ -724,9 +759,10 @@ $SourceHashesBefore = Get-SourceHashSnapshot
 
 $ResolvedPython = Resolve-PythonExecutable
 $Probe = 'import json, torch; print(json.dumps({"torch": torch.__version__, "cuda": bool(torch.cuda.is_available()), "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None}))'
-Invoke-PythonStage $ResolvedPython "Python/PyTorch preflight" @("-c", $Probe)
+Invoke-PythonProgram $ResolvedPython $Probe "Python/PyTorch preflight"
 if (-not $AllowCpu) {
-    Invoke-PythonStage $ResolvedPython "CUDA preflight" @("-c", "import sys, torch; sys.exit(0 if torch.cuda.is_available() else 3)")
+    $CudaProbe = 'import sys, torch; sys.exit(0 if torch.cuda.is_available() else 3)'
+    Invoke-PythonProgram $ResolvedPython $CudaProbe "CUDA preflight"
 }
 $DeviceArguments = if ($AllowCpu) { @("--device", "auto", "--allow-cpu") } else { @("--device", "cuda") }
 
@@ -870,7 +906,7 @@ try {
             "--expected-source-manifest-sha256", $ExpectedV6ManifestSha,
             "--expected-expert-protocol", $V8ExpertProtocol,
             "--expected-expert-scope", "residue-source-scoped-hybrid",
-            "--expected-active-expert-tokens-json", $NaturalExpertTokensJson,
+            "--expected-active-expert-tokens-csv", $NaturalExpertTokensCsv,
             "--expected-representation-protocol", $V8RepresentationProtocol,
             "--expected-representation-authorization", $V8RepresentationAuthorization,
             "--output-protocol", $V8BaselineProtocol,

@@ -561,11 +561,27 @@ def run(args: argparse.Namespace) -> None:
     expert_manifest = read_json(expert_manifest_path)
     representation_audit = read_json(representation_audit_path)
     checkpoint_sha256 = sha256_file(model_path)
-    expected_active_tokens = json.loads(str(args.expected_active_expert_tokens_json))
-    if not isinstance(expected_active_tokens, list) or not all(
-        isinstance(value, str) for value in expected_active_tokens
+    if args.expected_active_expert_tokens_csv is not None:
+        expected_active_tokens = [
+            value.strip()
+            for value in str(args.expected_active_expert_tokens_csv).split(",")
+        ]
+    else:
+        expected_active_tokens = json.loads(
+            str(args.expected_active_expert_tokens_json)
+        )
+    if (
+        not isinstance(expected_active_tokens, list)
+        or not expected_active_tokens
+        or not all(
+            isinstance(value, str) and bool(value)
+            for value in expected_active_tokens
+        )
+        or len(set(expected_active_tokens)) != len(expected_active_tokens)
     ):
-        raise ValueError("--expected-active-expert-tokens-json must be a JSON list")
+        raise ValueError(
+            "Expected active expert tokens must be a non-empty unique list"
+        )
     if not (
         expert_manifest.get("quality_gate") == "PASS"
         and expert_manifest.get("protocol") == args.expected_expert_protocol
@@ -1003,6 +1019,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--expected-active-expert-tokens-json", default='["S"]'
     )
+    parser.add_argument("--expected-active-expert-tokens-csv")
     parser.add_argument(
         "--expected-representation-protocol",
         default=V7_REPRESENTATION_AUDIT_PROTOCOL,

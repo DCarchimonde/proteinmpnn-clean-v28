@@ -4,6 +4,7 @@ import ast
 import hashlib
 import importlib.util
 import math
+import re
 import sys
 import tempfile
 import unittest
@@ -638,6 +639,37 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
             '$V7Source = Assert-SourceModel $V7Checkpoint',
             source,
         )
+
+    def test_runner_executes_embedded_python_without_powershell_c_quoting(self):
+        runner = (
+            ROOT
+            / "paper_clean_v28"
+            / "run_serine_qc_source_scoped_hybrid_v8.ps1"
+        )
+        source = runner.read_text(encoding="utf-8")
+        self.assertIn("function Invoke-PythonProgram", source)
+        self.assertIn(
+            'Invoke-PythonProgram $ResolvedPython $Probe "Python/PyTorch preflight"',
+            source,
+        )
+        self.assertIn(
+            'Invoke-PythonProgram $ResolvedPython $CudaProbe "CUDA preflight"',
+            source,
+        )
+        self.assertNotIn('@("-c", $Probe)', source)
+        self.assertNotIn('"CUDA preflight" @("-c"', source)
+        self.assertNotIn("NaturalExpertTokensJson", source)
+        self.assertIn(
+            '"--expected-active-expert-tokens-csv", $NaturalExpertTokensCsv',
+            source,
+        )
+        programs = re.findall(
+            r"\$(?:Probe|CudaProbe) = '([^'\r\n]+)'",
+            source,
+        )
+        self.assertEqual(len(programs), 2)
+        for program in programs:
+            compile(program, "<V8 PowerShell embedded Python>", "exec")
 
     def test_search_budget_trace_and_candidate_provenance_are_hard_gated(self):
         source = (RETRAIN_DIR / "14_directed_recovery_search_v8.py").read_text(
