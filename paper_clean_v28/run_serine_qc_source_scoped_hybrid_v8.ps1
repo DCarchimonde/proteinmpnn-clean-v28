@@ -220,6 +220,58 @@ function Assert-PassedManifest {
     return $Payload
 }
 
+function Assert-RetryablePreFixV8ModelFailure {
+    param([string]$ManifestPath)
+    $Manifest = Read-JsonFile $ManifestPath
+    if ([string]$Manifest.quality_gate -ne "FAIL" -or
+        [string]$Manifest.protocol -ne $V8ExpertProtocol -or
+        [string]$Manifest.release_status -ne "BLOCKED_SOURCE_COMPOSITION_OR_NONINFERIORITY_FAILURE" -or
+        $null -ne $Manifest.output_checkpoint) {
+        throw "Existing V8 model output is not the recognized pre-fix failed composition"
+    }
+    $FalseChecks = @(
+        $Manifest.quality_checks.PSObject.Properties |
+            Where-Object { -not [bool]$_.Value } |
+            ForEach-Object { [string]$_.Name }
+    )
+    Assert-SameStringSet -Observed $FalseChecks -Expected @("serine_auc_is_non_inferior_to_v6") -Stage "pre-fix V8 failed checks"
+    $ExpectedCandidate = Join-Path $ModelOut "frankenstein_v28_source_scoped_hybrid_v8.candidate.pt"
+    if (-not ([System.IO.Path]::GetFullPath([string]$Manifest.candidate_checkpoint)).Equals(
+        [System.IO.Path]::GetFullPath($ExpectedCandidate),
+        [System.StringComparison]::OrdinalIgnoreCase
+    ) -or
+        -not (Test-Path -LiteralPath $ExpectedCandidate -PathType Leaf) -or
+        (Get-Sha256 $ExpectedCandidate) -ne [string]$Manifest.checkpoint_artifact_sha256 -or
+        (Test-Path -LiteralPath $V8Checkpoint -PathType Leaf)) {
+        throw "Existing pre-fix V8 candidate checkpoint is missing, changed, or promoted"
+    }
+    if ([string]$Manifest.canonical_checkpoint_sha256 -ne (Get-Sha256 $CanonicalCheckpoint) -or
+        [string]$Manifest.v6_checkpoint_sha256 -ne (Get-Sha256 $V6Checkpoint) -or
+        [string]$Manifest.v6_manifest_sha256 -ne (Get-Sha256 $V6ExpertManifest) -or
+        [string]$Manifest.v7_checkpoint_sha256 -ne (Get-Sha256 $V7Checkpoint) -or
+        [string]$Manifest.v7_manifest_sha256 -ne (Get-Sha256 $V7ExpertManifest) -or
+        [string]$Manifest.test_jsonl_sha256 -ne (Get-Sha256 $TestJsonl)) {
+        throw "Existing pre-fix V8 failure belongs to different immutable inputs"
+    }
+    Assert-ArtifactHashes $Manifest.artifacts $ModelOut "pre-fix V8 failed composition"
+    Assert-SameStringSet -Observed @($Manifest.artifacts.PSObject.Properties | ForEach-Object { $_.Name }) -Expected @("metric_comparison", "metrics_by_residue", "position_probabilities") -Stage "pre-fix V8 failed artifacts"
+    Assert-ArtifactLeafExact $Manifest.artifacts.metric_comparison (Join-Path $ModelOut "v6_v7_v8_metric_comparison.csv") "pre-fix V8 failed composition" "metric_comparison"
+    Assert-ArtifactLeafExact $Manifest.artifacts.metrics_by_residue (Join-Path $ModelOut "test_metrics_by_residue.csv") "pre-fix V8 failed composition" "metrics_by_residue"
+    Assert-ArtifactLeafExact $Manifest.artifacts.position_probabilities (Join-Path $ModelOut "test_position_probabilities.csv") "pre-fix V8 failed composition" "position_probabilities"
+    $ObservedFiles = @(
+        Get-ChildItem -LiteralPath $ModelOut -File |
+            ForEach-Object { $_.Name }
+    )
+    Assert-SameStringSet -Observed $ObservedFiles -Expected @(
+        "expert_source_composition_manifest.json",
+        "frankenstein_v28_source_scoped_hybrid_v8.candidate.pt",
+        "test_metrics_by_residue.csv",
+        "test_position_probabilities.csv",
+        "v6_v7_v8_metric_comparison.csv"
+    ) -Stage "pre-fix V8 failed directory"
+    return $Manifest
+}
+
 function Assert-ArtifactNode {
     param(
         [object]$Node,
@@ -779,11 +831,22 @@ Write-Host "============================================================"
 
 Push-Location $RepoRoot
 try {
+    $RetryPreFixModelFailure = $false
     if (Test-Path -LiteralPath $V8ExpertManifest -PathType Leaf) {
-        $V8Model = Assert-PassedManifest $V8ExpertManifest $V8ExpertProtocol "V8 source-scoped model"
-        Write-Host "Model step: reused passed V8 source-scoped checkpoint"
-    } else {
-        Assert-EmptyOrAbsentDirectory $ModelOut "V8 model composition"
+        $ExistingV8Model = Read-JsonFile $V8ExpertManifest
+        if ([string]$ExistingV8Model.quality_gate -eq "PASS") {
+            $V8Model = Assert-PassedManifest $V8ExpertManifest $V8ExpertProtocol "V8 source-scoped model"
+            Write-Host "Model step: reused passed V8 source-scoped checkpoint"
+        } else {
+            $null = Assert-RetryablePreFixV8ModelFailure $V8ExpertManifest
+            $RetryPreFixModelFailure = $true
+            Write-Host "Model step: safely replacing the hash-verified pre-fix Ser-AUC failure"
+        }
+    }
+    if ($null -eq $V8Model) {
+        if (-not $RetryPreFixModelFailure) {
+            Assert-EmptyOrAbsentDirectory $ModelOut "V8 model composition"
+        }
         $Arguments = @(
             $Composer,
             "--canonical-model", $CanonicalCheckpoint,
@@ -797,6 +860,9 @@ try {
             "--temperature", 0.5,
             "--threshold", 0.6
         ) + $DeviceArguments
+        if ($RetryPreFixModelFailure) {
+            $Arguments += "--overwrite"
+        }
         Invoke-PythonStage $ResolvedPython "V8 source-scoped checkpoint composition and paired audit" $Arguments
         $V8Model = Assert-PassedManifest $V8ExpertManifest $V8ExpertProtocol "V8 source-scoped model"
     }
@@ -807,8 +873,9 @@ try {
         throw "V8 model paired audit used a non-frozen batch size"
     }
     Assert-ArtifactHashes $V8Model.artifacts $ModelOut "V8 source-scoped model"
-    Assert-SameStringSet -Observed @($V8Model.artifacts.PSObject.Properties | ForEach-Object { $_.Name }) -Expected @("metric_comparison", "metrics_by_residue", "position_probabilities") -Stage "V8 model artifacts"
+    Assert-SameStringSet -Observed @($V8Model.artifacts.PSObject.Properties | ForEach-Object { $_.Name }) -Expected @("metric_comparison", "frozen_source_route_comparison", "metrics_by_residue", "position_probabilities") -Stage "V8 model artifacts"
     Assert-ArtifactLeafExact $V8Model.artifacts.metric_comparison (Join-Path $ModelOut "v6_v7_v8_metric_comparison.csv") "V8 source-scoped model" "metric_comparison"
+    Assert-ArtifactLeafExact $V8Model.artifacts.frozen_source_route_comparison (Join-Path $ModelOut "frozen_source_route_comparison.csv") "V8 source-scoped model" "frozen_source_route_comparison"
     Assert-ArtifactLeafExact $V8Model.artifacts.metrics_by_residue (Join-Path $ModelOut "test_metrics_by_residue.csv") "V8 source-scoped model" "metrics_by_residue"
     Assert-ArtifactLeafExact $V8Model.artifacts.position_probabilities (Join-Path $ModelOut "test_position_probabilities.csv") "V8 source-scoped model" "position_probabilities"
     if ([string]$V8Model.canonical_checkpoint_sha256 -ne (Get-Sha256 $CanonicalCheckpoint) -or
@@ -833,7 +900,12 @@ try {
         -not [bool]$V8Model.quality_checks.recall_at_0_6_is_non_inferior_to_v6 -or
         -not [bool]$V8Model.quality_checks.f1_at_0_6_is_non_inferior_to_v6 -or
         -not [bool]$V8Model.quality_checks.non_ser_recall_at_0_6_is_non_inferior_to_v6 -or
-        -not [bool]$V8Model.quality_checks.non_ser_f1_at_0_6_is_non_inferior_to_v6) {
+        -not [bool]$V8Model.quality_checks.non_ser_f1_at_0_6_is_non_inferior_to_v6 -or
+        -not [bool]$V8Model.quality_checks.frozen_source_routed_recall_is_non_inferior_to_v6 -or
+        -not [bool]$V8Model.quality_checks.frozen_source_routed_f1_is_non_inferior_to_v6 -or
+        -not [bool]$V8Model.quality_checks.serine_auc_is_non_inferior_to_v6 -or
+        -not [bool]$V8Model.quality_checks.runtime_replay_serine_auc_ge_0_70 -or
+        $null -eq $V8Model.metric_gate_provenance.frozen_source_route) {
         throw "V8 source/probability inheritance or non-inferiority gate is not proven"
     }
 
@@ -1175,6 +1247,7 @@ try {
             "model/expert_source_composition_manifest.json" = $V8ExpertManifest
             "model/frankenstein_v28_source_scoped_hybrid_v8.pt" = $V8Checkpoint
             "model/v6_v7_v8_metric_comparison.csv" = (Join-Path $ModelOut "v6_v7_v8_metric_comparison.csv")
+            "model/frozen_source_route_comparison.csv" = (Join-Path $ModelOut "frozen_source_route_comparison.csv")
             "model/test_metrics_by_residue.csv" = (Join-Path $ModelOut "test_metrics_by_residue.csv")
             "model/test_position_probabilities.csv" = (Join-Path $ModelOut "test_position_probabilities.csv")
             "representation/cyclic_representation_audit.json" = $V8Representation

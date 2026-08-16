@@ -88,6 +88,11 @@ EXPERT_KEYS = {
 }
 PROBABILITY_TOLERANCE = 1e-7
 METRIC_TOLERANCE = 1e-12
+EXPECTED_FROZEN_V6_CONFUSION = {"tp": 210, "tn": 1209, "fp": 35, "fn": 51}
+EXPECTED_FROZEN_V7_CONFUSION = {"tp": 133, "tn": 1230, "fp": 14, "fn": 128}
+EXPECTED_FROZEN_SERINE_CONFUSION = {"tp": 10, "tn": 57, "fp": 5, "fn": 2}
+EXPECTED_FROZEN_V6_SERINE_AUC = 705.0 / 744.0
+EXPECTED_FROZEN_V7_SERINE_AUC = 712.0 / 744.0
 
 
 def sha256_file(path: Path) -> str:
@@ -341,6 +346,185 @@ def metric_comparison_rows(
     return rows
 
 
+def confusion_counts(row: Mapping[str, Any], label: str) -> Dict[str, int]:
+    """Read and internally validate one frozen threshold-confusion payload."""
+
+    try:
+        counts = {name: int(row[name]) for name in ("tp", "tn", "fp", "fn")}
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"{label} lacks integer TP/TN/FP/FN counts") from exc
+    if any(value < 0 for value in counts.values()):
+        raise RuntimeError(f"{label} contains a negative confusion count")
+    return counts
+
+
+def threshold_metrics_from_counts(
+    counts: Mapping[str, int], threshold: float
+) -> Dict[str, Any]:
+    """Recompute the exact threshold metrics without model replay."""
+
+    tp = int(counts["tp"])
+    tn = int(counts["tn"])
+    fp = int(counts["fp"])
+    fn = int(counts["fn"])
+    total = tp + tn + fp + fn
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    f1 = 2.0 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return {
+        "threshold": float(threshold),
+        "accuracy": (tp + tn) / total if total else 0.0,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "false_positive_rate": fp / (fp + tn) if fp + tn else 0.0,
+        "pred_methyl_rate": (tp + fp) / total if total else 0.0,
+        "tp": tp,
+        "tn": tn,
+        "fp": fp,
+        "fn": fn,
+    }
+
+
+def frozen_source_route(
+    v6_manifest: Mapping[str, Any],
+    v7_manifest: Mapping[str, Any],
+    threshold: float,
+    temperature: float,
+) -> Dict[str, Any]:
+    """Derive the pre-V8 comparator from the immutable source manifests.
+
+    The V6 and V7 checkpoints were each promoted together with a held-out-test
+    summary.  Replaying a float32 CUDA model later is useful as an execution
+    audit, but it must not silently replace that already-frozen comparator:
+    near-tied scores can change rank or cross a strict threshold when CUDA
+    reduction shapes differ even though checkpoint and test hashes are
+    identical.  V8's tensor source rule lets its frozen threshold confusion be
+    derived exactly: V6 non-Ser counts plus V7 Ser counts.  Its Ser AUC is the
+    already-frozen V7 Ser AUC.
+    """
+
+    try:
+        v6 = dict(v6_manifest["corrected_test"])
+        v7 = dict(v7_manifest["corrected_test"])
+        v6_fixed = dict(v6["overall_at_threshold"])
+        v7_fixed = dict(v7["overall_at_threshold"])
+        v6_non_ser = dict(v6["non_ser_at_threshold"])
+        v7_ser = dict(v7["serine"])
+        v6_ser = dict(v6["serine"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("V6/V7 source manifests lack frozen test summaries") from exc
+
+    for label, summary in (("V6", v6), ("V7", v7)):
+        if (
+            int(summary.get("positions", -1)) != 1505
+            or float(summary.get("threshold", float("nan"))) != float(threshold)
+            or float(summary.get("deployment_temperature", float("nan")))
+            != float(temperature)
+        ):
+            raise RuntimeError(
+                f"{label} frozen source summary uses another test/deployment protocol"
+            )
+
+    v6_counts = confusion_counts(v6_fixed, "V6 frozen overall")
+    v7_counts = confusion_counts(v7_fixed, "V7 frozen overall")
+    v6_ser_counts = confusion_counts(v6_ser, "V6 frozen Ser")
+    v7_ser_counts = confusion_counts(v7_ser, "V7 frozen Ser")
+    v6_non_ser_counts = confusion_counts(v6_non_ser, "V6 frozen non-Ser")
+    if v6_counts != EXPECTED_FROZEN_V6_CONFUSION:
+        raise RuntimeError(
+            "V6 source manifest no longer contains the pre-V8 frozen comparator: "
+            f"{v6_counts}"
+        )
+    if v7_counts != EXPECTED_FROZEN_V7_CONFUSION:
+        raise RuntimeError(
+            "V7 source manifest no longer contains the pre-V8 frozen diagnostic: "
+            f"{v7_counts}"
+        )
+    if (
+        v6_ser_counts != EXPECTED_FROZEN_SERINE_CONFUSION
+        or v7_ser_counts != EXPECTED_FROZEN_SERINE_CONFUSION
+    ):
+        raise RuntimeError("V6/V7 frozen Ser threshold confusion changed")
+    recomposed_v6 = {
+        name: v6_non_ser_counts[name] + v6_ser_counts[name]
+        for name in ("tp", "tn", "fp", "fn")
+    }
+    if recomposed_v6 != v6_counts:
+        raise RuntimeError("V6 frozen Ser/non-Ser confusion does not sum to overall")
+    if v6_ser.get("auc") is None or v7_ser.get("auc") is None:
+        raise RuntimeError("V6/V7 frozen Ser AUC is absent")
+    auc_values = (float(v6_ser["auc"]), float(v7_ser["auc"]))
+    if not all(math.isfinite(value) and 0.0 <= value <= 1.0 for value in auc_values):
+        raise RuntimeError("V6/V7 frozen Ser AUC is non-finite or out of range")
+    if (
+        abs(auc_values[0] - EXPECTED_FROZEN_V6_SERINE_AUC) > METRIC_TOLERANCE
+        or abs(auc_values[1] - EXPECTED_FROZEN_V7_SERINE_AUC)
+        > METRIC_TOLERANCE
+    ):
+        raise RuntimeError(
+            "V6/V7 source manifests no longer contain the pre-V8 frozen Ser AUCs"
+        )
+
+    routed_counts = {
+        name: v6_non_ser_counts[name] + v7_ser_counts[name]
+        for name in ("tp", "tn", "fp", "fn")
+    }
+    routed_fixed = threshold_metrics_from_counts(routed_counts, threshold)
+    return {
+        "basis": (
+            "immutable_pre_v8_source_manifests; V6 non-Ser threshold counts plus "
+            "V7 Ser threshold counts; V7 Ser AUC"
+        ),
+        "v6": {
+            "overall_at_threshold": threshold_metrics_from_counts(
+                v6_counts, threshold
+            ),
+            "serine_auc": auc_values[0],
+        },
+        "v7": {
+            "overall_at_threshold": threshold_metrics_from_counts(
+                v7_counts, threshold
+            ),
+            "serine_auc": auc_values[1],
+        },
+        "v8_routed": {
+            "overall_at_threshold": routed_fixed,
+            "serine_auc": auc_values[1],
+            "non_ser_source": "V6",
+            "serine_source": "V7",
+        },
+    }
+
+
+def frozen_source_comparison_rows(route: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """Human-readable rows for the immutable source-derived V8 gate."""
+
+    v6 = route["v6"]
+    v7 = route["v7"]
+    v8 = route["v8_routed"]
+    accessors = {
+        "recall_at_0_6": lambda row: row["overall_at_threshold"]["recall"],
+        "f1_at_0_6": lambda row: row["overall_at_threshold"]["f1"],
+        "true_positives_at_0_6": lambda row: row["overall_at_threshold"]["tp"],
+        "false_negatives_at_0_6": lambda row: row["overall_at_threshold"]["fn"],
+        "false_positives_at_0_6": lambda row: row["overall_at_threshold"]["fp"],
+        "true_negatives_at_0_6": lambda row: row["overall_at_threshold"]["tn"],
+        "serine_auc": lambda row: row["serine_auc"],
+    }
+    return [
+        {
+            "metric": metric,
+            "v6_frozen": accessor(v6),
+            "v7_frozen": accessor(v7),
+            "v8_source_routed": accessor(v8),
+            "v8_minus_v6": float(accessor(v8)) - float(accessor(v6)),
+            "gate_basis": route["basis"],
+        }
+        for metric, accessor in accessors.items()
+    ]
+
+
 def run(args: argparse.Namespace) -> None:
     try:
         import torch
@@ -398,10 +582,21 @@ def run(args: argparse.Namespace) -> None:
     validate_source_manifests(
         v6_manifest, v7_manifest, v6_model_path, v7_model_path, test_path
     )
+    frozen_route = frozen_source_route(
+        v6_manifest,
+        v7_manifest,
+        float(args.threshold),
+        float(args.temperature),
+    )
 
-    canonical_payload = torch.load(canonical_path, map_location="cpu")
-    v6_payload = torch.load(v6_model_path, map_location="cpu")
-    v7_payload = torch.load(v7_model_path, map_location="cpu")
+    # These are hash-verified local workflow artifacts and contain provenance
+    # metadata in addition to tensors.  State the trusted full-payload policy
+    # explicitly so PyTorch does not emit its future-default warning.
+    canonical_payload = torch.load(
+        canonical_path, map_location="cpu", weights_only=False
+    )
+    v6_payload = torch.load(v6_model_path, map_location="cpu", weights_only=False)
+    v7_payload = torch.load(v7_model_path, map_location="cpu", weights_only=False)
     canonical_state = extract_state_dict(canonical_payload)
     v6_state = extract_state_dict(v6_payload)
     v7_state = extract_state_dict(v7_payload)
@@ -586,6 +781,11 @@ def run(args: argparse.Namespace) -> None:
     v8_ser = v8_summary["serine"]
     v6_non_ser = v6_summary["non_ser_at_threshold"]
     v8_non_ser = v8_summary["non_ser_at_threshold"]
+    frozen_v6 = frozen_route["v6"]
+    frozen_v7 = frozen_route["v7"]
+    frozen_v8 = frozen_route["v8_routed"]
+    frozen_v6_fixed = frozen_v6["overall_at_threshold"]
+    frozen_v8_fixed = frozen_v8["overall_at_threshold"]
     quality_checks = {
         "all_shared_tensors_are_canonical_bitwise_identical": all(
             hybrid_hashes[key] == canonical_hashes[key] for key in shared_keys
@@ -623,8 +823,20 @@ def run(args: argparse.Namespace) -> None:
             float(v8_non_ser["f1"]) + METRIC_TOLERANCE
             >= float(v6_non_ser["f1"])
         ),
+        "frozen_source_routed_recall_is_non_inferior_to_v6": (
+            float(frozen_v8_fixed["recall"]) + METRIC_TOLERANCE
+            >= float(frozen_v6_fixed["recall"])
+        ),
+        "frozen_source_routed_f1_is_non_inferior_to_v6": (
+            float(frozen_v8_fixed["f1"]) + METRIC_TOLERANCE
+            >= float(frozen_v6_fixed["f1"])
+        ),
         "serine_auc_is_non_inferior_to_v6": (
-            float(v8_ser["auc"]) + METRIC_TOLERANCE >= float(v6_ser["auc"])
+            float(frozen_v8["serine_auc"]) + METRIC_TOLERANCE
+            >= float(frozen_v6["serine_auc"])
+        ),
+        "runtime_replay_serine_auc_ge_0_70": (
+            v8_ser["auc"] is not None and float(v8_ser["auc"]) >= 0.70
         ),
         "overall_auc_ge_0_85": float(v8_summary["overall_auc"]) >= 0.85,
         "overall_precision_at_0_6_ge_0_75": float(v8_fixed["precision"]) >= 0.75,
@@ -637,12 +849,19 @@ def run(args: argparse.Namespace) -> None:
         checkpoint_artifact = production_path
 
     comparison_path = out_dir / "v6_v7_v8_metric_comparison.csv"
+    frozen_comparison_path = out_dir / "frozen_source_route_comparison.csv"
     residue_metrics_path = out_dir / "test_metrics_by_residue.csv"
     position_path = out_dir / "test_position_probabilities.csv"
     atomic_write_csv(
         comparison_path,
         comparison,
         list(comparison[0]),
+    )
+    frozen_comparison = frozen_source_comparison_rows(frozen_route)
+    atomic_write_csv(
+        frozen_comparison_path,
+        frozen_comparison,
+        list(frozen_comparison[0]),
     )
     atomic_write_csv(
         residue_metrics_path,
@@ -730,6 +949,39 @@ def run(args: argparse.Namespace) -> None:
             for token in NATURAL_AA_ALPHABET
         },
         "probability_inheritance_audit": inheritance,
+        "metric_gate_provenance": {
+            "frozen_source_route": frozen_route,
+            "runtime_replay_policy": (
+                "Fresh V6/V7/V8 CUDA replays prove position-level source inheritance "
+                "and deployment safety floors. The zero-margin Ser-AUC ordering gate "
+                "uses the immutable pre-V8 V6/V7 source-manifest summaries so a later "
+                "float32 replay cannot silently move the frozen comparator."
+            ),
+            "runtime_replay_drift_from_frozen_sources": {
+                "v6_recall_at_0_6": (
+                    float(v6_fixed["recall"])
+                    - float(frozen_v6_fixed["recall"])
+                ),
+                "v6_f1_at_0_6": (
+                    float(v6_fixed["f1"]) - float(frozen_v6_fixed["f1"])
+                ),
+                "v6_serine_auc": (
+                    float(v6_ser["auc"]) - float(frozen_v6["serine_auc"])
+                ),
+                "v7_recall_at_0_6": (
+                    float(v7_summary["overall_at_threshold"]["recall"])
+                    - float(frozen_v7["overall_at_threshold"]["recall"])
+                ),
+                "v7_f1_at_0_6": (
+                    float(v7_summary["overall_at_threshold"]["f1"])
+                    - float(frozen_v7["overall_at_threshold"]["f1"])
+                ),
+                "v7_serine_auc": (
+                    float(v7_summary["serine"]["auc"])
+                    - float(frozen_v7["serine_auc"])
+                ),
+            },
+        },
         "v6_test": v6_summary,
         "v7_test": v7_summary,
         "v8_test": v8_summary,
@@ -738,6 +990,10 @@ def run(args: argparse.Namespace) -> None:
             "metric_comparison": {
                 "path": str(comparison_path),
                 "sha256": sha256_file(comparison_path),
+            },
+            "frozen_source_route_comparison": {
+                "path": str(frozen_comparison_path),
+                "sha256": sha256_file(frozen_comparison_path),
             },
             "metrics_by_residue": {
                 "path": str(residue_metrics_path),
@@ -765,6 +1021,23 @@ def run(args: argparse.Namespace) -> None:
         f"{float(v6_fixed['f1']):.4f} -> "
         f"{float(v7_summary['overall_at_threshold']['f1']):.4f} -> "
         f"{float(v8_fixed['f1']):.4f}",
+        flush=True,
+    )
+    print(
+        "Frozen V6 -> routed V8 recall/F1@0.6: "
+        f"{float(frozen_v6_fixed['recall']):.4f}/"
+        f"{float(frozen_v6_fixed['f1']):.4f} -> "
+        f"{float(frozen_v8_fixed['recall']):.4f}/"
+        f"{float(frozen_v8_fixed['f1']):.4f}",
+        flush=True,
+    )
+    print(
+        "Ser AUC (runtime V6/V7/V8; frozen V6/routed V8): "
+        f"{float(v6_ser['auc']):.6f}/"
+        f"{float(v7_summary['serine']['auc']):.6f}/"
+        f"{float(v8_ser['auc']):.6f}; "
+        f"{float(frozen_v6['serine_auc']):.6f}/"
+        f"{float(frozen_v8['serine_auc']):.6f}",
         flush=True,
     )
     print(f"Checkpoint: {checkpoint_artifact}", flush=True)

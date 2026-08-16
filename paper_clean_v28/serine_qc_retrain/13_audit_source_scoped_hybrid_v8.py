@@ -299,7 +299,7 @@ def run(args: argparse.Namespace) -> None:
         raise RuntimeError("V8 model composition manifest is absent, failed, or stale")
 
     auditor = load_auditor_module()
-    payload = torch.load(model_path, map_location="cpu")
+    payload = torch.load(model_path, map_location="cpu", weights_only=False)
     metadata = (
         dict(payload.get("expert_head_qc_metadata", {}))
         if isinstance(payload, Mapping)

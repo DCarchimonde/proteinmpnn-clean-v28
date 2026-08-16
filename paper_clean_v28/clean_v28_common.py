@@ -587,7 +587,10 @@ class RobustHierarchicalProteinMPNN(ProteinMPNN):
 def load_v28_model(model_path: str, device: torch.device) -> RobustHierarchicalProteinMPNN:
     """严格加载 frankenstein_v28.pt。不做切片，不做防弹加载。"""
     model = RobustHierarchicalProteinMPNN(augment_eps=0.0).to(device)
-    checkpoint = torch.load(model_path, map_location=device)
+    # Workflow callers hash-pin these local checkpoints, which also carry
+    # non-tensor provenance metadata.  Keep full-payload loading explicit and
+    # avoid PyTorch's warning about the future default changing.
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing or unexpected:

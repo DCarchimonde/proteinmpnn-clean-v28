@@ -38,6 +38,19 @@ V8 不训练、不平均权重、不调阈值；来源规则是在 V6/V7 成对�
 - 最终必须 17/17、无正式弃权；不降 `>0.6` 阈值；搜索不能修改模型指标；
 - 只生成人工复核 ZIP，不生成尚哥 handoff，也不生成 permeability input。
 
+V8 的首次组合运行暴露了一个比较基准实现错误：程序重新在 CUDA 上回放 V6，
+得到 `Recall=0.8123`，而 V8 提出前、V6 获准时的不可变清单记录为 `0.8046`
+（`TP/FN=210/51`）。checkpoint 与 test hash 均未改变，因此后来回放不能替换
+已经冻结的比较基准，尤其不能用 float32 近并列排序移动零容差 AUC 门。修复后：
+
+- 本次 V6/V7/V8 同口径回放仍负责概率来源继承、Recall/F1 与安全下限；
+- Ser AUC 的 V6 非劣效门使用 V8 出现前已写入、hash 固定的 V6/V7 source
+  manifest；V8 Ser tensor 逐位来自 V7，因此冻结 V8 Ser AUC 也严格取 V7；
+- 额外输出 `frozen_source_route_comparison.csv`，同时保留本次 runtime replay
+  数值和它相对冻结来源的漂移，不能隐去不一致；
+- 只含该旧 Ser-AUC 失败且所有候选/CSV/source hash 均吻合的 partial model
+  目录可由 launcher 自动重建；其他 partial 或其他科学门失败仍拒绝覆盖。
+
 一次运行（已 PASS 的 V8 stage 会按 manifest/hash 复用；普通 partial 目录原样
 保留并停止，只有带配置 hash 的定向搜索 checkpoint 可以继续）：
 

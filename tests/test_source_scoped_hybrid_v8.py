@@ -130,6 +130,84 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             v8_composer.validate_finite_position_rows([bad], "bad")
 
+    def test_frozen_source_route_uses_pre_v8_manifests_not_runtime_replay(self):
+        def fixed(counts):
+            return v8_composer.threshold_metrics_from_counts(counts, 0.6)
+
+        serine_counts = dict(v8_composer.EXPECTED_FROZEN_SERINE_CONFUSION)
+        v6_counts = dict(v8_composer.EXPECTED_FROZEN_V6_CONFUSION)
+        v7_counts = dict(v8_composer.EXPECTED_FROZEN_V7_CONFUSION)
+        v6_non_ser = {
+            name: v6_counts[name] - serine_counts[name]
+            for name in ("tp", "tn", "fp", "fn")
+        }
+        v6 = {
+            "positions": 1505,
+            "threshold": 0.6,
+            "deployment_temperature": 0.5,
+            "overall_at_threshold": fixed(v6_counts),
+            "non_ser_at_threshold": fixed(v6_non_ser),
+            "serine": {**fixed(serine_counts), "auc": 0.9475806451612904},
+        }
+        v7 = {
+            "positions": 1505,
+            "threshold": 0.6,
+            "deployment_temperature": 0.5,
+            "overall_at_threshold": fixed(v7_counts),
+            "non_ser_at_threshold": fixed(
+                {
+                    name: v7_counts[name] - serine_counts[name]
+                    for name in ("tp", "tn", "fp", "fn")
+                }
+            ),
+            "serine": {**fixed(serine_counts), "auc": 0.956989247311828},
+        }
+        route = v8_composer.frozen_source_route(
+            {"corrected_test": v6},
+            {"corrected_test": v7},
+            0.6,
+            0.5,
+        )
+        self.assertEqual(
+            route["v8_routed"]["overall_at_threshold"]["tp"], 210
+        )
+        self.assertEqual(
+            route["v8_routed"]["overall_at_threshold"]["fp"], 35
+        )
+        self.assertAlmostEqual(
+            route["v8_routed"]["overall_at_threshold"]["recall"],
+            210 / 261,
+        )
+        self.assertAlmostEqual(
+            route["v8_routed"]["overall_at_threshold"]["f1"],
+            420 / 506,
+        )
+        self.assertGreaterEqual(
+            route["v8_routed"]["serine_auc"], route["v6"]["serine_auc"]
+        )
+        rows = v8_composer.frozen_source_comparison_rows(route)
+        self.assertEqual({row["metric"] for row in rows}, {
+            "recall_at_0_6",
+            "f1_at_0_6",
+            "true_positives_at_0_6",
+            "false_negatives_at_0_6",
+            "false_positives_at_0_6",
+            "true_negatives_at_0_6",
+            "serine_auc",
+        })
+
+        tampered = dict(v6)
+        tampered["overall_at_threshold"] = fixed(
+            {"tp": 211, "tn": 1209, "fp": 35, "fn": 50}
+        )
+        with self.assertRaises(RuntimeError):
+            v8_composer.frozen_source_route(
+                {"corrected_test": tampered},
+                {"corrected_test": v7},
+                0.6,
+                0.5,
+            )
+
     def test_six_residue_radius_two_neighborhood_has_5530_sorted_members(self):
         anchor = "GRKWNC"
         first = v8_search.hamming_neighborhood(anchor, radius=2)
@@ -670,6 +748,29 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
         self.assertEqual(len(programs), 2)
         for program in programs:
             compile(program, "<V8 PowerShell embedded Python>", "exec")
+
+    def test_runner_safely_retries_only_the_exact_pre_fix_auc_failure(self):
+        runner = (
+            ROOT
+            / "paper_clean_v28"
+            / "run_serine_qc_source_scoped_hybrid_v8.ps1"
+        )
+        source = runner.read_text(encoding="utf-8")
+        self.assertIn("function Assert-RetryablePreFixV8ModelFailure", source)
+        self.assertIn(
+            'Assert-SameStringSet -Observed $FalseChecks -Expected '
+            '@("serine_auc_is_non_inferior_to_v6")',
+            source,
+        )
+        self.assertIn('$Arguments += "--overwrite"', source)
+        self.assertIn(
+            '"frozen_source_route_comparison"',
+            source,
+        )
+        self.assertIn(
+            "frozen_source_routed_recall_is_non_inferior_to_v6",
+            source,
+        )
 
     def test_search_budget_trace_and_candidate_provenance_are_hard_gated(self):
         source = (RETRAIN_DIR / "14_directed_recovery_search_v8.py").read_text(
