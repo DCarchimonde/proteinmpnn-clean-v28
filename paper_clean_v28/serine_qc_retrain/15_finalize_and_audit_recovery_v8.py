@@ -69,6 +69,12 @@ V8_REPRESENTATION_AUTHORIZATION = (
 V8_SEARCH_PROTOCOL = "deterministic_missing_target_directed_recovery_v8"
 V8_FINAL_PROTOCOL = "immutable_baseline_plus_directed_recovery_overlay_v8"
 V8_AUDIT_PROTOCOL = "independent_three_pass_source_scoped_recovery_v8"
+V8_MODEL_ARTIFACT_FILENAMES = {
+    "metric_comparison": "v6_v7_v8_metric_comparison.csv",
+    "serine_auc_tradeoff_audit": "serine_auc_tradeoff_audit.csv",
+    "metrics_by_residue": "test_metrics_by_residue.csv",
+    "position_probabilities": "test_position_probabilities.csv",
+}
 EXPECTED_BASELINE_ROWS = 31_500
 EXPECTED_TARGETS = 17
 THRESHOLD = 0.6
@@ -803,12 +809,8 @@ def run(args: argparse.Namespace) -> None:
         and artifact_map_matches_exact_paths(
             model_artifacts,
             {
-                "metric_comparison": model_manifest_path.parent
-                / "v6_v7_v8_metric_comparison.csv",
-                "metrics_by_residue": model_manifest_path.parent
-                / "test_metrics_by_residue.csv",
-                "position_probabilities": model_manifest_path.parent
-                / "test_position_probabilities.csv",
+                name: model_manifest_path.parent / filename
+                for name, filename in V8_MODEL_ARTIFACT_FILENAMES.items()
             },
         )
     ):

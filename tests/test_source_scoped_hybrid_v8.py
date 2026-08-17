@@ -399,6 +399,40 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
             first.write_bytes(first.read_bytes() + b"tamper")
             self.assertFalse(v8_search.artifact_hashes_match(artifact))
 
+    def test_search_and_finalizer_accept_the_complete_v8_model_artifact_contract(self):
+        expected = {
+            "metric_comparison": "v6_v7_v8_metric_comparison.csv",
+            "serine_auc_tradeoff_audit": "serine_auc_tradeoff_audit.csv",
+            "metrics_by_residue": "test_metrics_by_residue.csv",
+            "position_probabilities": "test_position_probabilities.csv",
+        }
+        self.assertEqual(v8_search.V8_MODEL_ARTIFACT_FILENAMES, expected)
+        self.assertEqual(v8_finalizer.V8_MODEL_ARTIFACT_FILENAMES, expected)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifacts = {}
+            expected_paths = {}
+            for logical_name, filename in expected.items():
+                path = root / filename
+                path.write_text(logical_name, encoding="utf-8")
+                artifacts[logical_name] = {
+                    "path": str(path),
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+                expected_paths[logical_name] = path
+            for module in (v8_search, v8_finalizer):
+                self.assertTrue(
+                    module.artifact_map_matches_exact_paths(
+                        artifacts, expected_paths
+                    )
+                )
+                legacy = dict(artifacts)
+                legacy.pop("serine_auc_tradeoff_audit")
+                self.assertFalse(
+                    module.artifact_map_matches_exact_paths(legacy, expected_paths)
+                )
+
     def test_zgc_resume_state_is_reconstructed_from_ledgers(self):
         def provenance(sequence, source="test_anchor"):
             return {
