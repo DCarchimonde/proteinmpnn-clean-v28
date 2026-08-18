@@ -1008,11 +1008,14 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
         v2_bootstrap = (ROOT / "recover_v8_autodl_cyclic_v2.sh").read_text(
             encoding="utf-8"
         )
-        self.assertIn("cda853e790f1cf37c0e5cdb2c01bf4dcd11f014b", v2_bootstrap)
+        self.assertIn("b86aee7562822637c49799121e2ad04ca24d8061", v2_bootstrap)
         self.assertIn("sha256sum -c", v2_bootstrap)
-        self.assertIn("codeload.github.com", v2_bootstrap)
+        self.assertIn("raw.githubusercontent.com", v2_bootstrap)
         self.assertIn("--retry-all-errors", v2_bootstrap)
         self.assertIn("run_v8_autodl_recovery_v2.sh", v2_bootstrap)
+        self.assertIn("Stopping verified old V2 process tree", v2_bootstrap)
+        self.assertIn("hash_pinned_v2_round_inflight_resume_v1", v2_bootstrap)
+        self.assertIn("约 0.1 MB", v2_bootstrap)
         self.assertNotIn("git clone", v2_bootstrap)
         self.assertNotIn("tmux", v2_bootstrap)
 
