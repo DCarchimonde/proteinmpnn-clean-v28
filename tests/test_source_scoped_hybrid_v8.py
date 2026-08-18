@@ -56,6 +56,10 @@ v8_cyclic_finalizer = load_module(
     "source_scoped_hybrid_v8_cyclic_base_finalizer",
     RETRAIN_DIR / "18_finalize_and_audit_recovery_v2.py",
 )
+v8_full_frontier = load_module(
+    "source_scoped_hybrid_v8_full_frontier_v3",
+    RETRAIN_DIR / "20_full_frontier_recovery_v3.py",
+)
 
 
 class FakeTensor:
@@ -84,6 +88,7 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
             "15_finalize_and_audit_recovery_v8.py",
             "17_cyclic_base_recovery_v2.py",
             "18_finalize_and_audit_recovery_v2.py",
+            "20_full_frontier_recovery_v3.py",
         ):
             source = (RETRAIN_DIR / name).read_text(encoding="utf-8")
             ast.parse(source, filename=name)
@@ -1335,6 +1340,261 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
             v8_cyclic_finalizer.V2_AUDIT_PROTOCOL,
             "independent_three_pass_cyclic_base_recovery_v8_v2",
         )
+
+    def test_v3_surrogate_is_deterministic_and_acquisition_only(self):
+        alphabet = v8_cyclic_recovery.NATURAL_AA
+        rng = random.Random(19)
+        rows = []
+        sequences = set()
+        while len(sequences) < 600:
+            sequences.add("".join(rng.choice(alphabet) for _ in range(7)))
+        for sequence in sorted(sequences):
+            value = (
+                -3.0
+                + 0.4 * (sequence[0] == "G")
+                + 0.7 * (sequence[-1] == "S")
+                + 0.9 * (sequence[-2:] == "GS")
+            )
+            rows.append(
+                {
+                    "sequence": sequence,
+                    "cyclic_base_log_probability_mean": value,
+                }
+            )
+        left = v8_full_frontier.KmerBaseSurrogate(alphabet, 7)
+        right = v8_full_frontier.KmerBaseSurrogate(alphabet, 7)
+        left_report = left.fit(rows)
+        right_report = right.fit(list(reversed(rows)))
+        probes = sorted(sequences)[:50]
+        self.assertEqual(left.predict(probes), right.predict(probes))
+        self.assertEqual(left_report, right_report)
+        self.assertFalse(left_report["release_decisions_use_surrogate"])
+        self.assertEqual(left_report["surrogate_use"], "ACQUISITION_RANKING_ONLY")
+
+    def test_v3_frontier_retains_every_strict_row_and_both_objectives(self):
+        alphabet = v8_cyclic_recovery.NATURAL_AA
+        rng = random.Random(23)
+        exact = []
+        candidate = []
+        sequences = set()
+        while len(sequences) < 900:
+            sequences.add("".join(rng.choice(alphabet) for _ in range(7)))
+        for index, sequence in enumerate(sorted(sequences)):
+            base = -3.5 + 0.003 * index + 0.7 * (sequence[-2:] == "GS")
+            exact.append(
+                {
+                    "sequence": sequence,
+                    "cyclic_base_log_probability_mean": base,
+                }
+            )
+            candidate.append(
+                {
+                    "sequence": sequence,
+                    "maximum_probability": 0.64 if index < 9 else 0.1 + index / 3000,
+                    "passes_strict_probability": int(index < 9),
+                    "argmax_position_1based": index % 7 + 1,
+                }
+            )
+        surrogate = v8_full_frontier.KmerBaseSurrogate(alphabet, 7)
+        surrogate.fit(exact)
+        selected = v8_full_frontier.select_surrogate_frontier(
+            rows=candidate,
+            surrogate=surrogate,
+            limit=128,
+            length=7,
+            floor=-2.1,
+            diversity_fill=v8_cyclic_recovery.deterministic_diversity_fill,
+        )
+        selected_sequences = {row["sequence"] for row in selected}
+        strict_sequences = {
+            row["sequence"] for row in candidate if row["passes_strict_probability"]
+        }
+        self.assertEqual(len(selected_sequences), 128)
+        self.assertTrue(strict_sequences <= selected_sequences)
+        self.assertTrue(
+            all("surrogate_cyclic_base_log_probability_mean" in row for row in selected)
+        )
+
+    def test_v3_frontier_refuses_to_drop_strict_rows_for_a_small_width(self):
+        alphabet = v8_cyclic_recovery.NATURAL_AA
+        rng = random.Random(29)
+        sequences = set()
+        while len(sequences) < 300:
+            sequences.add("".join(rng.choice(alphabet) for _ in range(7)))
+        exact = [
+            {
+                "sequence": sequence,
+                "cyclic_base_log_probability_mean": -3.0 + index / 1000,
+            }
+            for index, sequence in enumerate(sorted(sequences))
+        ]
+        candidates = [
+            {
+                "sequence": row["sequence"],
+                "maximum_probability": 0.7,
+                "passes_strict_probability": 1,
+                "argmax_position_1based": index % 7 + 1,
+            }
+            for index, row in enumerate(exact)
+        ]
+        surrogate = v8_full_frontier.KmerBaseSurrogate(alphabet, 7)
+        surrogate.fit(exact)
+        with self.assertRaises(RuntimeError):
+            v8_full_frontier.select_surrogate_frontier(
+                rows=candidates,
+                surrogate=surrogate,
+                limit=128,
+                length=7,
+                floor=-2.1,
+                diversity_fill=v8_cyclic_recovery.deterministic_diversity_fill,
+            )
+
+    def test_v3_frontier_balances_objectives_and_physical_positions_before_fill(self):
+        alphabet = v8_cyclic_recovery.NATURAL_AA
+        rng = random.Random(31)
+        sequences = set()
+        while len(sequences) < 700:
+            sequences.add("".join(rng.choice(alphabet) for _ in range(7)))
+        ordered = sorted(sequences)
+        rows = []
+        predicted = {}
+        for index, sequence in enumerate(ordered):
+            rows.append(
+                {
+                    "sequence": sequence,
+                    "maximum_probability": 0.95 - index / 2000,
+                    "passes_strict_probability": int(index < 11),
+                    "argmax_position_1based": index % 7 + 1,
+                }
+            )
+            predicted[sequence] = -8.0 + index / 100
+
+        class FixedSurrogate:
+            def predict(self, values):
+                return {value: predicted[value] for value in sorted(set(values))}
+
+        kwargs = {
+            "surrogate": FixedSurrogate(),
+            "limit": 128,
+            "length": 7,
+            "floor": -2.1,
+            "diversity_fill": v8_cyclic_recovery.deterministic_diversity_fill,
+        }
+        selected = v8_full_frontier.select_surrogate_frontier(rows=rows, **kwargs)
+        reversed_selected = v8_full_frontier.select_surrogate_frontier(
+            rows=list(reversed(rows)), **kwargs
+        )
+        selected_sequences = {row["sequence"] for row in selected}
+        self.assertEqual(
+            [row["sequence"] for row in selected],
+            [row["sequence"] for row in reversed_selected],
+        )
+        self.assertTrue({row["sequence"] for row in rows[:11]} <= selected_sequences)
+        self.assertIn(rows[0]["sequence"], selected_sequences)
+        self.assertIn(rows[-1]["sequence"], selected_sequences)
+        self.assertEqual(
+            {int(row["argmax_position_1based"]) for row in selected},
+            set(range(1, 8)),
+        )
+
+    def test_v3_exact_beam_balances_methyl_base_and_position_frontiers(self):
+        alphabet = v8_cyclic_recovery.NATURAL_AA
+        rng = random.Random(37)
+        sequences = set()
+        while len(sequences) < 900:
+            sequences.add("".join(rng.choice(alphabet) for _ in range(7)))
+        rows = []
+        for index, sequence in enumerate(sorted(sequences)):
+            rows.append(
+                {
+                    "sequence": sequence,
+                    "maximum_probability": 0.75 - index / 3000,
+                    "passes_strict_probability": int(index < 80),
+                    "argmax_position_1based": index % 7 + 1,
+                    "cyclic_base_log_probability_mean": -8.0 + index / 100,
+                }
+            )
+        kwargs = {
+            "limit": 128,
+            "length": 7,
+            "floor": -2.1,
+            "diversity_fill": v8_cyclic_recovery.deterministic_diversity_fill,
+        }
+        selected = v8_full_frontier.select_exact_dual_objective_beam(
+            rows=rows, **kwargs
+        )
+        reversed_selected = v8_full_frontier.select_exact_dual_objective_beam(
+            rows=list(reversed(rows)), **kwargs
+        )
+        selected_sequences = {row["sequence"] for row in selected}
+        self.assertEqual(len(selected_sequences), 128)
+        self.assertEqual(
+            [row["sequence"] for row in selected],
+            [row["sequence"] for row in reversed_selected],
+        )
+        self.assertIn(rows[0]["sequence"], selected_sequences)
+        self.assertIn(rows[-1]["sequence"], selected_sequences)
+        self.assertEqual(
+            {int(row["argmax_position_1based"]) for row in selected},
+            set(range(1, 8)),
+        )
+
+    def test_v3_source_contract_uses_all_legacy_rows_without_relaxing_gates(self):
+        source = (RETRAIN_DIR / "17_cyclic_base_recovery_v2.py").read_text(
+            encoding="utf-8"
+        )
+        helper = (RETRAIN_DIR / "20_full_frontier_recovery_v3.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("legacy_all_rows", source)
+        self.assertIn("prior_v2_exact_rows", source)
+        self.assertIn("legacy_baseline_overlap", source)
+        self.assertIn("select_exact_dual_objective_beam", source)
+        self.assertIn("surrogate_release_authority", source)
+        self.assertIn("strict_threshold_remains_greater_than_0_6", source)
+        self.assertIn("every_release_passes_cyclic_base_floor", source)
+        self.assertIn("ACQUISITION_RANKING_ONLY", helper)
+        self.assertNotIn("THRESHOLD = 0.5", helper)
+
+    def test_v3_finalizer_packager_and_runner_are_a_linked_offline_chain(self):
+        packager = load_module(
+            "v8_v3_packager_contract_test",
+            RETRAIN_DIR / "19_package_v8_recovery_v2.py",
+        )
+        self.assertEqual(
+            v8_cyclic_finalizer.V3_FINAL_PROTOCOL,
+            "immutable_baseline_plus_full_frontier_recovery_overlay_v8_v3",
+        )
+        self.assertEqual(
+            v8_cyclic_finalizer.V3_AUDIT_PROTOCOL,
+            "independent_three_pass_full_frontier_recovery_v8_v3",
+        )
+        self.assertEqual(
+            packager.PROTOCOL_CHAINS[v8_full_frontier.V3_SEARCH_PROTOCOL][:2],
+            (
+                v8_cyclic_finalizer.V3_FINAL_PROTOCOL,
+                v8_cyclic_finalizer.V3_AUDIT_PROTOCOL,
+            ),
+        )
+        search_source = (RETRAIN_DIR / "17_cyclic_base_recovery_v2.py").read_text(
+            encoding="utf-8"
+        )
+        package_source = (
+            RETRAIN_DIR / "19_package_v8_recovery_v2.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("prior_v2_failure_manifest.json", search_source)
+        self.assertIn("prior_v2_failure_search_trace.csv", search_source)
+        self.assertIn(
+            'artifact_leaves(search_manifest.get("artifacts"))', package_source
+        )
+        runner = (ROOT / "run_v8_autodl_recovery_v3.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("--frontier-v3", runner)
+        self.assertIn("--prior-v2-dir", runner)
+        self.assertIn("ALL V8 V3 FULL-FRONTIER AUTOMATED GATES PASSED", runner)
+        self.assertNotIn("curl ", runner)
+        self.assertNotIn("raw.githubusercontent.com", runner)
 
 
 if __name__ == "__main__":

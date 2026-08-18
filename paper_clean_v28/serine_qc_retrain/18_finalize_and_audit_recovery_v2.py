@@ -31,6 +31,7 @@ os.environ["CUBLAS_WORKSPACE_CONFIG"] = CUBLAS_WORKSPACE_CONFIG
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[2]
 SEARCH_V2_PATH = SCRIPT_PATH.with_name("17_cyclic_base_recovery_v2.py")
+FRONTIER_V3_PATH = SCRIPT_PATH.with_name("20_full_frontier_recovery_v3.py")
 LEGACY_SEARCH_PATH = SCRIPT_PATH.with_name("14_directed_recovery_search_v8.py")
 LEGACY_FINALIZER_PATH = SCRIPT_PATH.with_name("15_finalize_and_audit_recovery_v8.py")
 V7_AUDITOR_PATH = SCRIPT_PATH.with_name("11_triple_audit_serine_only_v7.py")
@@ -59,6 +60,11 @@ DEFAULT_PRIOR = (
 
 V2_FINAL_PROTOCOL = "immutable_baseline_plus_cyclic_base_recovery_overlay_v8_v2"
 V2_AUDIT_PROTOCOL = "independent_three_pass_cyclic_base_recovery_v8_v2"
+V3_SEARCH_PROTOCOL = "full_legacy_frontier_cyclic_base_recovery_v8_v3"
+V3_FINAL_PROTOCOL = (
+    "immutable_baseline_plus_full_frontier_recovery_overlay_v8_v3"
+)
+V3_AUDIT_PROTOCOL = "independent_three_pass_full_frontier_recovery_v8_v3"
 EXPECTED_BASELINE_ROWS = 31_500
 EXPECTED_TARGETS = 17
 THRESHOLD = 0.6
@@ -267,11 +273,38 @@ def run(args: argparse.Namespace) -> None:
     search_manifest = search_v2.read_json(
         search_dir / "cyclic_base_recovery_manifest.json"
     )
+    search_protocol = str(search_manifest.get("protocol", ""))
+    if search_protocol == search_v2.V2_SEARCH_PROTOCOL:
+        version_label = "V2"
+        final_protocol = V2_FINAL_PROTOCOL
+        audit_protocol = V2_AUDIT_PROTOCOL
+        frontier_contract_ok = True
+    elif search_protocol == V3_SEARCH_PROTOCOL:
+        version_label = "V3 FULL FRONTIER"
+        final_protocol = V3_FINAL_PROTOCOL
+        audit_protocol = V3_AUDIT_PROTOCOL
+        frontier_contract_ok = (
+            FRONTIER_V3_PATH.is_file()
+            and dict(search_manifest.get("config") or {}).get(
+                "frontier_v3_program_sha256"
+            )
+            == sha256_file(FRONTIER_V3_PATH)
+            and dict(search_manifest.get("config") or {}).get(
+                "surrogate_release_authority"
+            )
+            == "NONE_ACQUISITION_ONLY"
+            and dict(search_manifest.get("quality_checks") or {}).get(
+                "surrogate_is_acquisition_only_and_never_a_release_gate"
+            )
+            is True
+        )
+    else:
+        raise RuntimeError(f"Unsupported V8 recovery protocol: {search_protocol}")
     search_config = dict(search_manifest.get("config") or {})
     serine_provenance = dict(search_manifest.get("serine_provenance_gate") or {})
     if not (
         search_manifest.get("quality_gate") == "PASS"
-        and search_manifest.get("protocol") == search_v2.V2_SEARCH_PROTOCOL
+        and frontier_contract_ok
         and search_manifest.get("config_sha256")
         == search_v2.stable_json_sha256(search_config)
         and search_manifest.get("model_sha256") == sha256_file(model_path)
@@ -295,7 +328,9 @@ def run(args: argparse.Namespace) -> None:
         and dict(serine_provenance.get("expert_source_by_residue") or {}).get("S")
         == "v7_serine"
     ):
-        raise RuntimeError("V8 V2 search is failed, stale, or uses the wrong contract")
+        raise RuntimeError(
+            f"V8 {version_label} search is failed, stale, or uses the wrong contract"
+        )
     validate_artifacts_under(search_manifest.get("artifacts"), search_dir)
 
     baseline_hashes_before = {
@@ -744,7 +779,8 @@ def run(args: argparse.Namespace) -> None:
             if quality_gate == "PASS"
             else "BLOCKED_DO_NOT_SEND_TO_SHANGGE"
         ),
-        "protocol": V2_FINAL_PROTOCOL,
+        "protocol": final_protocol,
+        "search_protocol": search_protocol,
         "finalizer_program_sha256": sha256_file(SCRIPT_PATH),
         "search_program_sha256": sha256_file(SEARCH_V2_PATH),
         "model_sha256": sha256_file(model_path),
@@ -783,7 +819,8 @@ def run(args: argparse.Namespace) -> None:
     audit_report = {
         "quality_gate": quality_gate,
         "release_status": final_manifest["release_status"],
-        "protocol": V2_AUDIT_PROTOCOL,
+        "protocol": audit_protocol,
+        "search_protocol": search_protocol,
         "finalizer_program_sha256": sha256_file(SCRIPT_PATH),
         "search_program_sha256": sha256_file(SEARCH_V2_PATH),
         "python_version": platform.python_version(),
@@ -837,7 +874,10 @@ def run(args: argparse.Namespace) -> None:
     }
     if baseline_hashes_after != baseline_hashes_before:
         raise RuntimeError("Immutable V8 baseline changed during V2 final audit")
-    print("===== V8 V2 INDEPENDENT THREE-PASS AUDIT COMPLETE =====", flush=True)
+    print(
+        f"===== V8 {version_label} INDEPENDENT THREE-PASS AUDIT COMPLETE =====",
+        flush=True,
+    )
     print(f"Quality gate: {quality_gate}", flush=True)
     print(f"Target coverage: {EXPECTED_TARGETS - len(uncovered)}/{EXPECTED_TARGETS}", flush=True)
     print(f"Final candidates: {len(final_rows)}", flush=True)
@@ -852,7 +892,9 @@ def run(args: argparse.Namespace) -> None:
             )
             if value != "PASS"
         ]
-        raise RuntimeError("V8 V2 final audit failed: " + ", ".join(failed))
+        raise RuntimeError(
+            f"V8 {version_label} final audit failed: " + ", ".join(failed)
+        )
 
 
 def parse_args() -> argparse.Namespace:

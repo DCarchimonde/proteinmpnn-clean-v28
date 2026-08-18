@@ -361,3 +361,18 @@ paper_clean_v28_outputs/serine_qc_source_scoped_hybrid_v8/
 
 该 ZIP 可以交给尚哥进行人工科学复核，但仍不是结构计算 handoff；人工确认最终
 序列后再单独创建正式结构任务。
+
+## 当前 AutoDL 续跑：V8 V3 full frontier（仅 3ZGC）
+
+完成 V2 六轮且清单唯一失败项为
+`at_least_one_real_3zgc_candidate_is_released` 时，使用
+`run_v8_autodl_recovery_v3.sh`。该流程只为唯一缺失靶点 3ZGC 搜索；其余
+16 个靶点复用不可变的 31,500 行 V8 基线，末尾只做完整性、来源、物理点位和
+覆盖率终审。日志中的 3WNE 两条记录是固定的长度 6 对照，不是重新生成 3WNE。
+
+V3 的冻结协议、断点及失败语义见
+`V8_FULL_FRONTIER_RECOVERY_V3.md`。成功标志只能是：
+
+```text
+===== ALL V8 V3 FULL-FRONTIER AUTOMATED GATES PASSED =====
+```

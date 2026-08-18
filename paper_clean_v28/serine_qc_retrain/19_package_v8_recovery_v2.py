@@ -23,6 +23,15 @@ DEFAULT_OUTPUT = V8_ROOT / "v8_cyclic_base_v2_review_bundle.zip"
 SEARCH_PROTOCOL = "cyclic_start_base_pareto_recovery_v8_v2"
 FINAL_PROTOCOL = "immutable_baseline_plus_cyclic_base_recovery_overlay_v8_v2"
 AUDIT_PROTOCOL = "independent_three_pass_cyclic_base_recovery_v8_v2"
+V3_SEARCH_PROTOCOL = "full_legacy_frontier_cyclic_base_recovery_v8_v3"
+V3_FINAL_PROTOCOL = (
+    "immutable_baseline_plus_full_frontier_recovery_overlay_v8_v3"
+)
+V3_AUDIT_PROTOCOL = "independent_three_pass_full_frontier_recovery_v8_v3"
+PROTOCOL_CHAINS = {
+    SEARCH_PROTOCOL: (FINAL_PROTOCOL, AUDIT_PROTOCOL, "V2"),
+    V3_SEARCH_PROTOCOL: (V3_FINAL_PROTOCOL, V3_AUDIT_PROTOCOL, "V3 FULL FRONTIER"),
+}
 
 
 def sha256_file(path: Path) -> str:
@@ -112,13 +121,20 @@ def run(args: argparse.Namespace) -> None:
     search_manifest = read_json(search_manifest_path)
     final_manifest = read_json(final_manifest_path)
     audit_report = read_json(audit_report_path)
+    search_protocol = str(search_manifest.get("protocol", ""))
+    if search_protocol not in PROTOCOL_CHAINS:
+        raise RuntimeError(f"Unsupported V8 recovery protocol: {search_protocol}")
+    final_protocol, audit_protocol, version_label = PROTOCOL_CHAINS[search_protocol]
+    is_v3 = search_protocol == V3_SEARCH_PROTOCOL
     if not (
         search_manifest.get("quality_gate") == "PASS"
-        and search_manifest.get("protocol") == SEARCH_PROTOCOL
+        and search_manifest.get("protocol") == search_protocol
         and final_manifest.get("quality_gate") == "PASS"
-        and final_manifest.get("protocol") == FINAL_PROTOCOL
+        and final_manifest.get("protocol") == final_protocol
+        and final_manifest.get("search_protocol") == search_protocol
         and audit_report.get("quality_gate") == "PASS"
-        and audit_report.get("protocol") == AUDIT_PROTOCOL
+        and audit_report.get("protocol") == audit_protocol
+        and audit_report.get("search_protocol") == search_protocol
         and final_manifest.get("search_manifest_sha256")
         == sha256_file(search_manifest_path)
         and dict(audit_report.get("artifacts") or {})
@@ -126,7 +142,9 @@ def run(args: argparse.Namespace) -> None:
         .get("sha256")
         == sha256_file(final_manifest_path)
     ):
-        raise RuntimeError("V8 V2 search/final/audit manifests are not a linked PASS chain")
+        raise RuntimeError(
+            f"V8 {version_label} search/final/audit manifests are not a linked PASS chain"
+        )
     validate_manifest_artifacts(search_manifest, search)
     validate_manifest_artifacts(final_manifest, generation)
     validate_manifest_artifacts(audit_report, REPO_ROOT)
@@ -182,17 +200,65 @@ def run(args: argparse.Namespace) -> None:
             "programs/18_finalize_and_audit_recovery_v2.py",
         ),
         (SCRIPT_PATH, "programs/19_package_v8_recovery_v2.py"),
-        (
-            SCRIPT_PATH.with_name("V8_CYCLIC_BASE_RECOVERY_V2.md"),
-            "programs/V8_CYCLIC_BASE_RECOVERY_V2.md",
-        ),
-        (REPO_ROOT / "run_v8_autodl_recovery_v2.sh", "programs/run_v8_autodl_recovery_v2.sh"),
     ]
+    if is_v3:
+        requested.extend(
+            [
+                (
+                    search / "pre_v3_full_frontier_selection.csv.gz",
+                    "search/pre_v3_full_frontier_selection.csv.gz",
+                ),
+                (
+                    search / "pre_v3_full_frontier_cyclic_base.csv.gz",
+                    "search/pre_v3_full_frontier_cyclic_base.csv.gz",
+                ),
+                (search / "v3_frontier_state.json", "search/v3_frontier_state.json"),
+                (search / "v3_surrogate_audit.json", "search/v3_surrogate_audit.json"),
+                (
+                    SCRIPT_PATH.with_name("20_full_frontier_recovery_v3.py"),
+                    "programs/20_full_frontier_recovery_v3.py",
+                ),
+                (
+                    SCRIPT_PATH.with_name("V8_FULL_FRONTIER_RECOVERY_V3.md"),
+                    "programs/V8_FULL_FRONTIER_RECOVERY_V3.md",
+                ),
+                (
+                    REPO_ROOT / "run_v8_autodl_recovery_v3.sh",
+                    "programs/run_v8_autodl_recovery_v3.sh",
+                ),
+            ]
+        )
+    else:
+        requested.extend(
+            [
+                (
+                    SCRIPT_PATH.with_name("V8_CYCLIC_BASE_RECOVERY_V2.md"),
+                    "programs/V8_CYCLIC_BASE_RECOVERY_V2.md",
+                ),
+                (
+                    REPO_ROOT / "run_v8_autodl_recovery_v2.sh",
+                    "programs/run_v8_autodl_recovery_v2.sh",
+                ),
+            ]
+        )
+    # A scientific review archive must be able to reproduce the search
+    # manifest's hash inventory without access to the original AutoDL disk.
+    # Include every declared search artifact (round screens, exact shortlists,
+    # resume state, and V3 frontier evidence), while retaining the curated
+    # generation/audit subset above to keep the archive compact.
+    requested_by_arcname = {arcname: (path, arcname) for path, arcname in requested}
+    for leaf in artifact_leaves(search_manifest.get("artifacts")):
+        path = Path(str(leaf["path"])).resolve()
+        relative = path.relative_to(search)
+        arcname = f"search/{relative.as_posix()}"
+        requested_by_arcname.setdefault(arcname, (path, arcname))
+    requested = list(requested_by_arcname.values())
     missing = [str(path) for path, _arcname in requested if not path.is_file()]
     if missing:
         raise RuntimeError("Review bundle input is absent: " + ", ".join(missing))
     bundle_manifest = {
         "quality_gate": "PASS",
+        "protocol": search_protocol,
         "purpose": "SCIENTIFIC_REVIEW_ONLY_NO_STRUCTURE_HANDOFF_NO_PERMEABILITY_INPUT",
         "search_manifest_sha256": sha256_file(search_manifest_path),
         "final_manifest_sha256": sha256_file(final_manifest_path),
@@ -202,7 +268,7 @@ def run(args: argparse.Namespace) -> None:
         },
     }
     write_deterministic_zip(output, requested, bundle_manifest)
-    print("===== V8 V2 REVIEW BUNDLE COMPLETE =====", flush=True)
+    print(f"===== V8 {version_label} REVIEW BUNDLE COMPLETE =====", flush=True)
     print(f"Bundle: {output}", flush=True)
     print(f"SHA256: {sha256_file(output)}", flush=True)
 

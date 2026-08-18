@@ -41,6 +41,7 @@ os.environ["CUBLAS_WORKSPACE_CONFIG"] = CUBLAS_WORKSPACE_CONFIG
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[2]
 LEGACY_SEARCH_PATH = SCRIPT_PATH.with_name("14_directed_recovery_search_v8.py")
+FRONTIER_V3_PATH = SCRIPT_PATH.with_name("20_full_frontier_recovery_v3.py")
 V8_ROOT = REPO_ROOT / "paper_clean_v28_outputs" / "serine_qc_source_scoped_hybrid_v8"
 DEFAULT_MODEL = V8_ROOT / "model" / "frankenstein_v28_source_scoped_hybrid_v8.pt"
 DEFAULT_MODEL_MANIFEST = V8_ROOT / "model" / "expert_source_composition_manifest.json"
@@ -48,6 +49,7 @@ DEFAULT_REPRESENTATION = V8_ROOT / "representation_audit" / "cyclic_representati
 DEFAULT_BASELINE = V8_ROOT / "generation_baseline"
 DEFAULT_LEGACY_SEARCH = V8_ROOT / "directed_search"
 DEFAULT_OUT = V8_ROOT / "directed_search_cyclic_base_v2"
+DEFAULT_PRIOR_V2 = DEFAULT_OUT
 DEFAULT_PLAN = SCRIPT_PATH.with_name("target_plan_cyclic_representation_v6.json")
 DEFAULT_NATIVE = REPO_ROOT / "17_complexes_native.jsonl"
 DEFAULT_HISTORICAL = (
@@ -81,6 +83,7 @@ EXPECTED_BEAM_WIDTH = 512
 EXPECTED_OFFSPRING = 4096
 EXPECTED_SHORTLIST = 4096
 EXPECTED_RELEASE_LIMIT = 200
+EXPECTED_V3_LEGACY_BRIDGE = 16_384
 
 
 def load_module(name: str, path: Path) -> Any:
@@ -121,6 +124,13 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
         encoding="utf-8",
     )
     os.replace(temporary, path)
+
+
+def atomic_copy_file(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary.write_bytes(source.read_bytes())
+    os.replace(temporary, destination)
 
 
 def atomic_write_csv(
@@ -941,7 +951,12 @@ def validate_and_reconstruct_legacy(
     baseline: Path,
     baseline_unique: Sequence[Mapping[str, Any]],
     numpy_module: Any,
-) -> Tuple[Dict[str, Any], set[str], Dict[str, Dict[str, Any]]]:
+) -> Tuple[
+    Dict[str, Any],
+    set[str],
+    Dict[str, Dict[str, Any]],
+    List[Dict[str, Any]],
+]:
     manifest_path = legacy_dir / "directed_search_manifest.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(manifest_path)
@@ -1026,7 +1041,28 @@ def validate_and_reconstruct_legacy(
     )
     if completed != EXPECTED_LEGACY_ROUNDS or len(seen) != expected_seen or len(qualified) != expected_qualified:
         raise RuntimeError("Legacy V8 ledgers do not reconstruct to manifest counts")
-    return manifest, seen, qualified
+    # V2 used the complete ledger only to reconstruct ``seen`` and retained
+    # solely the 2,881 strict rows.  V3 must preserve the other 265,484 model
+    # observations as possible bridge states instead of making them
+    # permanently unreachable.  Reloading is cheap compared with GPU scoring,
+    # and the artifact hashes and exact round reconstruction were checked
+    # immediately above.
+    all_rows: List[Dict[str, Any]] = []
+    all_sequences: set[str] = set()
+    for filename in expected_ledgers:
+        rows = [
+            old.normalize_search_ledger_row(row)
+            for row in old.read_gzip_csv(legacy_dir / filename)
+        ]
+        for row in rows:
+            sequence = str(row.get("sequence", "")).upper()
+            if not sequence or sequence in all_sequences:
+                raise RuntimeError("Legacy V8 full ledger has a duplicate sequence")
+            all_sequences.add(sequence)
+            all_rows.append(row)
+    if all_sequences != seen or len(all_rows) != expected_seen:
+        raise RuntimeError("Legacy V8 full-ledger materialization differs from replay")
+    return manifest, seen, qualified, all_rows
 
 
 def exclusion_sets(
@@ -1266,6 +1302,14 @@ def run(args: argparse.Namespace) -> None:
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     old = load_module("v8_legacy_search_for_cyclic_v2", LEGACY_SEARCH_PATH)
+    frontier_v3 = (
+        load_module("v8_full_frontier_recovery_v3", FRONTIER_V3_PATH)
+        if bool(args.frontier_v3)
+        else None
+    )
+    protocol = (
+        frontier_v3.V3_SEARCH_PROTOCOL if frontier_v3 is not None else V2_SEARCH_PROTOCOL
+    )
 
     model_path = Path(args.model_path).resolve()
     model_manifest_path = Path(args.model_manifest).resolve()
@@ -1276,8 +1320,9 @@ def run(args: argparse.Namespace) -> None:
     native_path = Path(args.native_jsonl).resolve()
     historical_path = Path(args.historical_designs_csv).resolve()
     prior_path = Path(args.prior_handoff_csv).resolve()
+    prior_v2_dir = Path(args.prior_v2_dir).resolve()
     out_dir = Path(args.out_dir).resolve()
-    immutable = (
+    immutable = [
         model_path,
         model_manifest_path,
         representation_path,
@@ -1289,7 +1334,9 @@ def run(args: argparse.Namespace) -> None:
         prior_path,
         SCRIPT_PATH,
         LEGACY_SEARCH_PATH,
-    )
+    ]
+    if frontier_v3 is not None:
+        immutable.extend((prior_v2_dir, FRONTIER_V3_PATH))
     if any(old.paths_overlap(out_dir, path) for path in immutable):
         raise ValueError("V2 output overlaps an immutable input")
     for required in (
@@ -1354,11 +1401,34 @@ def run(args: argparse.Namespace) -> None:
         str(row["target_name"]).upper(): str(row["selected_chain"])
         for row in baseline_target_rows
     }
-    legacy_manifest, legacy_seen, legacy_qualified = validate_and_reconstruct_legacy(
+    legacy_manifest, legacy_seen, legacy_qualified, legacy_all_rows = validate_and_reconstruct_legacy(
         old, legacy_dir, model_path, baseline, baseline_unique, np
     )
+    prior_v2_manifest: Optional[Dict[str, Any]] = None
+    prior_v2_screen_rows: List[Dict[str, Any]] = []
+    prior_v2_exact_rows: List[Dict[str, Any]] = []
+    prior_v2_seen: set[str] = set()
+    if frontier_v3 is not None:
+        (
+            prior_v2_manifest,
+            prior_v2_screen_rows,
+            prior_v2_exact_rows,
+            prior_v2_seen,
+        ) = (
+            frontier_v3.validate_prior_v2_failure(
+                prior_dir=prior_v2_dir,
+                expected_model_sha256=sha256_file(model_path),
+                expected_baseline_manifest_sha256=sha256_file(
+                    baseline / "generation_manifest.json"
+                ),
+                expected_legacy_manifest_sha256=sha256_file(
+                    legacy_dir / "directed_search_manifest.json"
+                ),
+                read_gzip_csv=old.read_gzip_csv,
+            )
+        )
     config = {
-        "protocol": V2_SEARCH_PROTOCOL,
+        "protocol": protocol,
         "legacy_manifest_sha256": sha256_file(
             legacy_dir / "directed_search_manifest.json"
         ),
@@ -1405,21 +1475,55 @@ def run(args: argparse.Namespace) -> None:
         ),
         "full_conditional_budget_no_early_stop": True,
     }
+    if frontier_v3 is not None:
+        config.update(
+            {
+                "frontier_v3_program_sha256": sha256_file(FRONTIER_V3_PATH),
+                "prior_v2_manifest_sha256": sha256_file(
+                    prior_v2_dir / "cyclic_base_recovery_manifest.json"
+                ),
+                "prior_v2_config_sha256": prior_v2_manifest["config_sha256"],
+                "prior_v2_methyl_screen_rows_available_to_frontier": len(
+                    prior_v2_screen_rows
+                ),
+                "legacy_full_ledger_rows_available_to_frontier": len(
+                    legacy_all_rows
+                ),
+                "legacy_bridge_exact_score_budget": int(
+                    args.legacy_bridge_size
+                ),
+                "surrogate_protocol": frontier_v3.V3_SURROGATE_PROTOCOL,
+                "surrogate_release_authority": "NONE_ACQUISITION_ONLY",
+            }
+        )
     config_digest = stable_json_sha256(config)
     manifest_path = out_dir / "cyclic_base_recovery_manifest.json"
     if manifest_path.is_file():
         existing = read_json(manifest_path)
         if existing.get("config_sha256") != config_digest:
-            raise RuntimeError("Existing V2 output belongs to a different configuration")
+            raise RuntimeError("Existing recovery output belongs to a different configuration")
         if existing.get("quality_gate") == "PASS":
             for declared in dict(existing.get("artifacts") or {}).values():
                 if isinstance(declared, dict) and "path" in declared:
                     validate_declared_artifact(declared, Path(str(declared["path"])))
-            print("V8 V2 recovery: reused hash-valid PASS result", flush=True)
+            print("V8 recovery: reused hash-valid PASS result", flush=True)
             return
     elif out_dir.exists() and any(out_dir.iterdir()) and not args.resume:
-        raise FileExistsError("V2 output exists; pass --resume after inspection")
+        raise FileExistsError("Recovery output exists; pass --resume after inspection")
     out_dir.mkdir(parents=True, exist_ok=True)
+    prior_v2_manifest_copy: Optional[Path] = None
+    prior_v2_trace_copy: Optional[Path] = None
+    if frontier_v3 is not None:
+        prior_v2_manifest_copy = out_dir / "prior_v2_failure_manifest.json"
+        prior_v2_trace_copy = out_dir / "prior_v2_failure_search_trace.csv"
+        atomic_copy_file(
+            prior_v2_dir / "cyclic_base_recovery_manifest.json",
+            prior_v2_manifest_copy,
+        )
+        atomic_copy_file(
+            prior_v2_dir / "search_trace_by_round.csv",
+            prior_v2_trace_copy,
+        )
 
     if args.device == "cuda":
         if not torch.cuda.is_available():
@@ -1580,6 +1684,215 @@ def run(args: argparse.Namespace) -> None:
         list(legacy_evidence[0]),
     )
 
+    legacy_bridge_rows: List[Dict[str, Any]] = []
+    legacy_bridge_path: Optional[Path] = None
+    surrogate_report_path: Optional[Path] = None
+    surrogate: Optional[Any] = None
+    surrogate_training_rows: List[Dict[str, Any]] = []
+    if frontier_v3 is not None:
+        # Exact V2 rows, the baseline, and all 2,881 strict re-audits provide a
+        # large frozen training set for acquisition ranking.  The surrogate
+        # never decides release; its only role is deciding which previously
+        # discarded legacy rows deserve the expensive exact cyclic-base score.
+        surrogate_training_rows = [
+            *baseline_rows,
+            *[
+                {
+                    "sequence": sequence,
+                    **legacy_base[sequence],
+                }
+                for sequence in legacy_sequences
+            ],
+            *prior_v2_exact_rows,
+        ]
+        surrogate = frontier_v3.KmerBaseSurrogate(NATURAL_AA, 7)
+        initial_surrogate_report = surrogate.fit(surrogate_training_rows)
+        prior_v2_exact_sequences = {
+            str(row["sequence"]) for row in prior_v2_exact_rows
+        }
+        baseline_sequence_set = set(baseline_sequences)
+        legacy_baseline_overlap = set(legacy_seen) & baseline_sequence_set
+        pre_v3_frontier_rows = [
+            *[
+                row
+                for row in legacy_all_rows
+                if str(row["sequence"]) not in baseline_sequence_set
+            ],
+            *[
+                row
+                for row in prior_v2_screen_rows
+                if str(row["sequence"]) not in prior_v2_exact_sequences
+            ],
+        ]
+        if len({str(row["sequence"]) for row in pre_v3_frontier_rows}) != len(
+            pre_v3_frontier_rows
+        ):
+            raise RuntimeError("V3 pre-search frontier contains duplicate sequences")
+        selected_bridge = frontier_v3.select_surrogate_frontier(
+            rows=pre_v3_frontier_rows,
+            surrogate=surrogate,
+            limit=int(args.legacy_bridge_size),
+            length=7,
+            floor=floor,
+            diversity_fill=deterministic_diversity_fill,
+            exclude_strict=True,
+        )
+        bridge_sequences = [str(row["sequence"]).upper() for row in selected_bridge]
+        if set(bridge_sequences) & set(legacy_sequences):
+            raise RuntimeError("V3 non-strict bridge overlaps legacy strict hits")
+        if set(bridge_sequences) & baseline_sequence_set:
+            raise RuntimeError("V3 exact bridge wastes budget on an exact baseline row")
+        bridge_selection_path = out_dir / "pre_v3_full_frontier_selection.csv.gz"
+        legacy_bridge_path = out_dir / "pre_v3_full_frontier_cyclic_base.csv.gz"
+        bridge_state_path = out_dir / "v3_frontier_state.json"
+        reusable_bridge = False
+        if args.resume and bridge_state_path.is_file():
+            bridge_state = read_json(bridge_state_path)
+            reusable_bridge = (
+                bridge_state.get("config_sha256") == config_digest
+                and bridge_state.get("selection_filename")
+                == bridge_selection_path.name
+                and bridge_state.get("exact_filename") == legacy_bridge_path.name
+                and bridge_selection_path.is_file()
+                and legacy_bridge_path.is_file()
+                and bridge_state.get("selection_sha256")
+                == sha256_file(bridge_selection_path)
+                and bridge_state.get("exact_sha256")
+                == sha256_file(legacy_bridge_path)
+                and bridge_state.get("selection_sequence_sha256")
+                == hashlib.sha256(
+                    ("\n".join(bridge_sequences) + "\n").encode("ascii")
+                ).hexdigest()
+            )
+        if reusable_bridge:
+            persisted_selection = old.read_gzip_csv(bridge_selection_path)
+            if [
+                str(row.get("sequence", "")).upper()
+                for row in persisted_selection
+            ] != bridge_sequences:
+                raise RuntimeError("V3 reusable bridge selection order changed")
+            legacy_bridge_rows = frontier_v3.validate_exact_frontier_rows(
+                old.read_gzip_csv(legacy_bridge_path),
+                bridge_sequences,
+                V2_BASE_POLICY,
+                7,
+            )
+            print(
+                f"V3 full legacy frontier: reused {len(legacy_bridge_rows):,} "
+                "hash-pinned exact bridge rows",
+                flush=True,
+            )
+        else:
+            bridge_minimal = methyl_scorer.score_minimal(
+                target,
+                bridge_sequences,
+                "V3 full-legacy frontier destination replay",
+            )
+            source_bridge = {
+                str(row["sequence"]).upper(): row for row in selected_bridge
+            }
+            replayed_selection: List[Dict[str, Any]] = []
+            for sequence in bridge_sequences:
+                source = source_bridge[sequence]
+                observed = bridge_minimal[sequence]
+                difference = abs(
+                    float(source["maximum_probability"])
+                    - float(observed["maximum_probability"])
+                )
+                if not (
+                    difference <= RESCORE_TOLERANCE
+                    and int(source["argmax_position_1based"])
+                    == int(observed["argmax_position_1based"])
+                    and str(source["argmax_residue"])
+                    == str(observed["argmax_residue"])
+                    and int(source["passes_strict_probability"])
+                    == int(observed["passes_strict_probability"])
+                    == 0
+                ):
+                    raise RuntimeError(
+                        "V3 legacy bridge is not reproduced on destination: "
+                        + sequence
+                    )
+                replayed_selection.append(
+                    {
+                        **source,
+                        **observed,
+                        "search_stage": "V3 full-legacy frontier exact bridge",
+                        "legacy_destination_probability_difference": difference,
+                    }
+                )
+            atomic_write_gzip_csv(
+                bridge_selection_path,
+                replayed_selection,
+                list(replayed_selection[0]),
+            )
+            exact_bridge = base_scorer.score_detailed(
+                target,
+                bridge_sequences,
+                "V3 full-legacy frontier exact cyclic base",
+            )
+            replayed_by_sequence = {
+                str(row["sequence"]): row for row in replayed_selection
+            }
+            legacy_bridge_rows = [
+                {
+                    **replayed_by_sequence[sequence],
+                    **exact_bridge[sequence],
+                }
+                for sequence in bridge_sequences
+            ]
+            atomic_write_gzip_csv(
+                legacy_bridge_path,
+                legacy_bridge_rows,
+                list(legacy_bridge_rows[0]),
+            )
+            atomic_write_json(
+                bridge_state_path,
+                {
+                    "protocol": frontier_v3.V3_SEARCH_PROTOCOL,
+                    "config_sha256": config_digest,
+                    "selection_filename": bridge_selection_path.name,
+                    "selection_sha256": sha256_file(bridge_selection_path),
+                    "exact_filename": legacy_bridge_path.name,
+                    "exact_sha256": sha256_file(legacy_bridge_path),
+                    "selection_sequence_sha256": hashlib.sha256(
+                        ("\n".join(bridge_sequences) + "\n").encode("ascii")
+                    ).hexdigest(),
+                },
+            )
+        surrogate_training_rows.extend(legacy_bridge_rows)
+        after_bridge_surrogate_report = surrogate.fit(surrogate_training_rows)
+        surrogate_report_path = out_dir / "v3_surrogate_audit.json"
+        atomic_write_json(
+            surrogate_report_path,
+            {
+                "protocol": frontier_v3.V3_SURROGATE_PROTOCOL,
+                "initial_fit": initial_surrogate_report,
+                "after_exact_legacy_bridge_fit": after_bridge_surrogate_report,
+                "legacy_frontier_rows_available": len(legacy_all_rows),
+                "legacy_rows_already_exact_in_baseline": len(
+                    legacy_baseline_overlap
+                ),
+                "prior_v2_methyl_screen_rows_available": len(
+                    prior_v2_screen_rows
+                ),
+                "prior_v2_exact_rows_reused": len(prior_v2_exact_rows),
+                "non_exact_pre_v3_frontier_rows_available": len(
+                    pre_v3_frontier_rows
+                ),
+                "legacy_strict_rows_separately_audited": len(legacy_sequences),
+                "legacy_non_strict_bridge_rows_exactly_scored": len(
+                    legacy_bridge_rows
+                ),
+                "selection": frontier_v3.frontier_summary(
+                    selected_bridge, floor
+                ),
+                "hard_gate_threshold": THRESHOLD,
+                "hard_gate_cyclic_base_floor": floor,
+                "surrogate_release_authority": "NONE",
+            },
+        )
+
     conditional_search_ran = not legacy_releases
     search_evidence: List[Dict[str, Any]] = []
     search_releases: List[Dict[str, Any]] = []
@@ -1587,6 +1900,9 @@ def run(args: argparse.Namespace) -> None:
     screening_paths: List[Path] = []
     shortlist_paths: List[Path] = []
     if conditional_search_ran:
+        round_stage_prefix = (
+            "v3_full_frontier" if frontier_v3 is not None else "v2_joint"
+        )
         baseline_methyl = methyl_scorer.score_minimal(
             target, baseline_sequences, "V2 baseline joint-search anchors"
         )
@@ -1606,16 +1922,28 @@ def run(args: argparse.Namespace) -> None:
                     **legacy_base[sequence],
                 }
             )
-        beam = select_dual_objective_beam(
-            initial_rows, int(args.beam_width), 7, floor
+        if frontier_v3 is not None:
+            initial_rows.extend(legacy_bridge_rows)
+            initial_rows.extend(prior_v2_exact_rows)
+        beam = (
+            frontier_v3.select_exact_dual_objective_beam(
+                rows=initial_rows,
+                limit=int(args.beam_width),
+                length=7,
+                floor=floor,
+                diversity_fill=deterministic_diversity_fill,
+            )
+            if frontier_v3 is not None
+            else select_dual_objective_beam(
+                initial_rows, int(args.beam_width), 7, floor
+            )
         )
-        seen = set(legacy_seen) | set(baseline_sequences)
+        seen = set(legacy_seen) | set(baseline_sequences) | set(prior_v2_seen)
         all_joint_hits: Dict[str, Dict[str, Any]] = {}
         for row in initial_rows:
             if (
                 int(row["passes_strict_probability"]) == 1
                 and float(row["cyclic_base_log_probability_mean"]) >= floor
-                and str(row["sequence"]) not in legacy_qualified
             ):
                 all_joint_hits[str(row["sequence"])] = row
         start_round = 1
@@ -1645,7 +1973,9 @@ def run(args: argparse.Namespace) -> None:
                 expected_shortlist_hashes
             ) != expected_shortlist_names:
                 raise RuntimeError("V2 resume state lacks a complete round artifact map")
-            reconstructed_seen = set(legacy_seen) | set(baseline_sequences)
+            reconstructed_seen = (
+                set(legacy_seen) | set(baseline_sequences) | set(prior_v2_seen)
+            )
             for index in range(1, completed_round + 1):
                 screen_path = out_dir / f"v2_round_{index:02d}_methyl_screen.csv.gz"
                 shortlist_path = out_dir / f"v2_round_{index:02d}_cyclic_base.csv.gz"
@@ -1675,6 +2005,22 @@ def run(args: argparse.Namespace) -> None:
                 reconstructed_seen.update(screen_sequences)
                 screening_paths.append(screen_path)
                 shortlist_paths.append(shortlist_path)
+                if frontier_v3 is not None:
+                    persisted_exact = old.read_gzip_csv(shortlist_path)
+                    persisted_sequences = [
+                        str(row.get("sequence", "")).upper()
+                        for row in persisted_exact
+                    ]
+                    surrogate_training_rows.extend(
+                        frontier_v3.validate_exact_frontier_rows(
+                            persisted_exact,
+                            persisted_sequences,
+                            V2_BASE_POLICY,
+                            7,
+                        )
+                    )
+            if frontier_v3 is not None:
+                surrogate.fit(surrogate_training_rows)
             observed_seen_hash = hashlib.sha256(
                 ("\n".join(sorted(reconstructed_seen)) + "\n").encode("ascii")
             ).hexdigest()
@@ -1702,7 +2048,7 @@ def run(args: argparse.Namespace) -> None:
                 and len(resumed_trace) == completed_round
                 and {str(row.get("stage", "")) for row in resumed_trace}
                 == {
-                    f"v2_joint_round_{index:02d}"
+                    f"{round_stage_prefix}_round_{index:02d}"
                     for index in range(1, completed_round + 1)
                 }
                 and len({str(row.get("sequence", "")) for row in resumed_hits})
@@ -1742,7 +2088,11 @@ def run(args: argparse.Namespace) -> None:
                 str(row["sequence"]): float(row["cyclic_base_log_probability_mean"])
                 for row in beam
             }
-            methyl_stage = f"V2 methyl screen round {round_index:02d}"
+            methyl_stage = (
+                f"V3 full-frontier methyl screen round {round_index:02d}"
+                if frontier_v3 is not None
+                else f"V2 methyl screen round {round_index:02d}"
+            )
             screen_path = out_dir / f"v2_round_{round_index:02d}_methyl_screen.csv.gz"
             shortlist_path = out_dir / f"v2_round_{round_index:02d}_cyclic_base.csv.gz"
             round_context = v2_round_context(
@@ -1819,9 +2169,26 @@ def run(args: argparse.Namespace) -> None:
                 }
                 atomic_write_json(inflight_path, inflight)
             screening_paths.append(screen_path)
-            shortlist_sequences = select_methyl_screen_shortlist(
-                screen_rows, int(args.shortlist_per_round), 7
-            )
+            if frontier_v3 is not None:
+                selected_frontier_rows = frontier_v3.select_surrogate_frontier(
+                    rows=screen_rows,
+                    surrogate=surrogate,
+                    limit=int(args.shortlist_per_round),
+                    length=7,
+                    floor=floor,
+                    diversity_fill=deterministic_diversity_fill,
+                )
+                shortlist_sequences = [
+                    str(row["sequence"]) for row in selected_frontier_rows
+                ]
+                selected_frontier_by_sequence = {
+                    str(row["sequence"]): row for row in selected_frontier_rows
+                }
+            else:
+                shortlist_sequences = select_methyl_screen_shortlist(
+                    screen_rows, int(args.shortlist_per_round), 7
+                )
+                selected_frontier_by_sequence = {}
             if (
                 inflight is not None
                 and inflight.get("phase") == "cyclic_base_shortlist_complete"
@@ -1860,11 +2227,18 @@ def run(args: argparse.Namespace) -> None:
                 detailed = base_scorer.score_detailed(
                     target,
                     shortlist_sequences,
-                    f"V2 cyclic-base shortlist round {round_index:02d}",
+                    (
+                        f"V3 full-frontier cyclic-base shortlist round "
+                        f"{round_index:02d}"
+                        if frontier_v3 is not None
+                        else f"V2 cyclic-base shortlist round {round_index:02d}"
+                    ),
                 )
                 screen_by_sequence = {
                     str(row["sequence"]): row for row in screen_rows
                 }
+                if frontier_v3 is not None:
+                    screen_by_sequence.update(selected_frontier_by_sequence)
                 shortlist_rows = [
                     {**screen_by_sequence[sequence], **detailed[sequence]}
                     for sequence in shortlist_sequences
@@ -1887,6 +2261,14 @@ def run(args: argparse.Namespace) -> None:
                 }
                 atomic_write_json(inflight_path, inflight)
             shortlist_paths.append(shortlist_path)
+            if frontier_v3 is not None:
+                surrogate_training_rows.extend(shortlist_rows)
+                round_surrogate_report = surrogate.fit(surrogate_training_rows)
+                current_surrogate_audit = read_json(surrogate_report_path)
+                current_surrogate_audit[
+                    f"after_v3_round_{round_index:02d}_fit"
+                ] = round_surrogate_report
+                atomic_write_json(surrogate_report_path, current_surrogate_audit)
             for row in shortlist_rows:
                 if (
                     int(row["passes_strict_probability"]) == 1
@@ -1895,14 +2277,24 @@ def run(args: argparse.Namespace) -> None:
                     all_joint_hits[str(row["sequence"])] = row
             combined = {str(row["sequence"]): row for row in beam}
             combined.update({str(row["sequence"]): row for row in shortlist_rows})
-            beam = select_dual_objective_beam(
-                list(combined.values()), int(args.beam_width), 7, floor
+            beam = (
+                frontier_v3.select_exact_dual_objective_beam(
+                    rows=list(combined.values()),
+                    limit=int(args.beam_width),
+                    length=7,
+                    floor=floor,
+                    diversity_fill=deterministic_diversity_fill,
+                )
+                if frontier_v3 is not None
+                else select_dual_objective_beam(
+                    list(combined.values()), int(args.beam_width), 7, floor
+                )
             )
             seen.update(to_score)
             trace_rows.append(
                 {
                     "target_name": target,
-                    "stage": f"v2_joint_round_{round_index:02d}",
+                    "stage": f"{round_stage_prefix}_round_{round_index:02d}",
                     "generated_unique": len(provenance),
                     "newly_methyl_scored": len(to_score),
                     "cyclic_base_shortlist": len(shortlist_rows),
@@ -1963,7 +2355,12 @@ def run(args: argparse.Namespace) -> None:
                 sequence: {
                     **all_joint_hits[sequence],
                     "search_stage": all_joint_hits[sequence].get(
-                        "search_stage", "V2 dual-objective search"
+                        "search_stage",
+                        (
+                            "V3 full-frontier dual-objective search"
+                            if frontier_v3 is not None
+                            else "V2 dual-objective search"
+                        ),
                     ),
                 }
                 for sequence in joint_sequences
@@ -1977,7 +2374,13 @@ def run(args: argparse.Namespace) -> None:
                 for sequence in joint_sequences
             }
             joint_full = methyl_scorer.score_full(
-                target, joint_sequences, stage="V2 joint-hit physical-position audit"
+                target,
+                joint_sequences,
+                stage=(
+                    "V3 joint-hit physical-position audit"
+                    if frontier_v3 is not None
+                    else "V2 joint-hit physical-position audit"
+                ),
             )
             search_evidence, search_releases = evaluate_candidates(
                 old=old,
@@ -1990,7 +2393,11 @@ def run(args: argparse.Namespace) -> None:
                 batch_one_scorer=batch_one_scorer,
                 selected_chain=selected_chains[target],
                 max_release=int(args.max_release_per_target),
-                id_prefix="v8v2_3zgc_joint",
+                id_prefix=(
+                    "v8v3_3zgc_joint"
+                    if frontier_v3 is not None
+                    else "v8v2_3zgc_joint"
+                ),
             )
 
     release_rows = legacy_releases if legacy_releases else search_releases
@@ -2068,10 +2475,19 @@ def run(args: argparse.Namespace) -> None:
         or len(trace_rows) == int(args.rounds)
         and {str(row["stage"]) for row in trace_rows}
         == {
-            f"v2_joint_round_{index:02d}"
+            f"{round_stage_prefix}_round_{index:02d}"
             for index in range(1, int(args.rounds) + 1)
         }
     )
+    exact_search_rows = [
+        *legacy_bridge_rows,
+        *prior_v2_exact_rows,
+        *[
+            row
+            for path in shortlist_paths
+            for row in old.read_gzip_csv(path)
+        ],
+    ]
     quality_checks = {
         "legacy_failure_is_hash_pinned_and_exactly_reconstructed": True,
         "s_to_S_source_scoped_model_and_representation_are_hash_pinned": (
@@ -2083,11 +2499,11 @@ def run(args: argparse.Namespace) -> None:
         "cyclic_base_uses_joint_coordinate_sequence_roll_and_residue_index_reset": True,
         "cyclic_base_averages_all_physical_starts_and_all_decoder_orders": all(
             int(row["cyclic_base_total_ensemble_size"]) == len(row["sequence"]) ** 2
-            for row in combined_evidence
+            for row in [*combined_evidence, *exact_search_rows]
         ),
         "baseline_and_candidates_use_identical_cyclic_base_policy": all(
             row["cyclic_base_context_policy"] == V2_BASE_POLICY
-            for row in [*baseline_rows, *combined_evidence]
+            for row in [*baseline_rows, *combined_evidence, *exact_search_rows]
         ),
         "physical_position_vectors_and_argmax_are_persisted": all(
             len(json.loads(str(row["physical_probability_vector"])))
@@ -2116,6 +2532,45 @@ def run(args: argparse.Namespace) -> None:
         "at_least_one_real_3zgc_candidate_is_released": bool(release_rows),
         "no_threshold_relaxation_formal_abstention_handoff_or_permeability": True,
     }
+    if frontier_v3 is not None:
+        quality_checks.update(
+            {
+                "all_268365_legacy_rows_are_represented_by_exact_baseline_or_frontier_selection": (
+                    len(legacy_all_rows) == len(legacy_seen) == 268_365
+                    and {str(row["sequence"]) for row in legacy_all_rows}
+                    == set(legacy_seen)
+                    and legacy_baseline_overlap <= baseline_sequence_set
+                ),
+                "all_159329_v2_screen_rows_are_reused_as_exact_or_frontier": (
+                    len(prior_v2_screen_rows) == len(prior_v2_seen) == 159_329
+                    and {str(row["sequence"]) for row in prior_v2_screen_rows}
+                    == set(prior_v2_seen)
+                    and prior_v2_exact_sequences <= set(prior_v2_seen)
+                ),
+                "non_strict_legacy_bridge_received_exact_cyclic_base_scores": (
+                    len(legacy_bridge_rows) == int(args.legacy_bridge_size)
+                    and all(
+                        int(row["passes_strict_probability"]) == 0
+                        and row["cyclic_base_context_policy"] == V2_BASE_POLICY
+                        and str(row["sequence"]) not in baseline_sequence_set
+                        for row in legacy_bridge_rows
+                    )
+                ),
+                "completed_v2_failure_is_hash_pinned_and_reused_not_rerun": (
+                    prior_v2_manifest is not None
+                    and int(prior_v2_manifest["conditional_rounds_completed"]) == 6
+                    and len(prior_v2_exact_rows) == 6 * 4096
+                ),
+                "surrogate_is_acquisition_only_and_never_a_release_gate": (
+                    surrogate_report_path is not None
+                    and surrogate_report_path.is_file()
+                    and read_json(surrogate_report_path).get(
+                        "surrogate_release_authority"
+                    )
+                    == "NONE"
+                ),
+            }
+        )
     quality_gate = "PASS" if all(quality_checks.values()) else "FAIL"
     artifacts: Dict[str, Any] = {
         "baseline_cyclic_plausibility": artifact(baseline_base_path),
@@ -2133,14 +2588,39 @@ def run(args: argparse.Namespace) -> None:
             path.name: artifact(path) for path in shortlist_paths
         }
         artifacts["resume_state"] = artifact(out_dir / "v2_resume_state.json")
+    if frontier_v3 is not None:
+        artifacts.update(
+            {
+                "pre_v3_full_frontier_selection": artifact(
+                    out_dir / "pre_v3_full_frontier_selection.csv.gz"
+                ),
+                "pre_v3_full_frontier_exact_cyclic_base": artifact(
+                    legacy_bridge_path
+                ),
+                "frontier_state": artifact(out_dir / "v3_frontier_state.json"),
+                "surrogate_audit": artifact(surrogate_report_path),
+                "prior_v2_failure_manifest": artifact(
+                    prior_v2_manifest_copy
+                ),
+                "prior_v2_failure_search_trace": artifact(prior_v2_trace_copy),
+            }
+        )
     manifest = {
         "quality_gate": quality_gate,
         "release_status": (
-            "READY_FOR_INDEPENDENT_V2_FINAL_AUDIT_NO_STRUCTURE_HANDOFF"
+            (
+                "READY_FOR_INDEPENDENT_V3_FINAL_AUDIT_NO_STRUCTURE_HANDOFF"
+                if frontier_v3 is not None
+                else "READY_FOR_INDEPENDENT_V2_FINAL_AUDIT_NO_STRUCTURE_HANDOFF"
+            )
             if quality_gate == "PASS"
-            else "BLOCKED_FIXED_V2_BUDGET_DID_NOT_RECOVER_3ZGC"
+            else (
+                "BLOCKED_FIXED_V3_FULL_FRONTIER_BUDGET_DID_NOT_RECOVER_3ZGC"
+                if frontier_v3 is not None
+                else "BLOCKED_FIXED_V2_BUDGET_DID_NOT_RECOVER_3ZGC"
+            )
         ),
-        "protocol": V2_SEARCH_PROTOCOL,
+        "protocol": protocol,
         "config": config,
         "config_sha256": config_digest,
         "model_sha256": sha256_file(model_path),
@@ -2152,6 +2632,14 @@ def run(args: argparse.Namespace) -> None:
         ),
         "legacy_evaluated_sequences": len(legacy_seen),
         "legacy_strict_hits_reaudited": len(legacy_sequences),
+        "legacy_full_frontier_rows": (
+            len(legacy_all_rows) if frontier_v3 is not None else 0
+        ),
+        "legacy_rows_already_exact_in_baseline": (
+            len(legacy_baseline_overlap) if frontier_v3 is not None else 0
+        ),
+        "prior_v2_methyl_screen_rows_reused": len(prior_v2_screen_rows),
+        "legacy_non_strict_bridge_rows_exactly_scored": len(legacy_bridge_rows),
         "cyclic_base_floor_1pct": floor,
         "conditional_search_ran": conditional_search_ran,
         "conditional_rounds_completed": len(trace_rows),
@@ -2199,7 +2687,11 @@ def run(args: argparse.Namespace) -> None:
         },
     }
     atomic_write_json(manifest_path, manifest)
-    print("===== V8 CYCLIC-START BASE RECOVERY V2 COMPLETE =====", flush=True)
+    version_label = "V3 FULL FRONTIER" if frontier_v3 is not None else "V2"
+    print(
+        f"===== V8 CYCLIC-START BASE RECOVERY {version_label} COMPLETE =====",
+        flush=True,
+    )
     print(f"Quality gate: {quality_gate}", flush=True)
     print(f"Legacy strict hits re-audited: {len(legacy_sequences):,}", flush=True)
     print(f"Corrected cyclic-base floor: {floor:.8f}", flush=True)
@@ -2207,7 +2699,9 @@ def run(args: argparse.Namespace) -> None:
     print(f"Released 3ZGC candidates: {len(release_rows)}", flush=True)
     if quality_gate != "PASS":
         failed = [name for name, passed in quality_checks.items() if not passed]
-        raise RuntimeError("V8 V2 recovery failed honestly: " + ", ".join(failed))
+        raise RuntimeError(
+            f"V8 {version_label} recovery failed honestly: " + ", ".join(failed)
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -2221,6 +2715,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--native-jsonl", default=str(DEFAULT_NATIVE))
     parser.add_argument("--historical-designs-csv", default=str(DEFAULT_HISTORICAL))
     parser.add_argument("--prior-handoff-csv", default=str(DEFAULT_PRIOR))
+    parser.add_argument("--prior-v2-dir", default=str(DEFAULT_PRIOR_V2))
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT))
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--base-batch-size", type=int, default=32)
@@ -2229,6 +2724,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--offspring-per-round", type=int, default=EXPECTED_OFFSPRING)
     parser.add_argument("--shortlist-per-round", type=int, default=EXPECTED_SHORTLIST)
     parser.add_argument("--max-release-per-target", type=int, default=EXPECTED_RELEASE_LIMIT)
+    parser.add_argument(
+        "--legacy-bridge-size", type=int, default=EXPECTED_V3_LEGACY_BRIDGE
+    )
+    parser.add_argument("--frontier-v3", action="store_true")
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--allow-cpu", action="store_true")
     parser.add_argument("--resume", action="store_true")
@@ -2249,6 +2748,11 @@ def main() -> None:
             EXPECTED_RELEASE_LIMIT,
         ),
     }
+    if args.frontier_v3:
+        frozen["--legacy-bridge-size"] = (
+            args.legacy_bridge_size,
+            EXPECTED_V3_LEGACY_BRIDGE,
+        )
     changed = [name for name, (observed, expected) in frozen.items() if observed != expected]
     if changed:
         raise ValueError("V8 V2 numerical protocol is frozen: " + ", ".join(changed))
