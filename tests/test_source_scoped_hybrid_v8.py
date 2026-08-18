@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import importlib.util
+import json
 import math
 import random
 import re
@@ -47,6 +48,14 @@ v8_bundle = load_module(
     "source_scoped_hybrid_v8_autodl_bundle",
     RETRAIN_DIR / "16_v8_autodl_resume_bundle.py",
 )
+v8_cyclic_recovery = load_module(
+    "source_scoped_hybrid_v8_cyclic_base_recovery",
+    RETRAIN_DIR / "17_cyclic_base_recovery_v2.py",
+)
+v8_cyclic_finalizer = load_module(
+    "source_scoped_hybrid_v8_cyclic_base_finalizer",
+    RETRAIN_DIR / "18_finalize_and_audit_recovery_v2.py",
+)
 
 
 class FakeTensor:
@@ -73,6 +82,8 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
             "13_audit_source_scoped_hybrid_v8.py",
             "14_directed_recovery_search_v8.py",
             "15_finalize_and_audit_recovery_v8.py",
+            "17_cyclic_base_recovery_v2.py",
+            "18_finalize_and_audit_recovery_v2.py",
         ):
             source = (RETRAIN_DIR / name).read_text(encoding="utf-8")
             ast.parse(source, filename=name)
@@ -983,6 +994,17 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
         self.assertIn("current_imported_file_hashes", runner)
         self.assertIn("OMP_NUM_THREADS=16", runner)
 
+        v2_runner = (ROOT / "run_v8_autodl_recovery_v2.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("17_cyclic_base_recovery_v2.py", v2_runner)
+        self.assertIn("18_finalize_and_audit_recovery_v2.py", v2_runner)
+        self.assertIn("19_package_v8_recovery_v2.py", v2_runner)
+        self.assertIn("nohup bash -lc", v2_runner)
+        self.assertIn("OMP_NUM_THREADS=16", v2_runner)
+        self.assertIn("ALL V8 V2 AUTOMATED GATES PASSED", v2_runner)
+        self.assertNotIn("tmux", v2_runner)
+
         bundle_source = (
             RETRAIN_DIR / "16_v8_autodl_resume_bundle.py"
         ).read_text(encoding="utf-8")
@@ -1054,6 +1076,98 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
         self.assertIn('"NOT_CREATED_PENDING_MANUAL_REVIEW"', source)
         self.assertIn(
             '"DEFERRED_UNTIL_RETURNED_STRUCTURES_PASS_BOTH_RMSD_GATES"', source
+        )
+
+    def test_v2_physical_argmax_is_mapped_to_natural_residue_positions(self):
+        summary = v8_cyclic_recovery.physical_argmax_summary(
+            "APST", [0.20, 0.99, 0.72, 0.61]
+        )
+        # Proline is deliberately not methylatable, so its larger probability
+        # cannot become the actionable physical argmax.
+        self.assertEqual(summary["physical_argmax_position_1based"], 3)
+        self.assertEqual(summary["physical_argmax_residue"], "S")
+        self.assertEqual(
+            json.loads(summary["strict_physical_positions_1based"]), [3, 4]
+        )
+        self.assertEqual(
+            len(json.loads(summary["physical_probability_mass_fraction"])), 4
+        )
+
+    def test_v2_dual_objective_beam_retains_both_hard_gate_neighborhoods(self):
+        rows = []
+        for index, sequence in enumerate(
+            ("AAAAAAA", "CCCCCCC", "DDDDDDD", "EEEEEEE", "FFFFFFF")
+        ):
+            rows.append(
+                {
+                    "sequence": sequence,
+                    "maximum_probability": 0.65 - 0.02 * index,
+                    "passes_strict_probability": int(index < 3),
+                    "argmax_position_1based": index % 7 + 1,
+                    "cyclic_base_log_probability_mean": -4.0 + index,
+                }
+            )
+        beam = v8_cyclic_recovery.select_dual_objective_beam(
+            rows, width=4, length=7, floor=-1.5
+        )
+        sequences = {row["sequence"] for row in beam}
+        self.assertTrue(sequences & {"AAAAAAA", "CCCCCCC", "DDDDDDD"})
+        self.assertTrue(sequences & {"EEEEEEE", "FFFFFFF"})
+        self.assertEqual(len(sequences), 4)
+
+    def test_v2_round_generation_is_fixed_seed_and_complete_for_singles(self):
+        beam = [
+            {
+                "sequence": "AAAAAAA",
+                "cyclic_base_log_probability_mean": -1.0,
+            }
+        ]
+        left = v8_cyclic_recovery.v2_round_provenance(beam, 1, 32, np)
+        right = v8_cyclic_recovery.v2_round_provenance(beam, 1, 32, np)
+        self.assertEqual(left, right)
+        singles = [
+            row
+            for row in left.values()
+            if row["generation_kind"] == "complete_single_mutant"
+        ]
+        self.assertEqual(len(singles), 7 * 19)
+        self.assertTrue(
+            all(
+                not row["rng_seed"]
+                for row in singles
+            )
+        )
+        self.assertTrue(
+            any(
+                row["rng_seed"] == "20260818:1"
+                for row in left.values()
+                if row["generation_kind"] == "fixed_seed_multi_mutant"
+            )
+        )
+
+    def test_v2_contract_jointly_rolls_geometry_sequence_and_residue_indices(self):
+        source = (RETRAIN_DIR / "17_cyclic_base_recovery_v2.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Xb[:, selected] = self.torch.roll", source)
+        self.assertIn("Sb[:, selected] = rolled_natural", source)
+        self.assertIn("residueb[:, selected] = canonical_residue_idx", source)
+        self.assertIn("representation_shift in range(length)", source)
+        self.assertIn("order_shift in range(length)", source)
+        self.assertIn("conditional_fixed_budget_completed_without_early_stop", source)
+        self.assertNotIn("formal_abstention = 1", source)
+
+    def test_v2_finalizer_never_creates_structure_or_permeability_handoff(self):
+        source = (RETRAIN_DIR / "18_finalize_and_audit_recovery_v2.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("structure_tasks_for_shangge.csv", source)
+        self.assertNotIn("permeability_input.csv", source)
+        self.assertIn('"structure_handoff_is_not_created"', source)
+        self.assertIn('"permeability_remains_deferred"', source)
+        self.assertEqual(
+            v8_cyclic_finalizer.V2_AUDIT_PROTOCOL,
+            "independent_three_pass_cyclic_base_recovery_v8_v2",
         )
 
 
