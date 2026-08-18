@@ -27,6 +27,7 @@ import math
 import os
 import platform
 import sys
+import time
 from collections import Counter, defaultdict
 from itertools import combinations, product
 from pathlib import Path
@@ -116,6 +117,80 @@ SEARCH_LEDGER_FIELDS = [
     "rng_draw_index",
 ]
 
+PORTABLE_RESUME_IMPORT_PROTOCOL = "v8_autodl_portable_resume_import_v1"
+PORTABLE_RESCORE_TOLERANCE = 2e-6
+PORTABLE_SOURCE_COMMIT = "53ce92e5238d717fc982357b4c58f65538a8f710"
+PORTABLE_SOURCE_SEARCH_SHA256 = {
+    # Git blob / LF checkout.
+    "d0d3536a51ac92caabc1523e8b7418811ac71b4abf3588485055223408ea7097",
+    # Windows core.autocrlf checkout of the same Git blob.
+    "2bce6d3cb017cdacf62c130810616d08b80d73d0fc9f2dc4122c5be2aeb60a96",
+}
+
+
+def format_duration(seconds: float) -> str:
+    if not math.isfinite(float(seconds)) or float(seconds) < 0:
+        return "--:--"
+    total = int(round(float(seconds)))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+
+class ProgressBar:
+    """Dependency-free progress bar with rate and ETA for long GPU stages."""
+
+    def __init__(
+        self,
+        label: str,
+        total: int,
+        *,
+        unit: str = "seq",
+        min_interval: float = 5.0,
+    ) -> None:
+        self.label = str(label)
+        self.total = max(0, int(total))
+        self.unit = str(unit)
+        self.min_interval = max(0.2, float(min_interval))
+        self.completed = 0
+        self.started = time.monotonic()
+        self.last_print = 0.0
+        self.tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+        if self.total:
+            self._render(force=True)
+
+    def update(self, amount: int) -> None:
+        self.completed = min(self.total, self.completed + max(0, int(amount)))
+        self._render(force=self.completed >= self.total)
+
+    def close(self) -> None:
+        if self.total and self.completed < self.total:
+            self.completed = self.total
+            self._render(force=True)
+
+    def _render(self, *, force: bool) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_print < self.min_interval:
+            return
+        elapsed = max(now - self.started, 1e-9)
+        fraction = self.completed / self.total if self.total else 1.0
+        width = 24
+        filled = min(width, int(fraction * width))
+        bar = "#" * filled + "-" * (width - filled)
+        rate = self.completed / elapsed
+        remaining = (self.total - self.completed) / rate if rate > 0 else float("inf")
+        line = (
+            f"[{self.label}] [{bar}] {fraction * 100:6.2f}% "
+            f"{self.completed:,}/{self.total:,} {self.unit} | "
+            f"{rate:,.2f} {self.unit}/s | elapsed {format_duration(elapsed)} | "
+            f"ETA {format_duration(remaining)}"
+        )
+        if self.tty:
+            print("\r" + line, end="\n" if self.completed >= self.total else "", flush=True)
+        else:
+            print(line, flush=True)
+        self.last_print = now
+
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -146,6 +221,82 @@ def stable_json_sha256(payload: Mapping[str, Any]) -> str:
 
 def read_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def validate_portable_resume_import(
+    import_manifest_path: Path,
+    out_dir: Path,
+    model_path: Path,
+    model_manifest_path: Path,
+    representation_path: Path,
+    baseline: Path,
+) -> Dict[str, Any]:
+    """Validate a hash-pinned Windows-to-AutoDL evidence import.
+
+    Only round ledgers/checkpoints are trusted from the source runtime.  Final
+    candidate annotation is recomputed on the destination GPU and the final
+    three-pass audit independently re-scores every ledger row.
+    """
+
+    path = import_manifest_path.resolve()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    payload = read_json(path)
+    if not (
+        payload.get("quality_gate") == "PASS"
+        and payload.get("protocol") == PORTABLE_RESUME_IMPORT_PROTOCOL
+        and payload.get("source_commit") == PORTABLE_SOURCE_COMMIT
+        and payload.get("source_search_program_sha256")
+        in PORTABLE_SOURCE_SEARCH_SHA256
+        and str(payload.get("source_config_sha256", ""))
+        and float(payload.get("destination_rescore_tolerance", -1.0))
+        == PORTABLE_RESCORE_TOLERANCE
+    ):
+        raise RuntimeError("Portable resume import manifest is failed or unrecognized")
+    expected_current = {
+        "model": model_path,
+        "model_manifest": model_manifest_path,
+        "representation_audit": representation_path,
+        "baseline_manifest": baseline / "generation_manifest.json",
+    }
+    current_hashes = dict(payload.get("current_input_hashes") or {})
+    if set(current_hashes) != set(expected_current) or any(
+        not target.is_file() or sha256_file(target) != str(current_hashes[name])
+        for name, target in expected_current.items()
+    ):
+        raise RuntimeError("Portable resume current input hash map is stale")
+    evidence = dict(payload.get("evidence_files") or {})
+    if not evidence:
+        raise RuntimeError("Portable resume import has no evidence inventory")
+    resolved_evidence: List[Path] = []
+    for relative_name, expected_hash in evidence.items():
+        candidate = (REPO_ROOT / str(relative_name)).resolve()
+        try:
+            candidate.relative_to(out_dir.resolve())
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Portable resume evidence escapes directed-search output: {relative_name}"
+            ) from exc
+        if not candidate.is_file() or sha256_file(candidate) != str(expected_hash):
+            raise RuntimeError(f"Portable resume evidence hash mismatch: {relative_name}")
+        resolved_evidence.append(candidate)
+    expected_names = {
+        "3wne_exact_search_all.csv.gz",
+        "3zgc_round_00_initial.csv.gz",
+        *(f"3zgc_round_{index:02d}.csv.gz" for index in range(1, 7)),
+        *(f"3zgc_round_{index:02d}.json.gz" for index in range(1, 7)),
+    }
+    observed_names = {candidate.name for candidate in resolved_evidence}
+    if not expected_names <= observed_names:
+        raise RuntimeError("Portable resume evidence inventory is incomplete")
+    checkpoint_digests = {
+        str(read_gzip_json(candidate).get("config_sha256", ""))
+        for candidate in resolved_evidence
+        if candidate.name.endswith(".json.gz")
+    }
+    if checkpoint_digests != {str(payload["source_config_sha256"])}:
+        raise RuntimeError("Portable resume checkpoint configuration digest mismatch")
+    return payload
 
 
 def read_csv(path: Path) -> List[Dict[str, str]]:
@@ -726,7 +877,8 @@ def validate_ledger_scores_against_model(
     target: str,
     stage: str,
     score_minimal: Any,
-) -> None:
+    score_tolerance: float = 0.0,
+) -> Dict[str, Any]:
     """Recompute every persisted ledger score before it can steer a beam.
 
     ``MethylScorer.score_minimal`` persists eight-decimal probabilities, so a
@@ -740,19 +892,29 @@ def validate_ledger_scores_against_model(
         raise RuntimeError(f"{target} {stage} ledger has no model-score rows")
     if len(sequences) != len(set(sequences)):
         raise RuntimeError(f"{target} {stage} ledger has duplicate score rows")
+    tolerance = float(score_tolerance)
+    if not math.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError("Ledger score tolerance must be finite and non-negative")
     observed = score_minimal(target, sequences, stage)
     if set(observed) != set(sequences):
         raise RuntimeError(f"{target} {stage} model re-score key mismatch")
+    maximum_absolute_difference = 0.0
     for persisted in rows:
         sequence = str(persisted["sequence"]).upper()
         recomputed = observed[sequence]
         try:
+            absolute_difference = abs(
+                float(recomputed["maximum_probability"])
+                - float(persisted["maximum_probability"])
+            )
+            maximum_absolute_difference = max(
+                maximum_absolute_difference, absolute_difference
+            )
             matches = (
                 str(recomputed.get("target_name", "")).upper() == target
                 and str(recomputed.get("sequence", "")).upper() == sequence
                 and str(recomputed.get("search_stage", "")) == stage
-                and float(recomputed["maximum_probability"])
-                == float(persisted["maximum_probability"])
+                and absolute_difference <= tolerance
                 and int(recomputed["argmax_position_1based"])
                 == int(persisted["argmax_position_1based"])
                 and str(recomputed["argmax_residue"])
@@ -769,6 +931,14 @@ def validate_ledger_scores_against_model(
                 f"{target} ledger score is not reproduced by the frozen model: "
                 f"{stage}:{sequence}"
             )
+    return {
+        "target_name": target,
+        "stage": stage,
+        "rows": len(rows),
+        "score_tolerance": tolerance,
+        "maximum_absolute_probability_difference": maximum_absolute_difference,
+        "strict_pass_bits_match": True,
+    }
 
 
 def reconstruct_and_validate_zgc_resume(
@@ -780,6 +950,9 @@ def reconstruct_and_validate_zgc_resume(
     offspring_per_round: int,
     numpy_module: Any,
     score_minimal: Any,
+    *,
+    validate_model_scores: bool = True,
+    score_tolerance: float = 0.0,
 ) -> Tuple[int, set[str], List[Dict[str, Any]], Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
     """Rebuild resume state from complete ledgers; never trust checkpoint state alone."""
 
@@ -807,12 +980,16 @@ def reconstruct_and_validate_zgc_resume(
             "beam_initial_anchors",
             expected_initial_provenance[sequence],
         )
-    validate_ledger_scores_against_model(
-        initial_rows,
-        "3ZGC",
-        "beam_initial_anchors",
-        score_minimal,
-    )
+    if validate_model_scores:
+        if score_minimal is None:
+            raise ValueError("Model-score validation requires a scorer")
+        validate_ledger_scores_against_model(
+            initial_rows,
+            "3ZGC",
+            "beam_initial_anchors",
+            score_minimal,
+            score_tolerance,
+        )
     seen = set(initial_scored)
     qualified = {
         sequence: row
@@ -831,6 +1008,11 @@ def reconstruct_and_validate_zgc_resume(
             ),
         }
     }
+    replay_progress = ProgressBar(
+        "3ZGC checkpoint provenance replay",
+        len(checkpoints),
+        unit="round",
+    )
 
     for round_number, checkpoint_path in zip(round_numbers, checkpoints):
         generated_provenance = zgc_round_provenance(
@@ -860,12 +1042,14 @@ def reconstruct_and_validate_zgc_resume(
                 f"beam_round_{round_number:02d}",
                 generated_provenance[sequence],
             )
-        validate_ledger_scores_against_model(
-            round_rows,
-            "3ZGC",
-            f"beam_round_{round_number:02d}",
-            score_minimal,
-        )
+        if validate_model_scores:
+            validate_ledger_scores_against_model(
+                round_rows,
+                "3ZGC",
+                f"beam_round_{round_number:02d}",
+                score_minimal,
+                score_tolerance,
+            )
         seen.update(scored)
         for sequence, row in scored.items():
             if int(row["passes_strict_probability"]):
@@ -931,7 +1115,9 @@ def reconstruct_and_validate_zgc_resume(
             ):
                 raise RuntimeError(f"3ZGC round-{round_number} trace values mismatch")
         latest_trace = [dict(row) for row in trace]
+        replay_progress.update(1)
 
+    replay_progress.close()
     return round_numbers[-1], seen, beam, qualified, latest_trace
 
 
@@ -1005,7 +1191,11 @@ class MethylScorer:
         self, target: str, sequences: Sequence[str], stage: str
     ) -> Dict[str, Dict[str, Any]]:
         result: Dict[str, Dict[str, Any]] = {}
-        for sequence_batch in chunks(sorted(set(sequences)), self.batch_size):
+        unique_sequences = sorted(set(sequences))
+        progress = ProgressBar(
+            f"{target} {stage}", len(unique_sequences), unit="seq"
+        )
+        for sequence_batch in chunks(unique_sequences, self.batch_size):
             representation = self._representations(target, sequence_batch)
             for row_index, sequence in enumerate(sequence_batch):
                 probability = [
@@ -1049,12 +1239,27 @@ class MethylScorer:
                         and strict_rounded_pass(maximum_probability)
                     ),
                 }
+            progress.update(len(sequence_batch))
+        progress.close()
         return result
 
-    def score_full(self, target: str, sequences: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+    def score_full(
+        self,
+        target: str,
+        sequences: Sequence[str],
+        stage: str = "full annotation",
+        *,
+        show_progress: bool = True,
+    ) -> Dict[str, Dict[str, Any]]:
         result: Dict[str, Dict[str, Any]] = {}
         alphabet = self.common["NATURAL_AA_ALPHABET"]
-        for sequence_batch in chunks(sorted(set(sequences)), self.batch_size):
+        unique_sequences = sorted(set(sequences))
+        progress = (
+            ProgressBar(f"{target} {stage}", len(unique_sequences), unit="seq")
+            if show_progress
+            else None
+        )
+        for sequence_batch in chunks(unique_sequences, self.batch_size):
             representation = self._representations(target, sequence_batch)
             for row_index, sequence in enumerate(sequence_batch):
                 result[sequence] = self.reannotator.annotation_payload(
@@ -1066,6 +1271,10 @@ class MethylScorer:
                     self.common["EXTENDED_AA_ALPHABET"],
                     self.common["NAT_TO_METHYL_ABS"],
                 )
+            if progress is not None:
+                progress.update(len(sequence_batch))
+        if progress is not None:
+            progress.close()
         return result
 
 
@@ -1105,10 +1314,19 @@ class BasePlausibilityScorer:
             self.features[target] = tuple(tensors[:6])
         return self.features[target]
 
-    def score(self, target: str, sequences: Sequence[str]) -> Dict[str, float]:
+    def score(
+        self,
+        target: str,
+        sequences: Sequence[str],
+        stage: str = "base plausibility",
+    ) -> Dict[str, float]:
         result: Dict[str, float] = {}
         alphabet = self.common["NATURAL_AA_ALPHABET"]
-        for sequence_batch in chunks(sorted(set(sequences)), self.batch_size):
+        unique_sequences = sorted(set(sequences))
+        progress = ProgressBar(
+            f"{target} {stage}", len(unique_sequences), unit="seq"
+        )
+        for sequence_batch in chunks(unique_sequences, self.batch_size):
             X, S_true, mask, chain_M, residue_idx, chain_encoding = self._features(target)
             selected = self.torch.nonzero(
                 (chain_M[0] * mask[0]) > 0.0, as_tuple=False
@@ -1158,6 +1376,8 @@ class BasePlausibilityScorer:
                         f"Non-finite base plausibility for {target}:{sequence}"
                     )
                 result[sequence] = numeric
+            progress.update(len(sequence_batch))
+        progress.close()
         return result
 
 
@@ -1480,6 +1700,18 @@ def run(args: argparse.Namespace) -> None:
         "model_utils_program": sha256_file(MODEL_UTILS_PATH),
         "nmethyl_config_program": sha256_file(NMETHYL_CONFIG_PATH),
     }
+    portable_import: Optional[Dict[str, Any]] = None
+    portable_import_path: Optional[Path] = None
+    if str(args.portable_resume_manifest).strip():
+        portable_import_path = Path(args.portable_resume_manifest).resolve()
+        portable_import = validate_portable_resume_import(
+            portable_import_path,
+            out_dir,
+            model_path,
+            model_manifest_path,
+            representation_path,
+            baseline,
+        )
     config = {
         "protocol": V8_SEARCH_PROTOCOL,
         "input_hashes": input_hashes,
@@ -1529,6 +1761,16 @@ def run(args: argparse.Namespace) -> None:
         "probability_persistence_decimal_places": 8,
         "probability_rounding_implementation": "Python round(value, 8)",
         "full_budget_no_early_stop": True,
+        "resume_mode": (
+            "HASH_PINNED_CROSS_RUNTIME_EVIDENCE_IMPORT_WITH_DESTINATION_REAUDIT"
+            if portable_import is not None
+            else "SAME_RUNTIME_LEDGER_MODEL_REPLAY"
+        ),
+        "portable_resume_import_sha256": (
+            sha256_file(portable_import_path)
+            if portable_import_path is not None
+            else None
+        ),
     }
     config_digest = stable_json_sha256(config)
     existing_manifest = out_dir / "directed_search_manifest.json"
@@ -1734,9 +1976,26 @@ def run(args: argparse.Namespace) -> None:
             anchors, int(args.wne_radius)
         )
         search_sequences = sorted(search_provenance)
-        scored = methyl_scorer.score_minimal("3WNE", search_sequences, "exact_radius_2")
+        wne_ledger_path = out_dir / "3wne_exact_search_all.csv.gz"
+        if portable_import is not None:
+            if not wne_ledger_path.is_file():
+                raise RuntimeError("Portable resume lacks the 3WNE source ledger")
+            ledger = [
+                normalize_search_ledger_row(row)
+                for row in read_gzip_csv(wne_ledger_path)
+            ]
+            scored = {str(row["sequence"]): row for row in ledger}
+            if len(scored) != len(ledger) or set(scored) != set(search_sequences):
+                raise RuntimeError(
+                    "Portable 3WNE ledger is not the exact frozen radius-2 budget"
+                )
+        else:
+            scored = methyl_scorer.score_minimal(
+                "3WNE", search_sequences, "exact_radius_2"
+            )
         for sequence, row in scored.items():
-            row.update(search_provenance[sequence])
+            if portable_import is None:
+                row.update(search_provenance[sequence])
             validate_search_ledger_row(
                 row,
                 "3WNE",
@@ -1745,11 +2004,12 @@ def run(args: argparse.Namespace) -> None:
                 search_provenance[sequence],
             )
         ledger = list(scored.values())
-        atomic_write_gzip_csv(
-            out_dir / "3wne_exact_search_all.csv.gz",
-            ledger,
-            list(ledger[0]) if ledger else SEARCH_LEDGER_FIELDS,
-        )
+        if portable_import is None:
+            atomic_write_gzip_csv(
+                wne_ledger_path,
+                ledger,
+                list(ledger[0]) if ledger else SEARCH_LEDGER_FIELDS,
+            )
         evaluated_counts["3WNE"] = len(scored)
         evaluated_sequences["3WNE"] = set(scored)
         for sequence, row in scored.items():
@@ -1784,6 +2044,11 @@ def run(args: argparse.Namespace) -> None:
         seen: set[str]
         beam: List[Dict[str, Any]]
         if checkpoints and args.resume:
+            checkpoint_config_digest = (
+                str(portable_import["source_config_sha256"])
+                if portable_import is not None
+                else config_digest
+            )
             (
                 completed_round,
                 seen,
@@ -1793,12 +2058,13 @@ def run(args: argparse.Namespace) -> None:
             ) = reconstruct_and_validate_zgc_resume(
                 out_dir,
                 checkpoints,
-                config_digest,
+                checkpoint_config_digest,
                 int(args.zgc_beam_width),
                 initial_provenance,
                 int(args.zgc_offspring_per_round),
                 np,
                 methyl_scorer.score_minimal,
+                validate_model_scores=portable_import is None,
             )
             if completed_round > int(args.zgc_rounds):
                 raise RuntimeError("3ZGC checkpoint exceeds the frozen round budget")
@@ -1922,16 +2188,36 @@ def run(args: argparse.Namespace) -> None:
                 if str(row["target_name"]).upper() == target
             }
         )
-        pool_base = base_scorer.score(target, target_pool_sequences)
+        pool_base = base_scorer.score(
+            target,
+            target_pool_sequences,
+            stage="baseline plausibility floor",
+        )
         floor = nearest_rank_percentile(list(pool_base.values()), BASE_PERCENTILE)
         qualified_sequences = sorted(all_qualified[target])
-        candidate_base = base_scorer.score(target, qualified_sequences) if qualified_sequences else {}
+        candidate_base = (
+            base_scorer.score(
+                target,
+                qualified_sequences,
+                stage="strict-hit plausibility",
+            )
+            if qualified_sequences
+            else {}
+        )
         historical_natural, historical_cyclic = exclusion_keys(historical_rows, target)
         prior_natural, prior_cyclic = exclusion_keys(prior_rows, target)
         pool_natural, pool_cyclic = exclusion_keys(baseline_unique, target)
         native_natural = {NATIVE_CONTROLS[target]}
         native_cyclic = {forward_cyclic_identity(value) for value in native_natural}
-        full_payload = methyl_scorer.score_full(target, qualified_sequences) if qualified_sequences else {}
+        full_payload = (
+            methyl_scorer.score_full(
+                target,
+                qualified_sequences,
+                stage="strict-hit full annotation",
+            )
+            if qualified_sequences
+            else {}
+        )
         accepted_cyclic: set[str] = set()
         batch_one_scorer = MethylScorer(
             model,
@@ -1951,7 +2237,13 @@ def run(args: argparse.Namespace) -> None:
                 sequence,
             ),
         )
+        batch_one_progress = ProgressBar(
+            f"{target} eligibility + batch-one audit",
+            len(ordered),
+            unit="candidate",
+        )
         for sequence in ordered:
+            batch_one_progress.update(1)
             search_row = all_qualified[target][sequence]
             search_maximum = float(search_row["maximum_probability"])
             if not strict_rounded_pass(search_maximum):
@@ -2021,7 +2313,12 @@ def run(args: argparse.Namespace) -> None:
                 continue
             # Independent batch-one scoring is deliberately separate from the
             # search batches and is the final probability gate.
-            independent = batch_one_scorer.score_full(target, [sequence])[sequence]
+            independent = batch_one_scorer.score_full(
+                target,
+                [sequence],
+                stage="batch-one release audit",
+                show_progress=False,
+            )[sequence]
             independent_probabilities = [
                 float(value)
                 for value in json.loads(str(independent["methyl_probabilities"]))
@@ -2098,6 +2395,7 @@ def run(args: argparse.Namespace) -> None:
                     "permeability_id": "",
                 }
             )
+        batch_one_progress.close()
 
     atomic_write_csv(
         out_dir / "qualified_candidate_plausibility_and_novelty.csv",
@@ -2291,6 +2589,10 @@ def run(args: argparse.Namespace) -> None:
             for row in release_rows
         ),
         "no_formal_abstention_or_threshold_change": True,
+        "portable_resume_source_is_hash_pinned_and_destination_reaudit_required": (
+            portable_import is None
+            or portable_import.get("quality_gate") == "PASS"
+        ),
     }
     quality_gate = "PASS" if all(quality_checks.values()) else "FAIL"
     artifacts: Dict[str, Any] = {
@@ -2350,6 +2652,27 @@ def run(args: argparse.Namespace) -> None:
         "permeability_status": "DEFERRED_UNTIL_STRUCTURE_GATES_PASS",
         "quality_checks": quality_checks,
         "artifacts": artifacts,
+        "checkpoint_config_sha256": (
+            str(portable_import["source_config_sha256"])
+            if portable_import is not None
+            else config_digest
+        ),
+        "resume_provenance": (
+            {
+                "mode": config["resume_mode"],
+                "source_commit": portable_import["source_commit"],
+                "source_search_program_sha256": portable_import[
+                    "source_search_program_sha256"
+                ],
+                "source_config_sha256": portable_import["source_config_sha256"],
+                "portable_import_manifest": str(portable_import_path),
+                "portable_import_manifest_sha256": sha256_file(portable_import_path),
+                "destination_full_ledger_reaudit_required": True,
+                "destination_rescore_tolerance": PORTABLE_RESCORE_TOLERANCE,
+            }
+            if portable_import is not None
+            else None
+        ),
     }
     atomic_write_json(existing_manifest, manifest)
 
@@ -2398,6 +2721,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--allow-cpu", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--portable-resume-manifest",
+        default="",
+        help=(
+            "Hash-pinned AutoDL import manifest for a completed Windows round-6 "
+            "ledger/checkpoint set. Final candidates and the independent final "
+            "ledger audit are still recomputed on the destination GPU."
+        ),
+    )
     return parser.parse_args()
 
 

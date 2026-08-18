@@ -318,3 +318,46 @@ powershell -ExecutionPolicy Bypass -File .\run_serine_qc_cyclic_representation_v
 ```
 
 V6 人工复核通过前，结构交接和透膜性步骤都保持阻断。
+
+## V8 六轮完成后迁移 AutoDL 5090
+
+该路径仅适用于已经由提交 `53ce92e` 完成 `3zgc_round_06.json.gz`、但尚未写出
+`directed_search_manifest.json` 的 Windows 运行。它不会重新搜索或改变
+`>0.6` 门槛：导出端核对旧脚本哈希、旧运行环境摘要、全部 ledger/checkpoint
+哈希与精确搜索预算；AutoDL 只导入六轮证据并继续候选 plausibility、完整标注
+和 batch-one 复核。最终三遍审计仍在目标 GPU 上重算全部搜索 ledger，并要求
+严格通过位、argmax 位点和残基一致，跨 GPU 八位概率差不得超过 `2e-6`。
+
+Windows 停止旧 Python 进程并更新分支后导出：
+
+```powershell
+cd E:\ProteinMPNN_work\proteinmpnn-clean-v28
+git pull --ff-only origin fix/serine-provenance-retrain-2026
+D:\anaconda\envs\wain\python.exe .\paper_clean_v28\serine_qc_retrain\16_v8_autodl_resume_bundle.py export
+```
+
+上传仓库根目录生成的 `v8_autodl_resume_bundle.zip` 到
+`/root/autodl-tmp/`。AutoDL 推荐 5090 32 GB、PyTorch 2.8.0、Python 3.10、
+CUDA 12.8 镜像。新实例中克隆分支后运行：
+
+```bash
+bash run_v8_autodl_resume.sh /root/autodl-tmp/v8_autodl_resume_bundle.zip
+```
+
+所有长 GPU 阶段都会显示百分比、完成数、速度、已用时间和 ETA。真正完成标志：
+
+```text
+V8 ALL AUTOMATED GATES PASSED; MANUAL SCIENTIFIC REVIEW IS NEXT
+Final coverage: 17/17; no formal abstention
+Shang-ge handoff: NOT CREATED
+```
+
+最终人工复核包位于：
+
+```text
+paper_clean_v28_outputs/serine_qc_source_scoped_hybrid_v8/
+  serine_qc_source_scoped_hybrid_v8_review_bundle.zip
+```
+
+该 ZIP 可以交给尚哥进行人工科学复核，但仍不是结构计算 handoff；人工确认最终
+序列后再单独创建正式结构任务。

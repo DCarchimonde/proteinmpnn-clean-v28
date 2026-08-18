@@ -42,6 +42,10 @@ v8_finalizer = load_module(
     "source_scoped_hybrid_v8_finalizer",
     RETRAIN_DIR / "15_finalize_and_audit_recovery_v8.py",
 )
+v8_bundle = load_module(
+    "source_scoped_hybrid_v8_autodl_bundle",
+    RETRAIN_DIR / "16_v8_autodl_resume_bundle.py",
+)
 
 
 class FakeTensor:
@@ -820,6 +824,85 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
         self.assertNotIn("hybrid_metadata = dict(v7_metadata)", (
             RETRAIN_DIR / "12_compose_source_scoped_hybrid_v8.py"
         ).read_text(encoding="utf-8"))
+
+    def test_cross_runtime_ledger_tolerance_never_changes_strict_pass_bits(self):
+        persisted = [{
+            "target_name": "3ZGC",
+            "sequence": "AAAAAAA",
+            "search_stage": "round",
+            "maximum_probability": 0.61000000,
+            "argmax_position_1based": 1,
+            "argmax_residue": "A",
+            "passes_strict_probability": 1,
+        }]
+
+        def close_score(_target, sequences, _stage):
+            return {
+                sequence: {
+                    **persisted[0],
+                    "sequence": sequence,
+                    "maximum_probability": 0.61000150,
+                }
+                for sequence in sequences
+            }
+
+        with self.assertRaises(RuntimeError):
+            v8_search.validate_ledger_scores_against_model(
+                persisted, "3ZGC", "round", close_score
+            )
+        audit = v8_search.validate_ledger_scores_against_model(
+            persisted, "3ZGC", "round", close_score, 2e-6
+        )
+        self.assertEqual(audit["rows"], 1)
+        self.assertLessEqual(audit["maximum_absolute_probability_difference"], 2e-6)
+
+        def changed_gate(_target, sequences, _stage):
+            return {
+                sequence: {
+                    **persisted[0],
+                    "sequence": sequence,
+                    "maximum_probability": 0.59999999,
+                    "passes_strict_probability": 0,
+                }
+                for sequence in sequences
+            }
+
+        with self.assertRaises(RuntimeError):
+            v8_search.validate_ledger_scores_against_model(
+                persisted, "3ZGC", "round", changed_gate, 0.02
+            )
+
+    def test_autodl_resume_bundle_and_runner_preserve_full_destination_reaudit(self):
+        self.assertEqual(
+            v8_bundle.SOURCE_COMMIT,
+            "53ce92e5238d717fc982357b4c58f65538a8f710",
+        )
+        self.assertEqual(v8_bundle.RESCORE_TOLERANCE, 2e-6)
+        payload = {"a": {"b": ["old"]}}
+        v8_bundle.set_pointer(payload, ["a", "b", 0], "new")
+        self.assertEqual(payload, {"a": {"b": ["new"]}})
+        with self.assertRaises(RuntimeError):
+            v8_bundle.safe_member("../escape")
+
+        runner = (ROOT / "run_v8_autodl_resume.sh").read_text(encoding="utf-8")
+        self.assertIn("--portable-resume-manifest", runner)
+        self.assertIn("15_finalize_and_audit_recovery_v8.py", runner)
+        self.assertIn("package-review", runner)
+        self.assertIn("--batch-size 64", runner)
+        self.assertIn("--base-batch-size 32", runner)
+
+        search_source = (
+            RETRAIN_DIR / "14_directed_recovery_search_v8.py"
+        ).read_text(encoding="utf-8")
+        finalizer_source = (
+            RETRAIN_DIR / "15_finalize_and_audit_recovery_v8.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("class ProgressBar", search_source)
+        self.assertIn("destination_full_ledger_reaudit_required", search_source)
+        self.assertIn(
+            "portable_cross_runtime_full_ledger_reaudit_passes_within_tolerance",
+            finalizer_source,
+        )
 
     def test_finalizer_cannot_emit_handoff_or_permeability_inputs(self):
         source = (

@@ -958,6 +958,22 @@ def run(args: argparse.Namespace) -> None:
     ):
         raise RuntimeError("V8 baseline is not an intact PASS/recoverable overlay source")
     search_config = dict(search_manifest.get("config") or {})
+    resume_provenance = dict(search_manifest.get("resume_provenance") or {})
+    portable_resume = bool(resume_provenance)
+    ledger_rescore_tolerance = (
+        float(resume_provenance.get("destination_rescore_tolerance", -1.0))
+        if portable_resume
+        else 0.0
+    )
+    if portable_resume and not (
+        resume_provenance.get("mode")
+        == "HASH_PINNED_CROSS_RUNTIME_EVIDENCE_IMPORT_WITH_DESTINATION_REAUDIT"
+        and resume_provenance.get("destination_full_ledger_reaudit_required") is True
+        and ledger_rescore_tolerance == 2e-6
+        and str(search_manifest.get("checkpoint_config_sha256", ""))
+        == str(resume_provenance.get("source_config_sha256", ""))
+    ):
+        raise RuntimeError("Portable resume provenance is incomplete or stale")
     search_input_hashes = dict(search_config.get("input_hashes") or {})
     expected_search_input_hashes = {
         "model": sha256_file(model_path),
@@ -1397,6 +1413,7 @@ def run(args: argparse.Namespace) -> None:
                 "3WNE",
                 "exact_radius_2",
                 ledger_rescorer.score_minimal,
+                ledger_rescore_tolerance,
             )
         except (KeyError, RuntimeError, ValueError) as exc:
             search_provenance_errors.append(str(exc))
@@ -1429,12 +1446,18 @@ def run(args: argparse.Namespace) -> None:
             ) = search_module.reconstruct_and_validate_zgc_resume(
                 search_dir,
                 ordered_checkpoints,
-                str(search_manifest["config_sha256"]),
+                str(
+                    search_manifest.get(
+                        "checkpoint_config_sha256",
+                        search_manifest["config_sha256"],
+                    )
+                ),
                 512,
                 expected_initial_zgc,
                 4096,
                 np,
                 ledger_rescorer.score_minimal,
+                score_tolerance=ledger_rescore_tolerance,
             )
             if completed_round != 6 or replayed_seen != ledger_sequences["3ZGC"]:
                 raise RuntimeError(
@@ -1489,7 +1512,11 @@ def run(args: argparse.Namespace) -> None:
                     if str(row.get("target_name", "")).upper() == target
                 }
             )
-            pool_scores = base_rescorer.score(target, pool_sequences)
+            pool_scores = base_rescorer.score(
+                target,
+                pool_sequences,
+                stage="final-audit baseline plausibility floor",
+            )
             floor = search_module.nearest_rank_percentile(
                 list(pool_scores.values()), search_module.BASE_PERCENTILE
             )
@@ -1499,7 +1526,11 @@ def run(args: argparse.Namespace) -> None:
                 for evidence_target, sequence in plausibility_by_key
                 if evidence_target == target
             )
-            evidence_scores = base_rescorer.score(target, evidence_sequences)
+            evidence_scores = base_rescorer.score(
+                target,
+                evidence_sequences,
+                stage="final-audit strict-hit plausibility",
+            )
             for sequence, score in evidence_scores.items():
                 independent_base_by_key[(target, sequence)] = float(score)
             for sequence in evidence_sequences:
@@ -1539,7 +1570,13 @@ def run(args: argparse.Namespace) -> None:
     for row in baseline_eligible:
         baseline_annotation_errors.extend(validate_annotation_row(row))
         baseline_annotation_errors.extend(validate_eligible_candidate_row(row, 1))
+    directed_progress = search_module.ProgressBar(
+        "final audit directed batch-one replay",
+        len(directed_rows),
+        unit="candidate",
+    )
     for row in directed_rows:
+        directed_progress.update(1)
         directed_annotation_errors.extend(validate_annotation_row(row))
         directed_annotation_errors.extend(validate_eligible_candidate_row(row, 0))
         row_id = str(row.get("candidate_id", ""))
@@ -1671,7 +1708,12 @@ def run(args: argparse.Namespace) -> None:
             directed_annotation_errors.append(
                 f"{row.get('candidate_id', '')}: directed provenance/eligibility contract mismatch"
             )
-        recomputed = rescorer.score_full(target, [sequence])[sequence]
+        recomputed = rescorer.score_full(
+            target,
+            [sequence],
+            stage="final audit batch-one replay",
+            show_progress=False,
+        )[sequence]
         if str(recomputed["design_seq"]) != str(row["design_seq"]):
             rescore_errors.append(f"{row['candidate_id']}: independent design mismatch")
         persisted = [float(value) for value in json.loads(str(row["methyl_probabilities"]))]
@@ -1717,6 +1759,7 @@ def run(args: argparse.Namespace) -> None:
             rescore_errors.append(
                 f"{row['candidate_id']}: independent maximum/difference mismatch"
             )
+    directed_progress.close()
 
     baseline_augmented = []
     for source in baseline_eligible:
@@ -1910,6 +1953,9 @@ def run(args: argparse.Namespace) -> None:
         "search_ledgers_replay_from_frozen_anchors_rng_and_beam": (
             not search_provenance_errors
         ),
+        "portable_cross_runtime_full_ledger_reaudit_passes_within_tolerance": (
+            not portable_resume or not search_provenance_errors
+        ),
         "every_directed_candidate_is_a_matching_strict_search_ledger_hit": (
             directed_rows_come_from_strict_ledger_hits
         ),
@@ -2053,6 +2099,24 @@ def run(args: argparse.Namespace) -> None:
         "search_manifest_sha256": sha256_file(
             search_dir / "directed_search_manifest.json"
         ),
+        "portable_resume_reaudit": {
+            "enabled": portable_resume,
+            "source_config_sha256": resume_provenance.get(
+                "source_config_sha256"
+            ),
+            "destination_full_ledger_rows_recomputed": (
+                sum(len(values) for values in ledger_sequences.values())
+                if portable_resume
+                else 0
+            ),
+            "probability_tolerance": ledger_rescore_tolerance,
+            "strict_pass_bits_required_to_match": True,
+            "quality_gate": (
+                "PASS"
+                if not portable_resume or not search_provenance_errors
+                else "FAIL"
+            ),
+        },
         "temperature": TEMPERATURE,
         "methyl_threshold": THRESHOLD,
         "strict_threshold_operator": ">",
@@ -2123,6 +2187,7 @@ def run(args: argparse.Namespace) -> None:
         "position_auditor_program_sha256": sha256_file(V7_AUDITOR_PATH),
         "test_reuse_limitation": model_manifest.get("test_reuse_limitation"),
         "development_status": model_manifest.get("development_status"),
+        "portable_resume_reaudit": final_manifest["portable_resume_reaudit"],
         "pass_1_integrity_and_rescore": {
             "quality_gate": pass_1,
             "checks": pass_1_checks,
