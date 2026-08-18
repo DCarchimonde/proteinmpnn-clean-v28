@@ -294,35 +294,37 @@ def validate_static_search_evidence(
             "targets_without_signature_candidate", []
         )
     }
-    if missing_targets != {"3WNE", "3ZGC"}:
-        raise RuntimeError(
-            "This portable path is pinned to the observed 3WNE+3ZGC missing state"
-        )
+    search.portable_resume_expected_evidence_names(missing_targets)
 
-    wne_path = SEARCH_DIR / "3wne_exact_search_all.csv.gz"
-    wne_rows = [
-        search.normalize_search_ledger_row(row)
-        for row in search.read_gzip_csv(wne_path)
-    ]
-    ranked_wne = search.top_ranked_sequences(baseline_unique, "3WNE")
-    wne_anchors = [
-        (ranked_wne[0], "current_v8_baseline_top"),
-        (
-            search.HISTORICAL_CONTROLS["3WNE"]["sequence"],
-            "withdrawn_historical_control",
-        ),
-        (search.NATIVE_CONTROLS["3WNE"], "native_control"),
-    ]
-    expected_wne = search.wne_search_provenance(wne_anchors, 2)
-    wne_by_sequence = {str(row["sequence"]): row for row in wne_rows}
-    if len(wne_rows) != len(wne_by_sequence) or set(wne_by_sequence) != set(
-        expected_wne
-    ):
-        raise RuntimeError("3WNE portable ledger is not the exact radius-2 budget")
-    for sequence, row in wne_by_sequence.items():
-        search.validate_search_ledger_row(
-            row, "3WNE", sequence, "exact_radius_2", expected_wne[sequence]
-        )
+    wne_rows: List[Dict[str, Any]] = []
+    wne_by_sequence: Dict[str, Dict[str, Any]] = {}
+    if "3WNE" in missing_targets:
+        wne_path = SEARCH_DIR / "3wne_exact_search_all.csv.gz"
+        wne_rows = [
+            search.normalize_search_ledger_row(row)
+            for row in search.read_gzip_csv(wne_path)
+        ]
+        ranked_wne = search.top_ranked_sequences(baseline_unique, "3WNE")
+        wne_anchors = [
+            (ranked_wne[0], "current_v8_baseline_top"),
+            (
+                search.HISTORICAL_CONTROLS["3WNE"]["sequence"],
+                "withdrawn_historical_control",
+            ),
+            (search.NATIVE_CONTROLS["3WNE"], "native_control"),
+        ]
+        expected_wne = search.wne_search_provenance(wne_anchors, 2)
+        wne_by_sequence = {str(row["sequence"]): row for row in wne_rows}
+        if len(wne_rows) != len(wne_by_sequence) or set(wne_by_sequence) != set(
+            expected_wne
+        ):
+            raise RuntimeError(
+                "3WNE portable ledger is not the exact radius-2 budget"
+            )
+        for sequence, row in wne_by_sequence.items():
+            search.validate_search_ledger_row(
+                row, "3WNE", sequence, "exact_radius_2", expected_wne[sequence]
+            )
 
     ranked_zgc = search.top_ranked_sequences(baseline_unique, "3ZGC")
     initial = [
@@ -403,7 +405,8 @@ def manifest_relocations(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
-def source_inventory() -> List[Path]:
+def source_inventory(missing_targets: Iterable[str]) -> List[Path]:
+    missing = {str(value).upper() for value in missing_targets}
     required = [
         V6_CHECKPOINT,
         V6_MANIFEST,
@@ -412,9 +415,10 @@ def source_inventory() -> List[Path]:
         TEST_JSONL,
         SEARCH_DIR / "mandatory_length_6_7_controls.csv",
         SEARCH_DIR / "search_trace_by_round.csv",
-        SEARCH_DIR / "3wne_exact_search_all.csv.gz",
         SEARCH_DIR / "3zgc_round_00_initial.csv.gz",
     ]
+    if "3WNE" in missing:
+        required.append(SEARCH_DIR / "3wne_exact_search_all.csv.gz")
     required.extend(
         SEARCH_DIR / f"3zgc_round_{index:02d}.csv.gz" for index in range(1, 7)
     )
@@ -461,7 +465,7 @@ def export_bundle(output_path: Path) -> None:
             f"checkpoint={sorted(checkpoint_digests)} reconstructed={source_config_sha256}"
         )
     static_audit = validate_static_search_evidence(search, source_config_sha256)
-    files = source_inventory()
+    files = source_inventory(static_audit["missing_targets"])
     file_inventory = {
         relative(path): {"sha256": sha256_file(path), "size": path.stat().st_size}
         for path in files

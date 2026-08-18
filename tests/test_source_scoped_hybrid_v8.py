@@ -904,6 +904,24 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
             finalizer_source,
         )
 
+    def test_round_six_portable_evidence_matches_the_frozen_missing_target_subset(self):
+        zgc_only = v8_search.portable_resume_expected_evidence_names(["3ZGC"])
+        self.assertNotIn("3wne_exact_search_all.csv.gz", zgc_only)
+        self.assertIn("3zgc_round_06.csv.gz", zgc_only)
+        self.assertIn("3zgc_round_06.json.gz", zgc_only)
+        self.assertEqual(len(zgc_only), 13)
+
+        both = v8_search.portable_resume_expected_evidence_names(
+            ["3WNE", "3ZGC"]
+        )
+        self.assertEqual(both - zgc_only, {"3wne_exact_search_all.csv.gz"})
+        with self.assertRaises(RuntimeError):
+            v8_search.portable_resume_expected_evidence_names(["3WNE"])
+        with self.assertRaises(RuntimeError):
+            v8_search.portable_resume_expected_evidence_names(
+                ["3ZGC", "UNSUPPORTED"]
+            )
+
     def test_finalizer_cannot_emit_handoff_or_permeability_inputs(self):
         source = (
             RETRAIN_DIR / "15_finalize_and_audit_recovery_v8.py"

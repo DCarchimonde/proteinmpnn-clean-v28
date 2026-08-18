@@ -223,6 +223,27 @@ def read_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def portable_resume_expected_evidence_names(
+    missing_targets: Iterable[str],
+) -> set[str]:
+    """Return the exact round-six evidence contract for the frozen target state."""
+
+    missing = {str(value).upper() for value in missing_targets}
+    if "3ZGC" not in missing or not missing <= ALLOWED_RECOVERY_TARGETS:
+        raise RuntimeError(
+            "Portable round-six resume requires 3ZGC and permits only the "
+            "frozen 3WNE/3ZGC recovery targets"
+        )
+    expected = {
+        "3zgc_round_00_initial.csv.gz",
+        *(f"3zgc_round_{index:02d}.csv.gz" for index in range(1, 7)),
+        *(f"3zgc_round_{index:02d}.json.gz" for index in range(1, 7)),
+    }
+    if "3WNE" in missing:
+        expected.add("3wne_exact_search_all.csv.gz")
+    return expected
+
+
 def validate_portable_resume_import(
     import_manifest_path: Path,
     out_dir: Path,
@@ -280,12 +301,10 @@ def validate_portable_resume_import(
         if not candidate.is_file() or sha256_file(candidate) != str(expected_hash):
             raise RuntimeError(f"Portable resume evidence hash mismatch: {relative_name}")
         resolved_evidence.append(candidate)
-    expected_names = {
-        "3wne_exact_search_all.csv.gz",
-        "3zgc_round_00_initial.csv.gz",
-        *(f"3zgc_round_{index:02d}.csv.gz" for index in range(1, 7)),
-        *(f"3zgc_round_{index:02d}.json.gz" for index in range(1, 7)),
-    }
+    static_audit = dict(payload.get("static_search_evidence_audit") or {})
+    expected_names = portable_resume_expected_evidence_names(
+        static_audit.get("missing_targets", [])
+    )
     observed_names = {candidate.name for candidate in resolved_evidence}
     if not expected_names <= observed_names:
         raise RuntimeError("Portable resume evidence inventory is incomplete")
