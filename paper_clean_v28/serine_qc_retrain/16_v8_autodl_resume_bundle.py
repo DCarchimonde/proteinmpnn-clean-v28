@@ -82,6 +82,20 @@ MANIFEST_REBASE_ORDER = (
     REPRESENTATION_MANIFEST,
     BASELINE_MANIFEST,
 )
+PLAN_PATH = SCRIPT_PATH.with_name("target_plan_cyclic_representation_v6.json")
+NATIVE_PATH = REPO_ROOT / "17_complexes_native.jsonl"
+HISTORICAL_PATH = (
+    REPO_ROOT
+    / "paper_clean_v28_outputs"
+    / "generated_fasta_clean_auto_single"
+    / "all_designs.csv"
+)
+PRIOR_PATH = (
+    REPO_ROOT
+    / "paper_clean_v28_outputs"
+    / "rerun_temperature_0.5_multiseed"
+    / "methylated_new_candidates.csv"
+)
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -116,6 +130,153 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
         encoding="utf-8",
     )
     os.replace(temporary, path)
+
+
+def verified_text_line_ending_style(data: bytes, expected_sha256: str) -> str:
+    """Return LF/CRLF when a digest differs only by platform newlines.
+
+    Exact-byte matches are handled by the caller.  This deliberately rejects
+    non-UTF-8 data, lone CR bytes, mixed newline styles, and every content
+    difference other than a uniform CRLF/LF conversion.
+    """
+
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("Cross-platform hash target is not UTF-8 text") from exc
+    lf = data.replace(b"\r\n", b"\n")
+    if b"\r" in lf:
+        raise RuntimeError("Cross-platform hash target contains a lone CR byte")
+    crlf = lf.replace(b"\n", b"\r\n")
+    if data not in {lf, crlf}:
+        raise RuntimeError("Cross-platform hash target has mixed newline styles")
+    variants = {
+        sha256_bytes(lf): "LF",
+        sha256_bytes(crlf): "CRLF",
+    }
+    if expected_sha256 not in variants:
+        raise RuntimeError("Manifest hash differs by more than CRLF/LF newlines")
+    return variants[expected_sha256]
+
+
+def declared_repo_file(
+    payload: Mapping[str, Any],
+    path_field: str,
+    expected_path: Path | None = None,
+) -> Path:
+    candidate = Path(str(payload.get(path_field, ""))).resolve()
+    try:
+        candidate.relative_to(REPO_ROOT.resolve())
+    except ValueError as exc:
+        raise RuntimeError(f"Manifest path escapes the repository: {path_field}") from exc
+    if not candidate.is_file():
+        raise FileNotFoundError(candidate)
+    if expected_path is not None and candidate != expected_path.resolve():
+        raise RuntimeError(
+            f"Manifest path is not the required destination: {path_field}"
+        )
+    return candidate
+
+
+def rebase_text_hash_field(
+    payload: MutableMapping[str, Any],
+    manifest_name: str,
+    hash_field: str,
+    target: Path,
+) -> Dict[str, str] | None:
+    target = target.resolve()
+    try:
+        target.relative_to(REPO_ROOT.resolve())
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Cross-platform hash target escapes the repository: {target}"
+        ) from exc
+    if not target.is_file():
+        raise FileNotFoundError(target)
+    source_sha256 = str(payload.get(hash_field, ""))
+    if len(source_sha256) != 64:
+        raise RuntimeError(f"Manifest lacks a valid SHA256 field: {hash_field}")
+    data = target.read_bytes()
+    destination_sha256 = sha256_bytes(data)
+    if source_sha256 == destination_sha256:
+        return None
+    source_style = verified_text_line_ending_style(data, source_sha256)
+    destination_style = verified_text_line_ending_style(data, destination_sha256)
+    payload[hash_field] = destination_sha256
+    return {
+        "manifest": manifest_name,
+        "field": hash_field,
+        "path": str(target),
+        "source_sha256": source_sha256,
+        "destination_sha256": destination_sha256,
+        "verified_relation": f"{source_style}_TO_{destination_style}_ONLY",
+    }
+
+
+def rebase_manifest_text_hashes(
+    manifest_path: Path, payload: MutableMapping[str, Any]
+) -> List[Dict[str, str]]:
+    """Re-sign only verified CRLF/LF-equivalent destination text inputs."""
+
+    name = relative(manifest_path)
+    targets: List[Tuple[str, Path]] = []
+    if manifest_path == MODEL_MANIFEST:
+        targets.extend(
+            (
+                ("composer_program_sha256", SCRIPT_PATH.with_name("12_compose_source_scoped_hybrid_v8.py")),
+                ("trainer_program_sha256", SCRIPT_PATH.with_name("02_retrain_canonical_expert_heads.py")),
+                ("common_program_sha256", REPO_ROOT / "paper_clean_v28" / "clean_v28_common.py"),
+                ("model_utils_program_sha256", REPO_ROOT / "model_utils.py"),
+                ("nmethyl_config_program_sha256", REPO_ROOT / "nmethyl" / "utils" / "nmethyl_config.py"),
+                ("test_jsonl_sha256", declared_repo_file(payload, "test_jsonl")),
+            )
+        )
+    elif manifest_path == REPRESENTATION_MANIFEST:
+        targets.extend(
+            (
+                ("representation_auditor_program_sha256", SCRIPT_PATH.with_name("13_audit_source_scoped_hybrid_v8.py")),
+                ("equivariance_auditor_program_sha256", SCRIPT_PATH.with_name("07_audit_cyclic_representation_equivariance.py")),
+                ("common_program_sha256", REPO_ROOT / "paper_clean_v28" / "clean_v28_common.py"),
+                ("model_utils_program_sha256", REPO_ROOT / "model_utils.py"),
+                ("nmethyl_config_program_sha256", REPO_ROOT / "nmethyl" / "utils" / "nmethyl_config.py"),
+                ("test_jsonl_sha256", declared_repo_file(payload, "test_jsonl")),
+                ("native_jsonl_sha256", declared_repo_file(payload, "native_jsonl", NATIVE_PATH)),
+                ("best_csv_sha256", declared_repo_file(payload, "best_csv")),
+                ("plan_sha256", declared_repo_file(payload, "plan", PLAN_PATH)),
+            )
+        )
+    elif manifest_path == BASELINE_MANIFEST:
+        targets.extend(
+            (
+                ("reannotator_program_sha256", SCRIPT_PATH.with_name("10_reannotate_v6_pool_serine_only_v7.py")),
+                ("generator_program_sha256", REPO_ROOT / "paper_clean_v28" / "rerun_t05" / "01_generate_t05_multiseed.py"),
+                ("common_program_sha256", REPO_ROOT / "paper_clean_v28" / "clean_v28_common.py"),
+                ("model_utils_program_sha256", REPO_ROOT / "model_utils.py"),
+                ("nmethyl_config_program_sha256", REPO_ROOT / "nmethyl" / "utils" / "nmethyl_config.py"),
+                ("plan_sha256", declared_repo_file(payload, "plan", PLAN_PATH)),
+                ("native_jsonl_sha256", declared_repo_file(payload, "native_jsonl", NATIVE_PATH)),
+                ("historical_design_csv_sha256", declared_repo_file(payload, "historical_design_csv", HISTORICAL_PATH)),
+                ("prior_handoff_csv_sha256", declared_repo_file(payload, "prior_handoff_csv", PRIOR_PATH)),
+            )
+        )
+        heldout = dict(payload.get("cyclic_representation_heldout_audit") or {})
+        change = rebase_text_hash_field(
+            heldout,
+            name + ":cyclic_representation_heldout_audit",
+            "plan_sha256",
+            PLAN_PATH,
+        )
+        payload["cyclic_representation_heldout_audit"] = heldout
+        changes = [change] if change is not None else []
+    else:
+        raise RuntimeError(f"Unexpected manifest in rebase order: {manifest_path}")
+    if manifest_path != BASELINE_MANIFEST:
+        changes = []
+    for field, target in targets:
+        change = rebase_text_hash_field(payload, name, field, target)
+        if change is not None:
+            changes.append(change)
+    return changes
 
 
 def load_search_module() -> Any:
@@ -626,6 +787,7 @@ def import_bundle(bundle_path: Path) -> None:
 
     relocations = dict(manifest.get("manifest_relocations") or {})
     relocated_hashes: Dict[str, Dict[str, str]] = {}
+    cross_platform_text_hash_rebases: List[Dict[str, str]] = []
     current_model_manifest_sha = ""
     current_representation_sha = ""
     for manifest_path in MANIFEST_REBASE_ORDER:
@@ -647,6 +809,9 @@ def import_bundle(bundle_path: Path) -> None:
             heldout = dict(payload.get("cyclic_representation_heldout_audit") or {})
             heldout["sha256"] = current_representation_sha
             payload["cyclic_representation_heldout_audit"] = heldout
+        cross_platform_text_hash_rebases.extend(
+            rebase_manifest_text_hashes(manifest_path, payload)
+        )
         atomic_write_json(manifest_path, payload)
         destination_sha = sha256_file(manifest_path)
         relocated_hashes[name] = {
@@ -688,6 +853,8 @@ def import_bundle(bundle_path: Path) -> None:
         "current_input_hashes": current_input_hashes,
         "current_imported_file_hashes": current_imported_file_hashes,
         "relocated_manifests": relocated_hashes,
+        "cross_platform_text_hash_rebases": cross_platform_text_hash_rebases,
+        "scientific_artifact_bytes_changed_by_rebase": False,
         "evidence_files": evidence_files,
         "static_search_evidence_audit": manifest[
             "static_search_evidence_audit"

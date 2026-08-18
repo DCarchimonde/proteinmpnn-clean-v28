@@ -960,6 +960,19 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             v8_bundle.safe_member("../escape")
 
+        lf = b"alpha\nbeta\n"
+        crlf = b"alpha\r\nbeta\r\n"
+        self.assertEqual(
+            v8_bundle.verified_text_line_ending_style(
+                lf, v8_bundle.sha256_bytes(crlf)
+            ),
+            "CRLF",
+        )
+        with self.assertRaises(RuntimeError):
+            v8_bundle.verified_text_line_ending_style(
+                lf, v8_bundle.sha256_bytes(b"alpha\ngamma\n")
+            )
+
         runner = (ROOT / "run_v8_autodl_resume.sh").read_text(encoding="utf-8")
         self.assertIn("--portable-resume-manifest", runner)
         self.assertIn("15_finalize_and_audit_recovery_v8.py", runner)
@@ -978,6 +991,9 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
             '"current_imported_file_hashes": current_imported_file_hashes',
             bundle_source,
         )
+        self.assertIn("rebase_manifest_text_hashes", bundle_source)
+        self.assertIn("cross_platform_text_hash_rebases", bundle_source)
+        self.assertIn("scientific_artifact_bytes_changed_by_rebase", bundle_source)
 
         recovery = (
             ROOT / "recover_v8_autodl_legacy_bundle.sh"
@@ -990,6 +1006,10 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
         self.assertIn("source_config", recovery)
         self.assertIn("input_hashes", recovery)
         self.assertIn("OMP_NUM_THREADS=16", recovery)
+        self.assertIn("CRLF/LF", recovery)
+        self.assertIn("search.validate_baseline", recovery)
+        self.assertIn("model/representation/baseline/finalizer gates", recovery)
+        self.assertIn("V8 BACKGROUND JOB IS HEALTHY", recovery)
 
         search_source = (
             RETRAIN_DIR / "14_directed_recovery_search_v8.py"
