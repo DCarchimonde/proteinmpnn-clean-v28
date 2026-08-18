@@ -979,6 +979,18 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
             bundle_source,
         )
 
+        recovery = (
+            ROOT / "recover_v8_autodl_legacy_bundle.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "0e916c311956108269b57960fc2ca18d388a3713",
+            recovery,
+        )
+        self.assertIn("COMPLETE PRE-RUN AUDIT PASSED", recovery)
+        self.assertIn("source_config", recovery)
+        self.assertIn("input_hashes", recovery)
+        self.assertIn("OMP_NUM_THREADS=16", recovery)
+
         search_source = (
             RETRAIN_DIR / "14_directed_recovery_search_v8.py"
         ).read_text(encoding="utf-8")
