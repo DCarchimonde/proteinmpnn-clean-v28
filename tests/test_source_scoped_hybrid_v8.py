@@ -1005,6 +1005,17 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
         self.assertIn("ALL V8 V2 AUTOMATED GATES PASSED", v2_runner)
         self.assertNotIn("tmux", v2_runner)
 
+        v2_bootstrap = (ROOT / "recover_v8_autodl_cyclic_v2.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("cda853e790f1cf37c0e5cdb2c01bf4dcd11f014b", v2_bootstrap)
+        self.assertIn("sha256sum -c", v2_bootstrap)
+        self.assertIn("codeload.github.com", v2_bootstrap)
+        self.assertIn("--retry-all-errors", v2_bootstrap)
+        self.assertIn("run_v8_autodl_recovery_v2.sh", v2_bootstrap)
+        self.assertNotIn("git clone", v2_bootstrap)
+        self.assertNotIn("tmux", v2_bootstrap)
+
         bundle_source = (
             RETRAIN_DIR / "16_v8_autodl_resume_bundle.py"
         ).read_text(encoding="utf-8")
