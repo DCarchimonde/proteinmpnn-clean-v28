@@ -1126,6 +1126,158 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
         self.assertTrue(sequences & {"EEEEEEE", "FFFFFFF"})
         self.assertEqual(len(sequences), 4)
 
+    def test_v2_cached_diversity_fill_is_exactly_equivalent_to_frozen_reference(self):
+        def frozen_reference(ranked, initial, width):
+            selected = {str(row["sequence"]): row for row in initial}
+            candidates = [
+                dict(row)
+                for row in ranked
+                if str(row["sequence"]) not in selected
+            ]
+            rank = {
+                str(row["sequence"]): index for index, row in enumerate(ranked)
+            }
+            while candidates and len(selected) < width:
+                if not selected:
+                    chosen = candidates[0]
+                else:
+                    chosen = max(
+                        candidates,
+                        key=lambda row: (
+                            min(
+                                sum(
+                                    left != right
+                                    for left, right in zip(
+                                        str(row["sequence"]), prior
+                                    )
+                                )
+                                for prior in selected
+                            ),
+                            -rank[str(row["sequence"])],
+                            str(row["sequence"]),
+                        ),
+                    )
+                selected[str(chosen["sequence"])] = chosen
+                candidates.remove(chosen)
+            return list(selected.values())[:width]
+
+        alphabet = v8_cyclic_recovery.NATURAL_AA
+        for seed in range(8):
+            rng = random.Random(seed)
+            sequences = set()
+            while len(sequences) < 180:
+                sequences.add("".join(rng.choice(alphabet) for _ in range(7)))
+            rows = [
+                {"sequence": sequence, "rank_payload": index}
+                for index, sequence in enumerate(sorted(sequences))
+            ]
+            rng.shuffle(rows)
+            for initial_count, width in ((0, 40), (7, 64), (53, 90)):
+                initial = [dict(row) for row in rows[:initial_count]]
+                ranked = [dict(row) for row in rows[initial_count:]]
+                expected = frozen_reference(ranked, initial, width)
+                observed = v8_cyclic_recovery.deterministic_diversity_fill(
+                    ranked, initial, width
+                )
+                self.assertEqual(observed, expected)
+
+    def test_v2_inflight_rows_are_hash_context_bound_and_fully_validated(self):
+        sequence = "ACDEFGH"
+        parent = "AAAAAAA"
+        stage = "V2 methyl screen round 01"
+        provenance = {
+            sequence: {
+                "generation_kind": "fixed_seed_multi_mutant",
+                "parent_sequence": parent,
+                "edit_distance": 2,
+                "mutation_positions_1based": json.dumps([2, 3]),
+                "rng_seed": "20260818:1",
+                "rng_draw_index": 7,
+            }
+        }
+        row = {
+            "target_name": "3ZGC",
+            "sequence": sequence,
+            "search_stage": stage,
+            "maximum_probability": 0.7,
+            "argmax_position_1based": 1,
+            "argmax_residue": "A",
+            "passes_strict_probability": 1,
+            **provenance[sequence],
+            "parent_cyclic_base_log_probability_mean": -1.25,
+        }
+        restored = v8_cyclic_recovery.validate_v2_methyl_screen_rows(
+            v8_search,
+            [row],
+            "3ZGC",
+            stage,
+            [sequence],
+            provenance,
+            {parent: -1.25},
+        )
+        self.assertEqual(restored[0]["passes_strict_probability"], 1)
+        tampered = dict(row)
+        tampered["parent_cyclic_base_log_probability_mean"] = -1.24
+        with self.assertRaises(RuntimeError):
+            v8_cyclic_recovery.validate_v2_methyl_screen_rows(
+                v8_search,
+                [tampered],
+                "3ZGC",
+                stage,
+                [sequence],
+                provenance,
+                {parent: -1.25},
+            )
+
+        values = [-1.0, -1.1, -1.2, -1.3, -1.4, -1.5, -1.6]
+        mean = sum(values) / len(values)
+        base_row = {
+            **row,
+            "cyclic_base_log_probability_mean": mean,
+            "cyclic_base_log_probability_min": min(values),
+            "cyclic_base_log_probability_max": max(values),
+            "cyclic_base_log_probability_span": max(values) - min(values),
+            "cyclic_base_log_probability_std": math.sqrt(
+                sum((value - mean) ** 2 for value in values) / len(values)
+            ),
+            "cyclic_base_physical_start_scores": json.dumps(values),
+            "cyclic_base_physical_start_count": 7,
+            "cyclic_base_decoder_order_count_per_start": 7,
+            "cyclic_base_total_ensemble_size": 49,
+            "cyclic_base_context_policy": v8_cyclic_recovery.V2_BASE_POLICY,
+        }
+        base_restored = v8_cyclic_recovery.validate_v2_cyclic_base_rows(
+            v8_search,
+            [base_row],
+            "3ZGC",
+            stage,
+            [sequence],
+            provenance,
+            {parent: -1.25},
+            7,
+        )
+        self.assertAlmostEqual(
+            base_restored[0]["cyclic_base_log_probability_mean"], mean
+        )
+
+        context_left = v8_cyclic_recovery.v2_round_context(
+            "a" * 64,
+            1,
+            [base_row],
+            ["BBBBBBB", "AAAAAAA"],
+            [sequence],
+            provenance,
+        )
+        context_right = v8_cyclic_recovery.v2_round_context(
+            "a" * 64,
+            1,
+            [base_row],
+            ["AAAAAAA", "BBBBBBB"],
+            [sequence],
+            provenance,
+        )
+        self.assertEqual(context_left, context_right)
+
     def test_v2_round_generation_is_fixed_seed_and_complete_for_singles(self):
         beam = [
             {

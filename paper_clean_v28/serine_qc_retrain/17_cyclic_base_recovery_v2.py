@@ -29,6 +29,7 @@ import math
 import os
 import platform
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
@@ -63,6 +64,7 @@ DEFAULT_PRIOR = (
 )
 
 V2_SEARCH_PROTOCOL = "cyclic_start_base_pareto_recovery_v8_v2"
+V2_INFLIGHT_PROTOCOL = "hash_pinned_v2_round_inflight_resume_v1"
 V2_BASE_POLICY = (
     "native_complex_receptor_visible_joint_peptide_coordinate_sequence_roll_"
     "residue_index_reset_all_physical_starts_all_decoder_orders_mean"
@@ -409,7 +411,17 @@ def deterministic_diversity_fill(
     selected: List[Dict[str, Any]],
     width: int,
 ) -> List[Dict[str, Any]]:
-    """Fill a beam by max-min Hamming distance with deterministic ties."""
+    """Fill a beam by max-min Hamming distance with deterministic ties.
+
+    The original V2 implementation recomputed every candidate-to-selected
+    Hamming distance after every insertion.  At the production round-one
+    shape (roughly 30,000 candidates and 3,700 seeds) that turns a small
+    seven-residue max-min problem into hundreds of billions of Python-level
+    comparisons.  Cache each candidate's current nearest distance instead:
+    initialize the cache in bounded NumPy blocks, then update it only against
+    the newly selected sequence.  This is exactly the same greedy objective
+    and tie order; only the implementation cost changes.
+    """
 
     selected_by_sequence = {str(row["sequence"]): row for row in selected}
     candidates = [
@@ -418,25 +430,149 @@ def deterministic_diversity_fill(
         if str(row["sequence"]) not in selected_by_sequence
     ]
     rank = {str(row["sequence"]): index for index, row in enumerate(ranked)}
-    while candidates and len(selected_by_sequence) < width:
-        if not selected_by_sequence:
-            chosen = candidates[0]
-        else:
-            chosen = max(
-                candidates,
-                key=lambda row: (
-                    min(
-                        sum(left != right for left, right in zip(
-                            str(row["sequence"]), prior
-                        ))
-                        for prior in selected_by_sequence
-                    ),
-                    -rank[str(row["sequence"])],
-                    str(row["sequence"]),
-                ),
+    if not candidates or len(selected_by_sequence) >= width:
+        return list(selected_by_sequence.values())[:width]
+
+    started = time.monotonic()
+    additions_required = max(0, int(width) - len(selected_by_sequence))
+    if len(candidates) >= 1000 and additions_required:
+        print(
+            "V2 deterministic diversity fill: "
+            f"candidates={len(candidates):,}; "
+            f"selected={len(selected_by_sequence):,}; "
+            f"additions<={additions_required:,}",
+            flush=True,
+        )
+    candidate_sequences = [str(row["sequence"]) for row in candidates]
+    prior_sequences = list(selected_by_sequence)
+    uniform_length = (
+        len({len(sequence) for sequence in [*candidate_sequences, *prior_sequences]})
+        == 1
+    )
+    numpy_module = None
+    candidate_tokens = None
+    if prior_sequences and uniform_length:
+        try:
+            numpy_module = __import__("numpy")
+            length = len(candidate_sequences[0])
+            candidate_tokens = numpy_module.frombuffer(
+                "".join(candidate_sequences).encode("ascii"),
+                dtype=numpy_module.uint8,
+            ).reshape(len(candidate_sequences), length)
+            prior_tokens = numpy_module.frombuffer(
+                "".join(prior_sequences).encode("ascii"),
+                dtype=numpy_module.uint8,
+            ).reshape(len(prior_sequences), length)
+            minimum_distances = numpy_module.full(
+                len(candidate_sequences), length + 1, dtype=numpy_module.int16
             )
-        selected_by_sequence[str(chosen["sequence"])] = chosen
-        candidates.remove(chosen)
+            candidate_block_size = 4096
+            prior_block_size = 256
+            for candidate_start in range(
+                0, len(candidate_sequences), candidate_block_size
+            ):
+                candidate_stop = min(
+                    candidate_start + candidate_block_size,
+                    len(candidate_sequences),
+                )
+                block = candidate_tokens[candidate_start:candidate_stop]
+                block_minimum = numpy_module.full(
+                    len(block), length + 1, dtype=numpy_module.int16
+                )
+                for prior_start in range(0, len(prior_sequences), prior_block_size):
+                    prior_stop = min(
+                        prior_start + prior_block_size, len(prior_sequences)
+                    )
+                    distances = numpy_module.count_nonzero(
+                        block[:, None, :]
+                        != prior_tokens[None, prior_start:prior_stop, :],
+                        axis=2,
+                    )
+                    block_minimum = numpy_module.minimum(
+                        block_minimum, distances.min(axis=1)
+                    )
+                minimum_distances[candidate_start:candidate_stop] = block_minimum
+        except (ImportError, UnicodeEncodeError, ValueError):
+            numpy_module = None
+            candidate_tokens = None
+
+    if prior_sequences and candidate_tokens is None:
+        minimum_distances = [
+            min(
+                sum(left != right for left, right in zip(sequence, prior))
+                for prior in prior_sequences
+            )
+            for sequence in candidate_sequences
+        ]
+    elif not prior_sequences:
+        minimum_distances = None
+
+    active = [True] * len(candidates)
+    while any(active) and len(selected_by_sequence) < width:
+        active_indices = [index for index, enabled in enumerate(active) if enabled]
+        if not selected_by_sequence:
+            chosen_index = active_indices[0]
+        else:
+            best_distance = max(
+                int(minimum_distances[index]) for index in active_indices
+            )
+            distance_ties = [
+                index
+                for index in active_indices
+                if int(minimum_distances[index]) == best_distance
+            ]
+            best_rank = min(rank[candidate_sequences[index]] for index in distance_ties)
+            rank_ties = [
+                index
+                for index in distance_ties
+                if rank[candidate_sequences[index]] == best_rank
+            ]
+            chosen_index = max(
+                rank_ties,
+                key=lambda index: (candidate_sequences[index], -index),
+            )
+        chosen = candidates[chosen_index]
+        chosen_sequence = candidate_sequences[chosen_index]
+        selected_by_sequence[chosen_sequence] = chosen
+        active[chosen_index] = False
+        if not any(active) or len(selected_by_sequence) >= width:
+            continue
+        if candidate_tokens is not None and numpy_module is not None:
+            distances = numpy_module.count_nonzero(
+                candidate_tokens != candidate_tokens[chosen_index], axis=1
+            )
+            if minimum_distances is None:
+                minimum_distances = distances
+            else:
+                minimum_distances = numpy_module.minimum(
+                    minimum_distances, distances
+                )
+        else:
+            if minimum_distances is None:
+                minimum_distances = [
+                    sum(
+                        left != right
+                        for left, right in zip(sequence, chosen_sequence)
+                    )
+                    for sequence in candidate_sequences
+                ]
+            else:
+                for index, sequence in enumerate(candidate_sequences):
+                    if active[index]:
+                        minimum_distances[index] = min(
+                            int(minimum_distances[index]),
+                            sum(
+                                left != right
+                                for left, right in zip(sequence, chosen_sequence)
+                            ),
+                        )
+    if len(candidates) >= 1000 and additions_required:
+        print(
+            "V2 deterministic diversity fill: complete; "
+            f"selected={len(selected_by_sequence):,}; "
+            f"elapsed={time.monotonic() - started:.2f}s",
+            flush=True,
+        )
     return list(selected_by_sequence.values())[:width]
 
 
@@ -616,6 +752,177 @@ def v2_round_provenance(
             },
         )
     return generated
+
+
+def v2_round_context(
+    config_digest: str,
+    round_index: int,
+    beam: Sequence[Mapping[str, Any]],
+    seen: Sequence[str],
+    to_score: Sequence[str],
+    provenance: Mapping[str, Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Hash every deterministic input that can affect one V2 search round."""
+
+    return {
+        "protocol": V2_INFLIGHT_PROTOCOL,
+        "config_sha256": str(config_digest),
+        "round_index": int(round_index),
+        "beam_sha256": stable_json_sha256({"rows": list(beam)}),
+        "seen_sequence_sha256": hashlib.sha256(
+            ("\n".join(sorted(set(seen))) + "\n").encode("ascii")
+        ).hexdigest(),
+        "to_score_sha256": hashlib.sha256(
+            ("\n".join(to_score) + "\n").encode("ascii")
+        ).hexdigest(),
+        "to_score_count": len(to_score),
+        "provenance_sha256": stable_json_sha256(
+            {"rows": {sequence: provenance[sequence] for sequence in to_score}}
+        ),
+    }
+
+
+def validate_v2_methyl_screen_rows(
+    old: Any,
+    rows: Sequence[Mapping[str, Any]],
+    target: str,
+    stage: str,
+    to_score: Sequence[str],
+    provenance: Mapping[str, Mapping[str, Any]],
+    parent_base: Mapping[str, float],
+) -> List[Dict[str, Any]]:
+    """Validate and type-restore a hash-pinned in-flight methyl screen."""
+
+    expected_sequences = list(to_score)
+    observed_sequences = [
+        str(row.get("sequence", "")).upper() for row in rows
+    ]
+    if observed_sequences != expected_sequences:
+        raise RuntimeError("V2 in-flight methyl screen sequence/order mismatch")
+    normalized: List[Dict[str, Any]] = []
+    for raw, sequence in zip(rows, expected_sequences):
+        row = old.normalize_search_ledger_row(raw)
+        old.validate_search_ledger_row(
+            row,
+            target,
+            sequence,
+            stage,
+            provenance[sequence],
+        )
+        parent = str(provenance[sequence]["parent_sequence"])
+        try:
+            observed_parent_base = float(
+                row["parent_cyclic_base_log_probability_mean"]
+            )
+            expected_parent_base = float(parent_base[parent])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Malformed V2 parent-base bridge score: {sequence}"
+            ) from exc
+        if not (
+            math.isfinite(observed_parent_base)
+            and observed_parent_base == expected_parent_base
+        ):
+            raise RuntimeError(
+                f"V2 parent-base bridge score mismatch: {sequence}"
+            )
+        row["parent_cyclic_base_log_probability_mean"] = observed_parent_base
+        normalized.append(row)
+    return normalized
+
+
+def validate_v2_cyclic_base_rows(
+    old: Any,
+    rows: Sequence[Mapping[str, Any]],
+    target: str,
+    stage: str,
+    shortlist_sequences: Sequence[str],
+    provenance: Mapping[str, Mapping[str, Any]],
+    parent_base: Mapping[str, float],
+    length: int,
+) -> List[Dict[str, Any]]:
+    """Validate and type-restore a hash-pinned in-flight base shortlist."""
+
+    normalized = validate_v2_methyl_screen_rows(
+        old,
+        rows,
+        target,
+        stage,
+        shortlist_sequences,
+        provenance,
+        parent_base,
+    )
+    for row in normalized:
+        sequence = str(row["sequence"])
+        try:
+            values = [
+                float(value)
+                for value in json.loads(
+                    str(row["cyclic_base_physical_start_scores"])
+                )
+            ]
+            mean = float(row["cyclic_base_log_probability_mean"])
+            minimum = float(row["cyclic_base_log_probability_min"])
+            maximum = float(row["cyclic_base_log_probability_max"])
+            span = float(row["cyclic_base_log_probability_span"])
+            standard_deviation = float(row["cyclic_base_log_probability_std"])
+            start_count = int(row["cyclic_base_physical_start_count"])
+            order_count = int(
+                row["cyclic_base_decoder_order_count_per_start"]
+            )
+            ensemble_size = int(row["cyclic_base_total_ensemble_size"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Malformed V2 cyclic-base in-flight row: {sequence}"
+            ) from exc
+        recomputed_mean = sum(values) / length if values else float("nan")
+        recomputed_std = (
+            math.sqrt(
+                sum((value - recomputed_mean) ** 2 for value in values) / length
+            )
+            if values
+            else float("nan")
+        )
+        if not (
+            len(values) == length
+            and all(
+                math.isfinite(value)
+                for value in [
+                    *values,
+                    mean,
+                    minimum,
+                    maximum,
+                    span,
+                    standard_deviation,
+                ]
+            )
+            and abs(recomputed_mean - mean) <= 2e-6
+            and abs(min(values) - minimum) <= 2e-6
+            and abs(max(values) - maximum) <= 2e-6
+            and abs((maximum - minimum) - span) <= 2e-6
+            and abs(recomputed_std - standard_deviation) <= 2e-6
+            and start_count == length
+            and order_count == length
+            and ensemble_size == length * length
+            and str(row.get("cyclic_base_context_policy", ""))
+            == V2_BASE_POLICY
+        ):
+            raise RuntimeError(
+                f"Inconsistent V2 cyclic-base in-flight row: {sequence}"
+            )
+        row.update(
+            {
+                "cyclic_base_log_probability_mean": mean,
+                "cyclic_base_log_probability_min": minimum,
+                "cyclic_base_log_probability_max": maximum,
+                "cyclic_base_log_probability_span": span,
+                "cyclic_base_log_probability_std": standard_deviation,
+                "cyclic_base_physical_start_count": start_count,
+                "cyclic_base_decoder_order_count_per_start": order_count,
+                "cyclic_base_total_ensemble_size": ensemble_size,
+            }
+        )
+    return normalized
 
 
 def validate_declared_artifact(declared: Mapping[str, Any], expected: Path) -> None:
@@ -1313,6 +1620,7 @@ def run(args: argparse.Namespace) -> None:
                 all_joint_hits[str(row["sequence"])] = row
         start_round = 1
         state_path = out_dir / "v2_resume_state.json"
+        inflight_path = out_dir / "v2_inflight_round_state.json"
         if args.resume and state_path.is_file():
             state = read_json(state_path)
             completed_round = int(state.get("completed_round", -1))
@@ -1417,55 +1725,167 @@ def run(args: argparse.Namespace) -> None:
                 f"V2 conditional search: resumed after round {completed_round}",
                 flush=True,
             )
+            if inflight_path.is_file():
+                stale_inflight = read_json(inflight_path)
+                if (
+                    stale_inflight.get("config_sha256") == config_digest
+                    and int(stale_inflight.get("round_index", -1))
+                    <= completed_round
+                ):
+                    inflight_path.unlink()
         for round_index in range(start_round, int(args.rounds) + 1):
             provenance = v2_round_provenance(
                 beam, round_index, int(args.offspring_per_round), np
             )
             to_score = sorted(set(provenance) - seen)
-            minimal = methyl_scorer.score_minimal(
-                target, to_score, f"V2 methyl screen round {round_index:02d}"
-            )
             parent_base = {
                 str(row["sequence"]): float(row["cyclic_base_log_probability_mean"])
                 for row in beam
             }
-            screen_rows: List[Dict[str, Any]] = []
-            for sequence in to_score:
-                source = provenance[sequence]
-                parent = str(source["parent_sequence"])
-                screen_rows.append(
-                    {
-                        **minimal[sequence],
-                        **source,
-                        "parent_cyclic_base_log_probability_mean": parent_base[parent],
-                    }
-                )
+            methyl_stage = f"V2 methyl screen round {round_index:02d}"
             screen_path = out_dir / f"v2_round_{round_index:02d}_methyl_screen.csv.gz"
-            atomic_write_gzip_csv(
-                screen_path,
-                screen_rows,
-                list(screen_rows[0]) if screen_rows else ["sequence"],
+            shortlist_path = out_dir / f"v2_round_{round_index:02d}_cyclic_base.csv.gz"
+            round_context = v2_round_context(
+                config_digest,
+                round_index,
+                beam,
+                sorted(seen),
+                to_score,
+                provenance,
             )
+            inflight: Optional[Dict[str, Any]] = None
+            if args.resume and inflight_path.is_file():
+                inflight = read_json(inflight_path)
+                if any(
+                    inflight.get(key) != value
+                    for key, value in round_context.items()
+                ):
+                    raise RuntimeError(
+                        "V2 in-flight round state belongs to a different context"
+                    )
+                if inflight.get("phase") not in {
+                    "methyl_screen_complete",
+                    "cyclic_base_shortlist_complete",
+                }:
+                    raise RuntimeError("V2 in-flight round phase is malformed")
+                if not (
+                    inflight.get("methyl_screen_filename") == screen_path.name
+                    and screen_path.is_file()
+                    and sha256_file(screen_path)
+                    == inflight.get("methyl_screen_sha256")
+                ):
+                    raise RuntimeError("V2 in-flight methyl screen is absent or stale")
+                screen_rows = validate_v2_methyl_screen_rows(
+                    old,
+                    old.read_gzip_csv(screen_path),
+                    target,
+                    methyl_stage,
+                    to_score,
+                    provenance,
+                    parent_base,
+                )
+                print(
+                    f"V2 round {round_index:02d}: reused hash-pinned "
+                    f"methyl screen ({len(screen_rows):,} rows)",
+                    flush=True,
+                )
+            else:
+                minimal = methyl_scorer.score_minimal(
+                    target, to_score, methyl_stage
+                )
+                screen_rows = []
+                for sequence in to_score:
+                    source = provenance[sequence]
+                    parent = str(source["parent_sequence"])
+                    screen_rows.append(
+                        {
+                            **minimal[sequence],
+                            **source,
+                            "parent_cyclic_base_log_probability_mean": parent_base[
+                                parent
+                            ],
+                        }
+                    )
+                atomic_write_gzip_csv(
+                    screen_path,
+                    screen_rows,
+                    list(screen_rows[0]) if screen_rows else ["sequence"],
+                )
+                inflight = {
+                    **round_context,
+                    "phase": "methyl_screen_complete",
+                    "methyl_screen_filename": screen_path.name,
+                    "methyl_screen_sha256": sha256_file(screen_path),
+                }
+                atomic_write_json(inflight_path, inflight)
             screening_paths.append(screen_path)
             shortlist_sequences = select_methyl_screen_shortlist(
                 screen_rows, int(args.shortlist_per_round), 7
             )
-            detailed = base_scorer.score_detailed(
-                target,
-                shortlist_sequences,
-                f"V2 cyclic-base shortlist round {round_index:02d}",
-            )
-            screen_by_sequence = {str(row["sequence"]): row for row in screen_rows}
-            shortlist_rows = [
-                {**screen_by_sequence[sequence], **detailed[sequence]}
-                for sequence in shortlist_sequences
-            ]
-            shortlist_path = out_dir / f"v2_round_{round_index:02d}_cyclic_base.csv.gz"
-            atomic_write_gzip_csv(
-                shortlist_path,
-                shortlist_rows,
-                list(shortlist_rows[0]) if shortlist_rows else ["sequence"],
-            )
+            if (
+                inflight is not None
+                and inflight.get("phase") == "cyclic_base_shortlist_complete"
+            ):
+                expected_shortlist_hash = hashlib.sha256(
+                    ("\n".join(shortlist_sequences) + "\n").encode("ascii")
+                ).hexdigest()
+                if not (
+                    inflight.get("cyclic_base_shortlist_filename")
+                    == shortlist_path.name
+                    and inflight.get("cyclic_base_shortlist_sequence_sha256")
+                    == expected_shortlist_hash
+                    and shortlist_path.is_file()
+                    and sha256_file(shortlist_path)
+                    == inflight.get("cyclic_base_shortlist_sha256")
+                ):
+                    raise RuntimeError(
+                        "V2 in-flight cyclic-base shortlist is absent or stale"
+                    )
+                shortlist_rows = validate_v2_cyclic_base_rows(
+                    old,
+                    old.read_gzip_csv(shortlist_path),
+                    target,
+                    methyl_stage,
+                    shortlist_sequences,
+                    provenance,
+                    parent_base,
+                    7,
+                )
+                print(
+                    f"V2 round {round_index:02d}: reused hash-pinned "
+                    f"cyclic-base shortlist ({len(shortlist_rows):,} rows)",
+                    flush=True,
+                )
+            else:
+                detailed = base_scorer.score_detailed(
+                    target,
+                    shortlist_sequences,
+                    f"V2 cyclic-base shortlist round {round_index:02d}",
+                )
+                screen_by_sequence = {
+                    str(row["sequence"]): row for row in screen_rows
+                }
+                shortlist_rows = [
+                    {**screen_by_sequence[sequence], **detailed[sequence]}
+                    for sequence in shortlist_sequences
+                ]
+                atomic_write_gzip_csv(
+                    shortlist_path,
+                    shortlist_rows,
+                    list(shortlist_rows[0]) if shortlist_rows else ["sequence"],
+                )
+                inflight = {
+                    **round_context,
+                    "phase": "cyclic_base_shortlist_complete",
+                    "methyl_screen_filename": screen_path.name,
+                    "methyl_screen_sha256": sha256_file(screen_path),
+                    "cyclic_base_shortlist_filename": shortlist_path.name,
+                    "cyclic_base_shortlist_sha256": sha256_file(shortlist_path),
+                    "cyclic_base_shortlist_sequence_sha256": hashlib.sha256(
+                        ("\n".join(shortlist_sequences) + "\n").encode("ascii")
+                    ).hexdigest(),
+                }
+                atomic_write_json(inflight_path, inflight)
             shortlist_paths.append(shortlist_path)
             for row in shortlist_rows:
                 if (
@@ -1535,6 +1955,8 @@ def run(args: argparse.Namespace) -> None:
                     },
                 },
             )
+            if inflight_path.is_file():
+                inflight_path.unlink()
         joint_sequences = sorted(all_joint_hits)
         if joint_sequences:
             joint_minimal = {

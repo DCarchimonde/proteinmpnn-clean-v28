@@ -45,6 +45,21 @@ The fixed fallback budget can still end in an honest failure if the frozen
 model contains no sequence satisfying both hard gates. V2 never converts that
 state into formal abstention, lowers the threshold, or fabricates a release.
 
+## Runtime-resume implementation
+
+The max-min Hamming diversity rule is unchanged, including its deterministic
+tie order. Its nearest-distance values are cached and updated incrementally;
+the production round-one shape completes this CPU-only selection in seconds
+instead of recomputing every candidate-to-selected pair after every insertion.
+
+Each conditional-search round now writes a configuration- and context-bound
+in-flight checkpoint after the methyl screen and again after the cyclic-base
+shortlist. The checkpoint pins the exact beam, seen set, generated sequence
+set, provenance map, and artifact SHA256. A restart may reuse an in-flight
+artifact only after its hash, complete sequence order, provenance fields,
+scores, physical-start vector, and ensemble summary all validate. Completed
+rounds continue to use the original full round-state audit.
+
 ## AutoDL entry point
 
 `run_v8_autodl_recovery_v2.sh` performs the complete input/GPU preflight and
