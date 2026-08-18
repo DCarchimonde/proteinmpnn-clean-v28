@@ -405,7 +405,7 @@ def manifest_relocations(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
-def source_inventory(missing_targets: Iterable[str]) -> List[Path]:
+def source_inventory(search: Any, missing_targets: Iterable[str]) -> List[Path]:
     missing = {str(value).upper() for value in missing_targets}
     required = [
         V6_CHECKPOINT,
@@ -413,6 +413,10 @@ def source_inventory(missing_targets: Iterable[str]) -> List[Path]:
         V7_CHECKPOINT,
         V7_MANIFEST,
         TEST_JSONL,
+        # This prior-handoff CSV is a generated, gitignored novelty input.  It
+        # must travel with the portable bundle; the other runtime data inputs
+        # are part of the pinned repository checkout on the destination.
+        search.DEFAULT_PRIOR,
         SEARCH_DIR / "mandatory_length_6_7_controls.csv",
         SEARCH_DIR / "search_trace_by_round.csv",
         SEARCH_DIR / "3zgc_round_00_initial.csv.gz",
@@ -465,7 +469,7 @@ def export_bundle(output_path: Path) -> None:
             f"checkpoint={sorted(checkpoint_digests)} reconstructed={source_config_sha256}"
         )
     static_audit = validate_static_search_evidence(search, source_config_sha256)
-    files = source_inventory(static_audit["missing_targets"])
+    files = source_inventory(search, static_audit["missing_targets"])
     file_inventory = {
         relative(path): {"sha256": sha256_file(path), "size": path.stat().st_size}
         for path in files
@@ -556,13 +560,18 @@ def import_is_reusable() -> bool:
         "baseline_manifest": BASELINE_MANIFEST,
     }
     expected = dict(payload.get("current_input_hashes") or {})
-    return set(expected) == set(current) and all(
+    imported_files = dict(payload.get("current_imported_file_hashes") or {})
+    return bool(imported_files) and set(expected) == set(current) and all(
         path.is_file() and sha256_file(path) == str(expected[name])
         for name, path in current.items()
     ) and all(
         (REPO_ROOT / name).is_file()
         and sha256_file(REPO_ROOT / name) == str(digest)
         for name, digest in dict(payload.get("evidence_files") or {}).items()
+    ) and all(
+        (REPO_ROOT / name).is_file()
+        and sha256_file(REPO_ROOT / name) == str(digest)
+        for name, digest in imported_files.items()
     )
 
 
@@ -660,6 +669,9 @@ def import_bundle(bundle_path: Path) -> None:
         "representation_audit": sha256_file(REPRESENTATION_MANIFEST),
         "baseline_manifest": sha256_file(BASELINE_MANIFEST),
     }
+    current_imported_file_hashes = {
+        name: sha256_file(REPO_ROOT / name) for name in sorted(inventory)
+    }
     imported = {
         "quality_gate": "PASS",
         "protocol": IMPORT_PROTOCOL,
@@ -674,6 +686,7 @@ def import_bundle(bundle_path: Path) -> None:
         "destination_rescore_tolerance": RESCORE_TOLERANCE,
         "destination_full_ledger_reaudit_required": True,
         "current_input_hashes": current_input_hashes,
+        "current_imported_file_hashes": current_imported_file_hashes,
         "relocated_manifests": relocated_hashes,
         "evidence_files": evidence_files,
         "static_search_evidence_audit": manifest[

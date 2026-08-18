@@ -966,6 +966,18 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
         self.assertIn("package-review", runner)
         self.assertIn("--batch-size 64", runner)
         self.assertIn("--base-batch-size 32", runner)
+        self.assertIn("V8 AUTODL RUNTIME PREFLIGHT PASSED", runner)
+        self.assertIn("current_imported_file_hashes", runner)
+        self.assertIn("OMP_NUM_THREADS=16", runner)
+
+        bundle_source = (
+            RETRAIN_DIR / "16_v8_autodl_resume_bundle.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("search.DEFAULT_PRIOR", bundle_source)
+        self.assertIn(
+            '"current_imported_file_hashes": current_imported_file_hashes',
+            bundle_source,
+        )
 
         search_source = (
             RETRAIN_DIR / "14_directed_recovery_search_v8.py"

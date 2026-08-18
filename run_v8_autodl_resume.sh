@@ -13,6 +13,10 @@ exec > >(tee -a "$TASK_LOG") 2>&1
 
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=16
+export MKL_NUM_THREADS=16
+export OPENBLAS_NUM_THREADS=16
+export NUMEXPR_NUM_THREADS=16
 
 echo "============================================================"
 echo "V8 AUTODL PORTABLE RESUME + FULL DESTINATION REAUDIT"
@@ -66,6 +70,79 @@ cd "$TASK_REPO"
 "$TASK_PYTHON" \
   paper_clean_v28/serine_qc_retrain/16_v8_autodl_resume_bundle.py \
   import --bundle "$TASK_BUNDLE"
+
+"$TASK_PYTHON" - "$TASK_REPO" "$TASK_V8_ROOT" "$TASK_IMPORT_MANIFEST" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+
+repo = Path(sys.argv[1]).resolve()
+v8_root = Path(sys.argv[2]).resolve()
+import_manifest_path = Path(sys.argv[3]).resolve()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+if not import_manifest_path.is_file():
+    raise SystemExit(f"Runtime preflight missing import manifest: {import_manifest_path}")
+import_manifest = json.loads(import_manifest_path.read_text(encoding="utf-8"))
+imported_files = dict(import_manifest.get("current_imported_file_hashes") or {})
+if not imported_files:
+    raise SystemExit(
+        "Runtime preflight requires a bundle exported with the complete portable "
+        "input contract"
+    )
+for name, expected in imported_files.items():
+    path = repo / name
+    if not path.is_file():
+        raise SystemExit(f"Runtime preflight missing imported file: {path}")
+    if sha256_file(path) != str(expected):
+        raise SystemExit(f"Runtime preflight imported-file hash mismatch: {path}")
+
+required = [
+    repo / "17_complexes_native.jsonl",
+    repo / "model_utils.py",
+    repo / "nmethyl/utils/nmethyl_config.py",
+    repo / "paper_clean_v28/clean_v28_common.py",
+    repo / "paper_clean_v28/rerun_t05/01_generate_t05_multiseed.py",
+    repo / "paper_clean_v28/serine_qc_retrain/10_reannotate_v6_pool_serine_only_v7.py",
+    repo / "paper_clean_v28/serine_qc_retrain/11_triple_audit_serine_only_v7.py",
+    repo / "paper_clean_v28/serine_qc_retrain/14_directed_recovery_search_v8.py",
+    repo / "paper_clean_v28/serine_qc_retrain/15_finalize_and_audit_recovery_v8.py",
+    repo / "paper_clean_v28/serine_qc_retrain/target_plan_cyclic_representation_v6.json",
+    repo / "paper_clean_v28_outputs/generated_fasta_clean_auto_single/all_designs.csv",
+    repo / "paper_clean_v28_outputs/rerun_temperature_0.5_multiseed/methylated_new_candidates.csv",
+    v8_root / "model/frankenstein_v28_source_scoped_hybrid_v8.pt",
+    v8_root / "model/expert_source_composition_manifest.json",
+    v8_root / "representation_audit/cyclic_representation_audit.json",
+    v8_root / "generation_baseline/all_candidates.csv",
+    v8_root / "generation_baseline/unique_candidates.csv",
+    v8_root / "generation_baseline/methylated_new_candidates.csv",
+    v8_root / "generation_baseline/target_manifest.csv",
+    v8_root / "generation_baseline/generation_summary_by_target.csv",
+    v8_root / "generation_baseline/generation_manifest.json",
+    v8_root / "directed_search/mandatory_length_6_7_controls.csv",
+]
+missing = [str(path) for path in required if not path.is_file()]
+if missing:
+    raise SystemExit(
+        "Runtime preflight found all missing inputs before GPU work:\n- "
+        + "\n- ".join(missing)
+    )
+print(
+    f"===== V8 AUTODL RUNTIME PREFLIGHT PASSED: "
+    f"{len(imported_files)} imported + {len(required)} runtime files =====",
+    flush=True,
+)
+PY
 
 "$TASK_PYTHON" \
   paper_clean_v28/serine_qc_retrain/14_directed_recovery_search_v8.py \
