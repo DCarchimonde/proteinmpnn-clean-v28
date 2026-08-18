@@ -4,6 +4,7 @@ import ast
 import hashlib
 import importlib.util
 import math
+import random
 import re
 import sys
 import tempfile
@@ -373,6 +374,81 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
         diverse_second = v8_search.select_diverse_sequences(ranking, count=5)
         self.assertEqual(diverse_first, diverse_second)
         self.assertEqual(len(diverse_first), len(set(diverse_first)))
+
+    def test_incremental_beam_selection_is_exactly_equivalent_to_frozen_reference(self):
+        def frozen_reference(scored, width, length):
+            ordered = sorted(
+                (dict(value) for value in scored.values()),
+                key=lambda row: (
+                    -float(row["maximum_probability"]),
+                    str(row["sequence"]),
+                ),
+            )
+            selected = []
+            seen = set()
+            per_position = max(1, min(32, width // max(1, 2 * length)))
+            for position in range(1, length + 1):
+                candidates = [
+                    row
+                    for row in ordered
+                    if int(row["argmax_position_1based"]) == position
+                ]
+                for row in candidates[:per_position]:
+                    sequence = str(row["sequence"])
+                    if sequence not in seen:
+                        selected.append(row)
+                        seen.add(sequence)
+            score_fill = min(width, max(len(selected), int(width * 0.75)))
+            for row in ordered:
+                if len(selected) >= score_fill:
+                    break
+                sequence = str(row["sequence"])
+                if sequence not in seen:
+                    selected.append(row)
+                    seen.add(sequence)
+            diversity_pool = [
+                row
+                for row in ordered[: max(width * 8, width)]
+                if str(row["sequence"]) not in seen
+            ]
+            while diversity_pool and len(selected) < width:
+                chosen = max(
+                    diversity_pool,
+                    key=lambda row: (
+                        min(
+                            v8_search.hamming(
+                                str(row["sequence"]), str(prior["sequence"])
+                            )
+                            for prior in selected
+                        ),
+                        float(row["maximum_probability"]),
+                        str(row["sequence"]),
+                    ),
+                )
+                selected.append(chosen)
+                seen.add(str(chosen["sequence"]))
+                diversity_pool.remove(chosen)
+            return selected[:width]
+
+        alphabet = v8_search.NATURAL_AA
+        for seed in range(5):
+            rng = random.Random(seed)
+            scored = {}
+            for index in range(240):
+                value = index
+                tokens = []
+                for _ in range(7):
+                    tokens.append(alphabet[value % len(alphabet)])
+                    value //= len(alphabet)
+                sequence = "".join(tokens)
+                scored[sequence] = {
+                    "sequence": sequence,
+                    "maximum_probability": round(rng.random(), 8),
+                    "argmax_position_1based": rng.randrange(1, 8),
+                }
+            expected = frozen_reference(scored, width=64, length=7)
+            observed = v8_search.select_beam(scored, width=64, length=7)
+            self.assertEqual(observed, expected)
 
     def test_search_evidence_gzip_is_byte_deterministic_and_hash_checked(self):
         with tempfile.TemporaryDirectory() as directory:

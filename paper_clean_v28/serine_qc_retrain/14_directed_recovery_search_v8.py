@@ -796,18 +796,33 @@ def select_beam(
             selected.append(row)
             seen.add(sequence)
     diversity_pool = [row for row in ordered[: max(width * 8, width)] if str(row["sequence"]) not in seen]
+    minimum_distances = {
+        str(row["sequence"]): min(
+            hamming(str(row["sequence"]), str(prior["sequence"]))
+            for prior in selected
+        )
+        for row in diversity_pool
+    }
     while diversity_pool and len(selected) < width:
         chosen = max(
             diversity_pool,
             key=lambda row: (
-                min(hamming(str(row["sequence"]), str(prior["sequence"])) for prior in selected),
+                minimum_distances[str(row["sequence"])],
                 float(row["maximum_probability"]),
                 str(row["sequence"]),
             ),
         )
         selected.append(chosen)
-        seen.add(str(chosen["sequence"]))
+        chosen_sequence = str(chosen["sequence"])
+        seen.add(chosen_sequence)
         diversity_pool.remove(chosen)
+        minimum_distances.pop(chosen_sequence)
+        for row in diversity_pool:
+            sequence = str(row["sequence"])
+            minimum_distances[sequence] = min(
+                minimum_distances[sequence],
+                hamming(sequence, chosen_sequence),
+            )
     return selected[:width]
 
 
