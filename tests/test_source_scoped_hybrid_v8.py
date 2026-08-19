@@ -60,6 +60,14 @@ v8_full_frontier = load_module(
     "source_scoped_hybrid_v8_full_frontier_v3",
     RETRAIN_DIR / "20_full_frontier_recovery_v3.py",
 )
+v8_methyl_first = load_module(
+    "source_scoped_hybrid_v8_methyl_first_v4",
+    RETRAIN_DIR / "21_methyl_first_joint_recovery_v4.py",
+)
+v8_methyl_first_audit = load_module(
+    "source_scoped_hybrid_v8_methyl_first_v4_audit",
+    RETRAIN_DIR / "22_audit_and_package_methyl_first_v4.py",
+)
 
 
 class FakeTensor:
@@ -89,6 +97,8 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
             "17_cyclic_base_recovery_v2.py",
             "18_finalize_and_audit_recovery_v2.py",
             "20_full_frontier_recovery_v3.py",
+            "21_methyl_first_joint_recovery_v4.py",
+            "22_audit_and_package_methyl_first_v4.py",
         ):
             source = (RETRAIN_DIR / name).read_text(encoding="utf-8")
             ast.parse(source, filename=name)
@@ -1595,6 +1605,161 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
         self.assertIn("ALL V8 V3 FULL-FRONTIER AUTOMATED GATES PASSED", runner)
         self.assertNotIn("curl ", runner)
         self.assertNotIn("raw.githubusercontent.com", runner)
+
+    def test_v4_legacy_strict_evidence_normalizes_to_the_same_methyl_gate(self):
+        row = v8_methyl_first.normalize_methyl_row(
+            {
+                "sequence": "GTEWGPS",
+                "qualified_full_maximum_probability": "0.60483360",
+                "physical_argmax_position_1based": "7",
+                "physical_argmax_residue": "S",
+            }
+        )
+        self.assertEqual(row["sequence"], "GTEWGPS")
+        self.assertEqual(row["argmax_position_1based"], 7)
+        self.assertEqual(row["argmax_residue"], "S")
+        self.assertEqual(row["passes_strict_probability"], 1)
+        self.assertTrue(v8_search.strict_rounded_pass(row["maximum_probability"]))
+
+    def test_v4_palette_fallback_has_six_residues_at_every_position(self):
+        narrow = [{"sequence": "GTEWGPS"}, {"sequence": "GTCWGPS"}]
+        fallback = [
+            {"sequence": "ACDEFGH"},
+            {"sequence": "IKLMNQR"},
+            {"sequence": "STVWYAC"},
+            {"sequence": "DEFGHIK"},
+            {"sequence": "LMNQRST"},
+            {"sequence": "VWYACDE"},
+        ]
+        palettes = v8_methyl_first.residue_palettes(
+            narrow, width=6, fallback_rows=fallback
+        )
+        self.assertEqual(len(palettes), 7)
+        self.assertTrue(all(len(set(palette)) == 6 for palette in palettes))
+
+    def test_v4_methyl_screen_selection_is_fixed_width_and_deterministic(self):
+        rows = []
+        alphabet = v8_methyl_first.NATURAL_AA
+        for index in range(500):
+            value = index
+            tokens = []
+            for _position in range(7):
+                tokens.append(alphabet[value % len(alphabet)])
+                value //= len(alphabet)
+            sequence = "".join(tokens)
+            rows.append(
+                {
+                    "sequence": sequence,
+                    "predicted_methyl_probability": 0.2 + (index % 200) / 300,
+                    "predicted_cyclic_base_log_probability_mean": -4.0
+                    + (index % 250) / 100,
+                    "cyclic_base_floor": -2.094945192337036,
+                }
+            )
+        selected = v8_methyl_first.select_screen_rows(rows, 128)
+        reversed_selected = v8_methyl_first.select_screen_rows(
+            list(reversed(rows)), 128
+        )
+        self.assertEqual(len(selected), 128)
+        self.assertEqual(
+            [row["sequence"] for row in selected],
+            [row["sequence"] for row in reversed_selected],
+        )
+        self.assertEqual(len({row["sequence"] for row in selected}), 128)
+
+    def test_v4_exact_base_shortlist_can_only_contain_strict_methyl_hits(self):
+        rows = [
+            {
+                "sequence": f"AAAAA{v8_methyl_first.NATURAL_AA[index // 20]}{v8_methyl_first.NATURAL_AA[index % 20]}",
+                "maximum_probability": 0.61 if index % 3 == 0 else 0.59,
+                "passes_strict_probability": int(index % 3 == 0),
+                "predicted_cyclic_base_log_probability_mean": -3.0 + index / 100,
+            }
+            for index in range(200)
+        ]
+        selected = v8_methyl_first.select_strict_exact_rows(rows, 32)
+        self.assertEqual(len(selected), 32)
+        self.assertTrue(
+            all(int(row["passes_strict_probability"]) == 1 for row in selected)
+        )
+
+    def test_v4_advisor_fallback_rejects_non_methylated_even_when_base_is_better(self):
+        class FakeScorer:
+            def score_full(self, _target, sequences, stage="", show_progress=True):
+                del stage, show_progress
+                result = {}
+                for sequence in sequences:
+                    probabilities = [0.0] * 6 + [0.60483360]
+                    result[sequence] = {
+                        "design_seq": sequence[:-1] + sequence[-1].lower(),
+                        "design_methyl_count": 1,
+                        "methyl_positions_1based": "[7]",
+                        "methyl_probabilities": json.dumps(probabilities),
+                        "methyl_probability_representation_min": json.dumps(
+                            probabilities
+                        ),
+                        "methyl_probability_representation_max": json.dumps(
+                            probabilities
+                        ),
+                        "representation_threshold_disagreement_positions_1based": "[]",
+                    }
+                return result
+
+        novelty = {
+            f"{label}_{kind}": set()
+            for label in ("historical", "prior", "pool", "native")
+            for kind in ("natural", "cyclic")
+        }
+        rows = [
+            {
+                "sequence": "GCRLGGS",
+                "maximum_probability": 0.50680798,
+                "passes_strict_probability": 0,
+                "cyclic_base_log_probability_mean": -2.17979121,
+            },
+            {
+                "sequence": "GTEWGPS",
+                "maximum_probability": 0.60483360,
+                "passes_strict_probability": 1,
+                "cyclic_base_log_probability_mean": -4.72348499,
+            },
+        ]
+        selected = v8_methyl_first.stable_methyl_review_rows(
+            ranked=rows,
+            limit=10,
+            floor=-2.094945192337036,
+            old=v8_search,
+            v2=v8_cyclic_recovery,
+            methyl_scorer=FakeScorer(),
+            batch_one_scorer=FakeScorer(),
+            novelty_sets=novelty,
+        )
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["design_natural_seq"], "GTEWGPS")
+        self.assertEqual(selected[0]["design_seq"], "GTEWGPs")
+        self.assertEqual(selected[0]["passes_methylation_hard_gate"], 1)
+        self.assertEqual(selected[0]["passes_cyclic_base_hard_gate"], 0)
+
+    def test_v4_source_contract_forbids_non_methylated_advisor_rows(self):
+        search_source = (
+            RETRAIN_DIR / "21_methyl_first_joint_recovery_v4.py"
+        ).read_text(encoding="utf-8")
+        audit_source = (
+            RETRAIN_DIR / "22_audit_and_package_methyl_first_v4.py"
+        ).read_text(encoding="utf-8")
+        runner = (ROOT / "run_v8_autodl_recovery_v4.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("no_non_methylated_candidate_can_enter_advisor_review", search_source)
+        self.assertIn("REVIEW_ONLY_NOT_FULLY_QUALIFIED", search_source)
+        self.assertIn("every_candidate_independently_passes_methyl_hard_gate", audit_source)
+        self.assertIn("advisor_rows_are_independently_methyl_pass_base_fail", audit_source)
+        self.assertIn("non_methyl_advisor_rows=FORBIDDEN", runner)
+        self.assertIn("ALL V8 V4 METHYL-FIRST AUTOMATED AUDITS PASSED", runner)
+        self.assertNotIn("THRESHOLD = 0.5", search_source)
+        self.assertEqual(v8_methyl_first.THRESHOLD, 0.6)
+        self.assertEqual(v8_methyl_first.METHYL_SCREEN_BUDGET, 24576)
+        self.assertEqual(v8_methyl_first.EXACT_BASE_BUDGET, 2048)
 
 
 if __name__ == "__main__":

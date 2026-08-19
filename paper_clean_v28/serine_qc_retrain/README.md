@@ -376,3 +376,25 @@ V3 的冻结协议、断点及失败语义见
 ```text
 ===== ALL V8 V3 FULL-FRONTIER AUTOMATED GATES PASSED =====
 ```
+
+## V3 双门零命中后的最终 V4（仅 3ZGC）
+
+只有 V3 已完整跑完、清单中唯一科学失败仍为
+`at_least_one_real_3zgc_candidate_is_released` 时，才允许运行
+`run_v8_autodl_recovery_v4.sh`。V4 完整复用 V2/V3 的昂贵评分，只新增固定
+24,576 条 methyl screen；只有严格 `p_methyl>0.6` 的新序列才允许进入最多
+2,048 条 exact cyclic-base 评分。
+
+正式 release 仍必须同时通过甲基与 base 双硬门。如果最终仍为零，程序只生成
+独立 batch-one 复核过的“甲基化通过、base 未过”尚哥审阅表，并显式标记
+`REVIEW_ONLY_NOT_FULLY_QUALIFIED`。任何未甲基化序列都禁止进入该表。
+
+完整协议和两个结果类别见 `V8_METHYL_FIRST_RECOVERY_V4.md`。无论科学双门是否
+命中，固定流程和独立审计正常完成的日志标志是：
+
+```text
+===== ALL V8 V4 METHYL-FIRST AUTOMATED AUDITS PASSED =====
+```
+
+同时必须查看紧邻的科学结果标志是 `SCIENTIFIC JOINT GATE PASSED`，还是
+`ZERO JOINT HITS; METHYLATED BASE-NEAR-MISS REVIEW ONLY`，二者不得混写。
