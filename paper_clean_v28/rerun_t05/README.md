@@ -1,5 +1,15 @@
 # 温度 0.5 多种子重跑与本地预筛
 
+> **历史流程警告**：本目录保留的是此前“透膜预筛在结构之前”的
+> 13-target 批次，只用于复现，不用于当前交付。当前实际顺序必须是
+> 结构先行、透膜后置；请改用 `run_serine_qc_cyclic_representation_v6.ps1` 和
+> `paper_clean_v28/serine_qc_retrain/README.md`。
+>
+> 旧结果还存在外层随机采样顺序与模型内部固定因果顺序不一致的问题；
+> 现有 872 条和后续 V5 的 3,389 条第 7 位集中结果均已撤回。当前 V6 生成器
+> 必须与 `cyclic_representation_augmented_v6` checkpoint 及绑定的独立 test
+> PASS 报告配套，并在结果门通过后停在人工复核。
+
 ## 目的
 
 只重跑温度 `0.5` 下尚未同时达到以下目标的 13 个复合物：

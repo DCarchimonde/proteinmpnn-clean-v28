@@ -74,13 +74,23 @@ class GenerationProtocolTests(unittest.TestCase):
         }
         repeated = dict(base, candidate_id="repeat", seed=202, base_log_probability_mean=-2.0)
         old = dict(base, candidate_id="old", design_seq="ACdE")
+        fresh = dict(base, candidate_id="fresh", design_seq="AcDF")
+        prior = dict(base, candidate_id="prior", design_seq="AcDG")
         rows = generator.aggregate_unique_candidates(
-            [base, repeated, old], {("T1", "ACdE")}
+            [base, repeated, old, fresh, prior],
+            {("T1", "ACdE")},
+            {("T1", "ACDE")},
+            {("T1", "AcDG")},
+            {("T1", "ACDG")},
         )
         by_sequence = {row["design_seq"]: row for row in rows}
         self.assertEqual(by_sequence["AcDE"]["occurrence_count"], 2)
-        self.assertEqual(by_sequence["AcDE"]["eligible_for_new_permeability_screen"], 1)
+        self.assertEqual(by_sequence["AcDE"]["eligible_for_new_permeability_screen"], 0)
+        self.assertEqual(by_sequence["AcDE"]["seen_in_historical_4115_naturalized"], 1)
         self.assertEqual(by_sequence["ACdE"]["eligible_for_new_permeability_screen"], 0)
+        self.assertEqual(by_sequence["AcDF"]["eligible_for_new_permeability_screen"], 1)
+        self.assertEqual(by_sequence["AcDG"]["seen_in_prior_1333"], 1)
+        self.assertEqual(by_sequence["AcDG"]["eligible_for_new_permeability_screen"], 0)
 
 
 class PermeabilitySelectionTests(unittest.TestCase):

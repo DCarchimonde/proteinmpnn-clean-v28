@@ -5,6 +5,7 @@ __pycache__/
 *.log
 
 raw_external/
+.serine_qc_source/
 nmethyl_data/train_set/
 paper_clean_v28_outputs/structure_metrics/*.tmp
 paper_clean_v28_outputs/structure_metrics/*.log

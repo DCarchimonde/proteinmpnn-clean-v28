@@ -145,3 +145,88 @@ Checks whether any files are too large for normal GitHub upload.
 
 ### `.gitignore`
 Clean-repository ignore rules.
+
+## Ser provenance and cyclic-representation recovery
+
+### `paper_clean_v28/serine_qc_retrain/README.md`
+Evidence for the Ser correction, the withdrawn non-methylated 3AV9 row, the
+fixed tensor-position-7 root cause, V6 quality gates, and exact commands.
+
+### `paper_clean_v28/run_serine_qc_source_scoped_hybrid_v8.ps1`
+Current Windows launcher. It performs no training and never reruns V6. It pins
+and reuses the passed canonical, V6 and V7 artifacts; composes canonical shared
+tensors + V6 non-Ser experts + V7 Ser expert; and requires exact per-position
+inheritance plus V6-noninferior frozen Recall/F1 before continuing. It then
+reannotates the immutable 31,500-row pool, performs deterministic fixed-budget
+recovery only for actually missing 3WNE/3ZGC targets, and runs the independent
+overlay audit. Existing partial stage directories are preserved. The only
+packaged deliverable is a checksum-indexed manual-review ZIP; no structure
+handoff or permeability input is created.
+This is explicitly a post-hoc internal recovery workflow; publication metrics
+still require a new outer/blind evaluation.
+
+### `paper_clean_v28/serine_qc_retrain/12_compose_source_scoped_hybrid_v8.py`
+Composes the fixed residue-source checkpoint without averaging or optimization.
+The paired 1,505-position audit proves non-Ser probabilities come from V6 and
+Ser probabilities come from V7. The repeatedly inspected 151-record set is
+explicitly documented as an internal frozen audit rather than a new blind test.
+
+### `paper_clean_v28/serine_qc_retrain/13_audit_source_scoped_hybrid_v8.py`
+Audits cyclic-start/decoder-order remapping, V6-noninferior sensitivity, all 17
+native-chain mappings, and explicit length-6/length-7 strata before authorizing
+directed recovery.
+
+### `paper_clean_v28/serine_qc_retrain/14_directed_recovery_search_v8.py`
+Scores mandatory historical/native length-6/7 controls and applies the frozen
+deterministic search budget only to missing 3WNE/3ZGC targets. Released rows
+must pass strict rounded `>0.6`, batch-one rescore, base-head plausibility and
+historical/prior/native/current-pool plus forward-cyclic novelty gates. Search
+metrics are kept separate from model metrics.
+
+### `paper_clean_v28/serine_qc_retrain/15_finalize_and_audit_recovery_v8.py`
+Overlays independently rescored directed rows on the immutable V8 baseline in
+a new directory, verifies 17/17 coverage, 3AV physical-position support,
+novelty and workflow ordering, and blocks handoff/permeability artifacts.
+
+### `run_serine_qc_serine_only_cyclic_v7.ps1`
+Historical V7 launcher. Its Ser provenance repair is retained as the source of
+the V8 Ser expert, but its rollback of all 19 non-Ser experts caused frozen
+Recall@0.6 to fall from 0.8046 to 0.5096 (77 true positives lost). Do not use it
+as the current recovery command. Its preserved 15/17 generation failure is
+included in the V8 review ZIP as diagnostic evidence.
+
+### `paper_clean_v28/serine_qc_retrain/10_reannotate_v6_pool_serine_only_v7.py`
+Scores each unique target/natural sequence once, propagates one canonical
+annotation payload to repeats, recomputes novelty, and preserves all base-model
+sampling statistics. Defaults reproduce Ser-only V7; explicit protocol/scope/
+authorization arguments let the V8 launcher use the same audited reannotation
+logic and record an isolated missing-target coverage state for recovery.
+
+### `paper_clean_v28/serine_qc_retrain/11_triple_audit_serine_only_v7.py`
+Independently reconstructs strict-threshold annotations, aggregation, position
+and decoder-step distributions, novelty, and 17/17 coverage. It treats nearest
+held-out backbone similarity as a diagnostic rather than methylation truth; the
+actual returned structures remain subject to both frozen RMSD gates.
+
+### `run_serine_qc_cyclic_representation_v6.ps1`
+Historical V6 launcher; do not use for the current repair. It retrains all 20 expert heads with every equivalent
+cyclic sequence/coordinate start, runs the held-out test gate, regenerates all
+17 targets, and performs the independent three-pass result audit. It stops at a
+manual-review bundle and never creates a structure handoff. The older V5
+handoff path is withdrawn and release-blocked. `-ResumeQuota` preserves a
+completed V6 checkpoint and original 19,500 draws, samples only quota-shortfall
+targets up to a cumulative fixed budget, and then continues the same three-pass
+review packaging. If that fixed budget has already produced zero candidates,
+the launcher records an explicit model abstention without loading Torch or
+sampling again.
+
+### `paper_clean_v28/serine_qc_retrain/08_resume_cyclic_representation_v6_quota.py`
+In-place, hash-pinned V6 quota recovery. It retains every pre-resume candidate,
+uses disjoint reserve seeds only for targets below the frozen structure quota,
+and records exact initial/top-up row accounting for the independent audit.
+
+### `paper_clean_v28/serine_qc_retrain/09_finalize_cyclic_representation_v6_exhaustion.py`
+Metadata-only terminal audit for a V6 target with zero novel candidates after
+the complete initial pool and 12,000 fixed-budget top-up rows. It preserves all
+candidate CSV hashes, does not lower the 0.6 threshold, and records
+`MODEL_ABSTAINS` instead of pretending that the frozen structure quota passed.
