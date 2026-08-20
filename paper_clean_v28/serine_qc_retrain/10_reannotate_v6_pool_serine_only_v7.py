@@ -99,6 +99,15 @@ EXPECTED_SOURCE_MANIFEST_SHA256 = (
 VALID_NATURAL_AA = set("ACDEFGHIKLMNPQRSTVWY")
 
 
+def strict_rounded_probability_pass(value: float, threshold: float = 0.6) -> bool:
+    numeric = float(value)
+    return (
+        math.isfinite(numeric)
+        and 0.0 <= numeric <= 1.0
+        and round(numeric, 8) > float(threshold)
+    )
+
+
 def load_generator_module() -> Any:
     spec = importlib.util.spec_from_file_location("serine_v7_base_generator", GENERATOR_PATH)
     if spec is None or spec.loader is None:
@@ -243,13 +252,22 @@ def annotation_payload(
     ):
         raise RuntimeError("Cyclic reannotation min/mean/max/span is inconsistent")
 
+    disagreement_positions = [
+        index
+        for index, (minimum, maximum) in enumerate(
+            zip(representation_min, representation_max), start=1
+        )
+        if not strict_rounded_probability_pass(minimum, threshold)
+        and strict_rounded_probability_pass(maximum, threshold)
+    ]
     output_tokens: List[str] = []
-    for token, value in zip(natural_sequence, probability):
+    for token, release_floor in zip(natural_sequence, representation_min):
         natural_index = natural_alphabet.index(token)
         methyl_index = natural_to_methyl.get(natural_index)
         output_tokens.append(
             extended_alphabet[int(methyl_index)]
-            if methyl_index is not None and value > threshold
+            if methyl_index is not None
+            and strict_rounded_probability_pass(release_floor, threshold)
             else token
         )
     design_sequence = "".join(output_tokens)
@@ -257,12 +275,8 @@ def annotation_payload(
         index for index, token in enumerate(design_sequence, start=1) if token.islower()
     ]
     methyl_site_probabilities = [probability[index - 1] for index in methyl_positions]
-    disagreement_positions = [
-        index
-        for index, (minimum, maximum) in enumerate(
-            zip(representation_min, representation_max), start=1
-        )
-        if minimum <= threshold < maximum
+    methyl_site_representation_floors = [
+        representation_min[index - 1] for index in methyl_positions
     ]
     representation_count = int(
         round(
@@ -294,6 +308,22 @@ def annotation_payload(
         "methyl_site_probability_max": (
             max(methyl_site_probabilities) if methyl_site_probabilities else ""
         ),
+        "methyl_site_representation_floor_min": (
+            min(methyl_site_representation_floors)
+            if methyl_site_representation_floors
+            else ""
+        ),
+        "methyl_site_representation_floor_mean": (
+            sum(methyl_site_representation_floors)
+            / len(methyl_site_representation_floors)
+            if methyl_site_representation_floors
+            else ""
+        ),
+        "methyl_site_representation_floor_max": (
+            max(methyl_site_representation_floors)
+            if methyl_site_representation_floors
+            else ""
+        ),
         "methyl_probabilities": json.dumps(probability),
         "methyl_probability_order_std": json.dumps(order_std),
         "methyl_probability_order_std_max": max(order_std),
@@ -318,6 +348,13 @@ def annotation_payload(
         "annotation_order_ensemble_size": len(natural_sequence),
         "annotation_decoder_order_ensemble_size": len(natural_sequence),
         "annotation_representation_ensemble_size": representation_count,
+        "annotation_ranking_probability_policy": "representation_mean",
+        "annotation_release_probability_policy": (
+            "representation_min_strict_gt_threshold_zero_disagreement"
+        ),
+        "stable_cyclic_release_gate": int(
+            bool(methyl_positions) and not disagreement_positions
+        ),
     }
 
 

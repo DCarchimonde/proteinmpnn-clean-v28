@@ -8,10 +8,13 @@ sequence space for 3WNE and 3ZGC under the same all-cyclic-start, all-decoder-
 order, physical-position-mapped expert score used by deployment.
 
 Historical controls are always scored but are never release eligible.  Every
-released sequence must pass strict rounded probability ``>0.6``, independent
-batch-one re-scoring, receptor-conditioned ProteinMPNN plausibility, historical
-and prior naturalized novelty, native/current-pool exclusion, and forward
-cyclic-identity exclusion.  Failure after the fixed budget remains a failure.
+released sequence must have an explicit representation minimum strictly above
+``0.6`` at every lowercase site, zero cyclic-start threshold disagreement, an
+exact minimum-derived lowercase pattern, independent batch-one re-scoring,
+receptor-conditioned ProteinMPNN plausibility, historical and prior naturalized
+novelty, native/current-pool exclusion, and forward cyclic-identity exclusion.
+Representation means are ranking evidence only.  Failure after the fixed budget
+remains a failure.
 """
 
 from __future__ import annotations
@@ -720,6 +723,211 @@ def strict_rounded_pass(value: float, threshold: float = THRESHOLD) -> bool:
         and 0.0 <= numeric <= 1.0
         and round(numeric, 8) > float(threshold)
     )
+
+
+CYCLIC_RELEASE_VECTOR_FIELDS = (
+    "methyl_probabilities",
+    "methyl_probability_representation_min",
+    "methyl_probability_representation_max",
+    "methyl_probability_representation_span",
+    "methyl_probability_representation_std",
+)
+
+
+def _release_vector(payload: Mapping[str, Any], field: str) -> List[float]:
+    """Parse one explicit cyclic-release vector without accepting defaults."""
+
+    if field not in payload:
+        raise ValueError(f"missing {field}")
+    raw = payload[field]
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raise ValueError(f"missing {field}")
+    try:
+        values = raw if isinstance(raw, (list, tuple)) else json.loads(str(raw))
+        if not isinstance(values, (list, tuple)):
+            raise TypeError(field)
+        return [float(value) for value in values]
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"malformed {field}") from exc
+
+
+def stable_cyclic_methyl_release_errors(
+    payload: Mapping[str, Any],
+    natural_sequence: Optional[str] = None,
+    threshold: float = THRESHOLD,
+) -> List[str]:
+    """Return fail-closed errors for the official cyclic methyl release gate.
+
+    Representation means are ranking evidence only.  A release/review pass
+    requires explicit mean/min/max/span/std vectors, a lowercase pattern
+    derived *exactly* from the per-position representation minimum after
+    eight-decimal rounding, and zero cyclic-start threshold disagreement.
+    """
+
+    errors: List[str] = []
+    try:
+        numeric_threshold = float(threshold)
+    except (TypeError, ValueError):
+        return ["invalid methyl threshold"]
+    if not math.isfinite(numeric_threshold) or not 0.0 <= numeric_threshold <= 1.0:
+        return ["invalid methyl threshold"]
+
+    supplied_natural = (
+        natural_sequence
+        if natural_sequence is not None
+        else payload.get("design_natural_seq", payload.get("sequence", ""))
+    )
+    natural = str(supplied_natural).upper()
+    design = str(payload.get("design_seq", ""))
+    if (
+        not natural
+        or not set(natural) <= set(NATURAL_AA)
+        or len(design) != len(natural)
+        or design.upper() != natural
+    ):
+        errors.append("design/natural sequence mismatch")
+    for field in ("design_natural_seq", "sequence"):
+        if (
+            payload.get(field) not in (None, "")
+            and str(payload[field]).upper() != natural
+        ):
+            errors.append(f"{field} does not match release sequence")
+    if "methyl_threshold" in payload:
+        try:
+            if float(payload["methyl_threshold"]) != numeric_threshold:
+                errors.append("persisted methyl threshold changed")
+        except (TypeError, ValueError):
+            errors.append("persisted methyl threshold is malformed")
+    if "strict_threshold_operator" in payload and str(
+        payload["strict_threshold_operator"]
+    ) != ">":
+        errors.append("persisted methyl threshold operator is not strict greater-than")
+    if "annotation_release_probability_policy" in payload and str(
+        payload["annotation_release_probability_policy"]
+    ) != "representation_min_strict_gt_threshold_zero_disagreement":
+        errors.append("persisted annotation release policy is incompatible")
+
+    vectors: Dict[str, List[float]] = {}
+    for field in CYCLIC_RELEASE_VECTOR_FIELDS:
+        try:
+            vectors[field] = _release_vector(payload, field)
+        except ValueError as exc:
+            errors.append(str(exc))
+    if errors:
+        return errors
+
+    expected_length = len(natural)
+    if any(len(values) != expected_length for values in vectors.values()):
+        errors.append("cyclic release vector length mismatch")
+        return errors
+    if any(not math.isfinite(value) for values in vectors.values() for value in values):
+        errors.append("cyclic release vector is non-finite")
+        return errors
+
+    mean = vectors["methyl_probabilities"]
+    minimum = vectors["methyl_probability_representation_min"]
+    maximum = vectors["methyl_probability_representation_max"]
+    span = vectors["methyl_probability_representation_span"]
+    standard_deviation = vectors["methyl_probability_representation_std"]
+    if any(
+        value < 0.0 or value > 1.0
+        for values in (mean, minimum, maximum)
+        for value in values
+    ):
+        errors.append("cyclic release probability outside [0, 1]")
+    if any(
+        value < 0.0 for values in (span, standard_deviation) for value in values
+    ):
+        errors.append("cyclic release dispersion is negative")
+    if any(
+        lower > center + RESCORE_TOLERANCE
+        or center > upper + RESCORE_TOLERANCE
+        or abs((upper - lower) - width) > RESCORE_TOLERANCE
+        for center, lower, upper, width in zip(mean, minimum, maximum, span)
+    ):
+        errors.append("cyclic release min/mean/max/span is inconsistent")
+
+    disagreement = [
+        index
+        for index, (lower, upper) in enumerate(zip(minimum, maximum), start=1)
+        if not strict_rounded_pass(lower, numeric_threshold)
+        and strict_rounded_pass(upper, numeric_threshold)
+    ]
+    try:
+        persisted_disagreement = payload[
+            "representation_threshold_disagreement_positions_1based"
+        ]
+        if not isinstance(persisted_disagreement, (list, tuple)):
+            persisted_disagreement = json.loads(str(persisted_disagreement))
+        persisted_disagreement = [int(value) for value in persisted_disagreement]
+        persisted_count = int(payload["representation_threshold_disagreement_count"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        errors.append("missing/malformed cyclic-start disagreement evidence")
+    else:
+        if disagreement or persisted_disagreement or persisted_count != 0:
+            errors.append("cyclic-start threshold disagreement is nonzero")
+        if persisted_disagreement != disagreement or persisted_count != len(disagreement):
+            errors.append("cyclic-start disagreement evidence is inconsistent")
+
+    expected_design = "".join(
+        token.lower()
+        if token in METHYLATABLE_AA
+        and strict_rounded_pass(lower, numeric_threshold)
+        else token
+        for token, lower in zip(natural, minimum)
+    )
+    expected_positions = [
+        index for index, token in enumerate(expected_design, start=1) if token.islower()
+    ]
+    if not expected_positions:
+        errors.append("no representation-stable methyl site")
+    if design != expected_design:
+        errors.append("lowercase pattern does not equal representation-minimum gate")
+    try:
+        positions = payload["methyl_positions_1based"]
+        if not isinstance(positions, (list, tuple)):
+            positions = json.loads(str(positions))
+        positions = [int(value) for value in positions]
+        methyl_count = int(payload["design_methyl_count"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        errors.append("missing/malformed methyl position evidence")
+    else:
+        if positions != expected_positions or methyl_count != len(expected_positions):
+            errors.append("methyl position/count evidence is inconsistent")
+    if "stable_cyclic_release_gate" in payload:
+        try:
+            if int(payload["stable_cyclic_release_gate"]) != 1:
+                errors.append("persisted stable cyclic release gate is not PASS")
+        except (TypeError, ValueError):
+            errors.append("persisted stable cyclic release gate is malformed")
+    return errors
+
+
+def stable_cyclic_methyl_release_gate(
+    payload: Mapping[str, Any],
+    natural_sequence: Optional[str] = None,
+    threshold: float = THRESHOLD,
+) -> bool:
+    """Whether a payload passes the official representation-minimum gate."""
+
+    return not stable_cyclic_methyl_release_errors(
+        payload, natural_sequence=natural_sequence, threshold=threshold
+    )
+
+
+def release_floor_actionable_max(
+    payload: Mapping[str, Any], natural_sequence: Optional[str] = None
+) -> float:
+    """Return the actionable representation-minimum maximum, fail closed."""
+
+    supplied_natural = (
+        natural_sequence
+        if natural_sequence is not None
+        else payload.get("design_natural_seq", payload.get("sequence", ""))
+    )
+    natural = str(supplied_natural).upper()
+    minimum = _release_vector(payload, "methyl_probability_representation_min")
+    return actionable_probability_max(natural, minimum)
 
 
 def actionable_probability_max(
@@ -2303,6 +2511,7 @@ def run(args: argparse.Namespace) -> None:
                 for value in json.loads(str(payload["methyl_probabilities"]))
             ]
             full_max = actionable_probability_max(sequence, full_probabilities)
+            full_release_floor_max = release_floor_actionable_max(payload, sequence)
             qualified_full_difference = abs(full_max - search_maximum)
             if not all(
                 math.isfinite(value)
@@ -2310,16 +2519,14 @@ def run(args: argparse.Namespace) -> None:
                     float(candidate_base[sequence]),
                     float(floor),
                     full_max,
+                    full_release_floor_max,
                     qualified_full_difference,
                 )
             ):
                 raise RuntimeError(
                     f"Non-finite candidate evidence for {target}:{sequence}"
                 )
-            persisted_pass = (
-                int(payload["design_methyl_count"]) > 0
-                and strict_rounded_pass(full_max)
-            )
+            persisted_pass = stable_cyclic_methyl_release_gate(payload, sequence)
             eligibility = (
                 not duplicate_reason
                 and base_pass
@@ -2330,9 +2537,36 @@ def run(args: argparse.Namespace) -> None:
                 {
                     "target_name": target,
                     "sequence": sequence,
+                    "design_seq": payload["design_seq"],
+                    "design_natural_seq": sequence,
+                    "design_methyl_count": payload["design_methyl_count"],
+                    "methyl_positions_1based": payload["methyl_positions_1based"],
+                    "methyl_probabilities": payload["methyl_probabilities"],
+                    "methyl_probability_representation_min": payload[
+                        "methyl_probability_representation_min"
+                    ],
+                    "methyl_probability_representation_max": payload[
+                        "methyl_probability_representation_max"
+                    ],
+                    "methyl_probability_representation_span": payload[
+                        "methyl_probability_representation_span"
+                    ],
+                    "methyl_probability_representation_std": payload[
+                        "methyl_probability_representation_std"
+                    ],
+                    "representation_threshold_disagreement_positions_1based": payload[
+                        "representation_threshold_disagreement_positions_1based"
+                    ],
+                    "representation_threshold_disagreement_count": payload[
+                        "representation_threshold_disagreement_count"
+                    ],
+                    "stable_cyclic_release_gate": int(persisted_pass),
                     "search_stage": search_row["search_stage"],
                     "search_maximum_probability": search_maximum,
                     "qualified_full_maximum_probability": full_max,
+                    "qualified_full_release_floor_maximum_probability": (
+                        full_release_floor_max
+                    ),
                     "qualified_full_rescore_absolute_difference": (
                         qualified_full_difference
                     ),
@@ -2360,13 +2594,21 @@ def run(args: argparse.Namespace) -> None:
             independent_max = actionable_probability_max(
                 sequence, independent_probabilities
             )
+            independent_release_floor_max = release_floor_actionable_max(
+                independent, sequence
+            )
             difference = abs(independent_max - search_maximum)
+            release_floor_difference = abs(
+                independent_release_floor_max - full_release_floor_max
+            )
             if not (
                 math.isfinite(independent_max)
+                and math.isfinite(independent_release_floor_max)
                 and math.isfinite(difference)
-                and int(independent["design_methyl_count"]) > 0
-                and strict_rounded_pass(independent_max)
+                and math.isfinite(release_floor_difference)
+                and stable_cyclic_methyl_release_gate(independent, sequence)
                 and difference <= RESCORE_TOLERANCE
+                and release_floor_difference <= RESCORE_TOLERANCE
             ):
                 continue
             accepted_cyclic.add(cyclic_key)
@@ -2393,7 +2635,13 @@ def run(args: argparse.Namespace) -> None:
                         qualified_full_difference
                     ),
                     "batch_one_maximum_probability": independent_max,
+                    "batch_one_release_floor_maximum_probability": (
+                        independent_release_floor_max
+                    ),
                     "batch_rescore_absolute_difference": difference,
+                    "batch_one_release_floor_rescore_absolute_difference": (
+                        release_floor_difference
+                    ),
                     "base_log_probability_mean": "",
                     "base_log_probability_mean_all_orders": candidate_base[sequence],
                     "base_plausibility_context_policy": (
@@ -2617,9 +2865,20 @@ def run(args: argparse.Namespace) -> None:
         "all_missing_targets_have_a_novel_plausible_strict_candidate": (
             not missing_after_search
         ),
-        "released_candidates_pass_batch_one_rescore": all(
-            strict_rounded_pass(float(row["batch_one_maximum_probability"]))
+        "no_pre_rescore_eligible_row_uses_representation_mean_alone": all(
+            not int(row["pre_rescore_release_eligible"])
+            or stable_cyclic_methyl_release_gate(row, str(row["sequence"]))
+            for row in plausibility_rows
+        ),
+        "released_candidates_pass_stable_cyclic_batch_one_rescore": all(
+            stable_cyclic_methyl_release_gate(
+                row, str(row["design_natural_seq"])
+            )
             and float(row["batch_rescore_absolute_difference"]) <= RESCORE_TOLERANCE
+            and float(
+                row["batch_one_release_floor_rescore_absolute_difference"]
+            )
+            <= RESCORE_TOLERANCE
             for row in release_rows
         ),
         "no_formal_abstention_or_threshold_change": True,

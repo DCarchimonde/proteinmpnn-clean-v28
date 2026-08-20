@@ -171,6 +171,30 @@ class SerineOnlyV7Tests(unittest.TestCase):
         self.assertEqual(payload["design_methyl_count"], 1)
         self.assertEqual(payload["sampling_path_methyl_probabilities"], "")
 
+    def test_mean_above_threshold_cannot_override_worst_start_failure(self):
+        representation = {
+            "mean": [FakeTensor([0.9, 0.1])],
+            "decoder_order_std_mean": [FakeTensor([0.0, 0.0])],
+            "representation_std": [FakeTensor([0.15, 0.0])],
+            "representation_min": [FakeTensor([0.59, 0.1])],
+            "representation_max": [FakeTensor([0.95, 0.1])],
+            "representation_span": [FakeTensor([0.36, 0.0])],
+            "representation_count": [FakeTensor([2.0, 2.0])],
+        }
+        payload = v7_reannotator.annotation_payload(
+            "SA",
+            representation,
+            0,
+            0.6,
+            NATURAL_AA_ALPHABET,
+            EXTENDED_AA_ALPHABET,
+            NAT_TO_METHYL_ABS,
+        )
+        self.assertEqual(payload["design_seq"], "SA")
+        self.assertEqual(payload["design_methyl_count"], 0)
+        self.assertEqual(payload["representation_threshold_disagreement_count"], 1)
+        self.assertEqual(payload["stable_cyclic_release_gate"], 0)
+
     def test_preserved_source_validator_requires_unique_ids_and_natural_rows(self):
         rows = [
             {

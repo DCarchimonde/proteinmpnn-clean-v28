@@ -450,10 +450,47 @@ def validate_annotation_row(row: Mapping[str, Any]) -> List[str]:
         methyl_rate - (len(positions) / len(sequence) if sequence else 0.0)
     ) > 1e-12:
         errors.append(f"{row_id}: methyl rate mismatch")
-    for index, (token, probability) in enumerate(zip(sequence, probabilities), start=1):
-        expected = token.upper() in METHYLATABLE_AA and strict_rounded_pass(probability)
+    disagreement_positions = [
+        index
+        for index, (minimum, maximum) in enumerate(zip(minima, maxima), start=1)
+        if not strict_rounded_pass(minimum) and strict_rounded_pass(maximum)
+    ]
+    for index, (token, release_floor) in enumerate(zip(sequence, minima), start=1):
+        expected = token.upper() in METHYLATABLE_AA and strict_rounded_pass(
+            release_floor
+        )
         if token.islower() != expected:
             errors.append(f"{row_id}: strict threshold mismatch at {index}")
+    if disagreement_positions:
+        errors.append(
+            f"{row_id}: cyclic-start threshold disagreement at "
+            + ",".join(str(value) for value in disagreement_positions)
+        )
+    try:
+        recorded_disagreements = [
+            int(value)
+            for value in parse_json_list(
+                row.get(
+                    "representation_threshold_disagreement_positions_1based",
+                    json.dumps(disagreement_positions),
+                ),
+                "representation_threshold_disagreement_positions_1based",
+                row_id,
+            )
+        ]
+        recorded_count = int(
+            row.get(
+                "representation_threshold_disagreement_count",
+                len(disagreement_positions),
+            )
+        )
+        if (
+            recorded_disagreements != disagreement_positions
+            or recorded_count != len(disagreement_positions)
+        ):
+            errors.append(f"{row_id}: threshold-disagreement summary mismatch")
+    except (TypeError, ValueError) as exc:
+        errors.append(str(exc))
     if any(
         minimum > mean + 1e-7
         or mean > maximum + 1e-7
@@ -520,21 +557,44 @@ def validate_eligible_candidate_row(
                 row_id,
             )
         ]
-        actionable = [
-            probability
-            for token, probability in zip(natural, probabilities)
+        minima = [
+            float(value)
+            for value in parse_json_list(
+                row.get("methyl_probability_representation_min"),
+                "representation_min",
+                row_id,
+            )
+        ]
+        maxima = [
+            float(value)
+            for value in parse_json_list(
+                row.get("methyl_probability_representation_max"),
+                "representation_max",
+                row_id,
+            )
+        ]
+        actionable_floors = [
+            minimum
+            for token, minimum in zip(natural, minima)
             if token in METHYLATABLE_AA
         ]
+        disagreements = [
+            index
+            for index, (minimum, maximum) in enumerate(zip(minima, maxima), start=1)
+            if not strict_rounded_pass(minimum) and strict_rounded_pass(maximum)
+        ]
         hard_gate = (
-            len(probabilities) == len(natural)
+            len(probabilities) == len(minima) == len(maxima) == len(natural)
             and all(
                 math.isfinite(value) and 0.0 <= value <= 1.0
-                for value in probabilities
+                for values in (probabilities, minima, maxima)
+                for value in values
             )
             and int(row.get("design_methyl_count", 0)) > 0
             and bool(methyl_positions(str(row.get("design_seq", ""))))
-            and bool(actionable)
-            and any(strict_rounded_pass(value) for value in actionable)
+            and bool(actionable_floors)
+            and any(strict_rounded_pass(value) for value in actionable_floors)
+            and not disagreements
             and int(row.get("passes_methylation_hard_gate", 0)) == 1
             and int(row.get("eligible_for_new_permeability_screen", -1))
             == int(expected_permeability_flag)
@@ -650,6 +710,13 @@ def concentration_audit(
             "targets": [],
         }
     global_row = next(row for row in concentration_rows if row["target_name"] == "ALL")
+    concentrated_targets = [
+        row
+        for row in concentration_rows
+        if row["target_name"] != "ALL"
+        and int(row["methyl_sites"]) >= 30
+        and float(row["maximum_single_position_share"]) > 0.80
+    ]
     checks = {
         "no_global_position_collapse_above_80_percent": (
             float(global_row["maximum_single_position_share"]) <= 0.80
@@ -662,11 +729,18 @@ def concentration_audit(
             for row in concentration_rows
             if int(row["methyl_sites"]) >= 30
         ),
-        "all_3av_targets_have_a_dominant_physical_position": complete_map,
-        "universal_3av_position_is_geometry_supported_when_present": (
-            av_alignment["quality_gate"] == "PASS"
+        "no_target_position_collapse_above_80_percent_when_n_ge_30": (
+            not concentrated_targets
         ),
+        "structural_homology_is_diagnostic_not_an_automatic_override": True,
     }
+    av_alignment["release_override_policy"] = (
+        "NO_AUTOMATIC_OVERRIDE; any target above 80% remains blocked pending "
+        "independent manual scientific release"
+    )
+    av_alignment["release_blocked_concentrated_targets"] = [
+        str(row["target_name"]) for row in concentrated_targets
+    ]
     return concentration_rows, av_alignment, checks
 
 

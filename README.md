@@ -2,6 +2,25 @@
 
 本仓库用于 clean V28 结果交接。
 
+## 当前17×100流程：V9循环稳定性修复（需GPU实跑验收）
+
+V8根因已经定位：训练每个循环起点只见一个decoder order，而部署对全部
+decoder orders求均值；旧3AV候选还出现4,080/4,080最高甲基化位点集中在第7位。
+V9修复完整物理起点×完整decoder-order训练网格，并在最终候选层硬执行
+`round(min_probability, 8) > 0.6`、零跨起点分歧、17×100精确配额、去重和
+单点/单残基不超过80%的集中度门。它不会把旧V8池过滤后冒充新结果。
+
+在Linux/CUDA环境运行：
+
+```bash
+bash run_cyclic_stability_v9_1700.sh
+```
+
+注意：当前分支修好的是训练/释放合同；新checkpoint是否真正消除位点塌缩，
+必须由这次GPU实跑的17靶点审计证明。151-record集合仅是内部开发安全审计，
+不是论文blind outer test。完整说明见
+`V9_CYCLIC_STABILITY_17X100_运行与验收.md`。
+
 ## 给师兄的文件
 
 单体：

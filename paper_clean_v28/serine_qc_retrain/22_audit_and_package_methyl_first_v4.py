@@ -1,6 +1,11 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Independent batch-one audit and deterministic review bundle for V8 V4."""
+"""Independent representation-minimum audit and review bundle for V8 V4.
+
+Both released and advisor-review rows must independently reproduce explicit
+min/max/span/std evidence, zero start disagreement, and the exact lowercase
+pattern.  A representation mean alone never passes this audit.
+"""
 
 from __future__ import annotations
 
@@ -68,6 +73,8 @@ def run(args: argparse.Namespace) -> None:
         and manifest.get("scientific_joint_gate") == manifest.get("quality_gate")
         and dict(manifest.get("config") or {}).get("v4_program_sha256")
         == v4.sha256_file(V4_SEARCH_PATH)
+        and dict(manifest.get("config") or {}).get("legacy_search_program_sha256")
+        == v4.sha256_file(LEGACY_SEARCH_PATH)
     ):
         raise RuntimeError("V4 search manifest is absent, stale, or incomplete")
     v4.validate_artifacts_under(manifest, search_dir)
@@ -151,6 +158,9 @@ def run(args: argparse.Namespace) -> None:
         ]
         point = v2.physical_argmax_summary(sequence, values)
         probability = float(point["physical_argmax_probability"])
+        release_floor_probability = old.release_floor_actionable_max(
+            fresh, sequence
+        )
         base_value = float(fresh_base["cyclic_base_log_probability_mean"])
         persisted_base = float(persisted["cyclic_base_log_probability_mean"])
         lower_positions = [
@@ -159,19 +169,39 @@ def run(args: argparse.Namespace) -> None:
             if token.islower()
         ]
         row_errors: List[str] = []
+        fresh_release_errors = old.stable_cyclic_methyl_release_errors(
+            fresh, sequence
+        )
+        persisted_release_errors = old.stable_cyclic_methyl_release_errors(
+            persisted, sequence
+        )
         if not (
             str(fresh["design_seq"]) == str(persisted["design_seq"])
-            and int(fresh["design_methyl_count"]) > 0
             and bool(lower_positions)
-            and old.strict_rounded_pass(probability)
+            and not fresh_release_errors
+            and not persisted_release_errors
             and abs(
                 probability - float(persisted["batch_one_maximum_probability"])
+            )
+            <= v4.RESCORE_TOLERANCE
+            and abs(
+                release_floor_probability
+                - float(
+                    persisted["batch_one_release_floor_maximum_probability"]
+                )
             )
             <= v4.RESCORE_TOLERANCE
             and int(point["physical_argmax_position_1based"]) in lower_positions
             and abs(base_value - persisted_base) <= v4.RESCORE_TOLERANCE
         ):
             row_errors.append("independent methyl/base replay mismatch")
+        row_errors.extend(
+            f"fresh stable cyclic gate: {message}" for message in fresh_release_errors
+        )
+        row_errors.extend(
+            f"persisted stable cyclic gate: {message}"
+            for message in persisted_release_errors
+        )
         if persisted["audit_class"] == "JOINT_RELEASE":
             if not (
                 base_value >= floor
@@ -197,17 +227,42 @@ def run(args: argparse.Namespace) -> None:
                 "design_seq": fresh["design_seq"],
                 "design_natural_seq": sequence,
                 "independent_methyl_probability": probability,
+                "independent_release_floor_maximum_probability": (
+                    release_floor_probability
+                ),
                 "independent_methyl_position_1based": point[
                     "physical_argmax_position_1based"
                 ],
                 "independent_methyl_residue": point["physical_argmax_residue"],
                 "independent_design_methyl_count": fresh["design_methyl_count"],
+                "design_methyl_count": fresh["design_methyl_count"],
+                "methyl_positions_1based": fresh["methyl_positions_1based"],
+                "methyl_probabilities": fresh["methyl_probabilities"],
+                "methyl_probability_representation_min": fresh[
+                    "methyl_probability_representation_min"
+                ],
+                "methyl_probability_representation_max": fresh[
+                    "methyl_probability_representation_max"
+                ],
+                "methyl_probability_representation_span": fresh[
+                    "methyl_probability_representation_span"
+                ],
+                "methyl_probability_representation_std": fresh[
+                    "methyl_probability_representation_std"
+                ],
+                "representation_threshold_disagreement_positions_1based": fresh[
+                    "representation_threshold_disagreement_positions_1based"
+                ],
+                "representation_threshold_disagreement_count": fresh[
+                    "representation_threshold_disagreement_count"
+                ],
+                "stable_cyclic_release_gate": int(not fresh_release_errors),
                 "independent_cyclic_base_log_probability_mean": base_value,
                 "frozen_cyclic_base_floor_1pct": floor,
-                "passes_methyl_hard_gate": int(old.strict_rounded_pass(probability)),
+                "passes_methyl_hard_gate": int(not fresh_release_errors),
                 "passes_cyclic_base_hard_gate": int(base_value >= floor),
                 "passes_joint_hard_gate": int(
-                    old.strict_rounded_pass(probability) and base_value >= floor
+                    not fresh_release_errors and base_value >= floor
                 ),
                 "row_audit_gate": "PASS" if not row_errors else "FAIL",
             }
@@ -224,7 +279,11 @@ def run(args: argparse.Namespace) -> None:
             for row in replay_rows
         ),
         "every_candidate_independently_passes_methyl_hard_gate": all(
-            int(row["passes_methyl_hard_gate"]) == 1 for row in replay_rows
+            int(row["passes_methyl_hard_gate"]) == 1
+            and old.stable_cyclic_methyl_release_gate(
+                persisted, str(persisted["design_natural_seq"])
+            )
+            for row, persisted in zip(replay_rows, all_rows)
         ),
         "released_rows_independently_pass_both_hard_gates": all(
             int(row["passes_joint_hard_gate"]) == 1
@@ -297,6 +356,7 @@ def run(args: argparse.Namespace) -> None:
         (replay_path, "audit/v4_independent_candidate_replay.csv"),
         (V4_SEARCH_PATH, "programs/21_methyl_first_joint_recovery_v4.py"),
         (SCRIPT_PATH, "programs/22_audit_and_package_methyl_first_v4.py"),
+        (LEGACY_SEARCH_PATH, "programs/14_directed_recovery_search_v8.py"),
         (V2_SEARCH_PATH, "programs/17_cyclic_base_recovery_v2.py"),
         (V3_HELPER_PATH, "programs/20_full_frontier_recovery_v3.py"),
         (REPO_ROOT / "run_v8_autodl_recovery_v4.sh", "programs/run_v8_autodl_recovery_v4.sh"),
@@ -319,7 +379,8 @@ def run(args: argparse.Namespace) -> None:
         "search_manifest_sha256": v4.sha256_file(manifest_path),
         "audit_report_sha256": v4.sha256_file(report_path),
         "candidate_delivery_rule": (
-            "JOINT RELEASE REQUIRES METHYL+BASE; FALLBACK REVIEW REQUIRES METHYL "
+            "JOINT RELEASE REQUIRES REPRESENTATION-MINIMUM-STABLE METHYL+BASE; "
+            "FALLBACK REVIEW REQUIRES THE SAME ZERO-DISAGREEMENT METHYL GATE "
             "AND IS EXPLICITLY BASE-FAIL"
         ),
     }

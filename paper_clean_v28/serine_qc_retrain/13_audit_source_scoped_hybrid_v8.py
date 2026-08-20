@@ -72,7 +72,7 @@ REQUIRED_TRAINING_ORDER_POLICY = (
 )
 REQUIRED_DEPLOYMENT_POLICY = (
     "all_cyclic_starts_and_all_decoder_orders_mapped_to_physical_"
-    "residues_probability_mean"
+    "residues_probability_mean_for_ranking_representation_min_for_release"
 )
 
 
@@ -429,6 +429,11 @@ def run(args: argparse.Namespace) -> None:
     v6_summary = dict(model_manifest["v6_test"])
     v8_composition_summary = dict(model_manifest["v8_test"])
     current_fixed = representation_summary["overall_at_threshold"]
+    release_floor_summary = auditor.metric_summary(
+        position_rows, "probability_representation_min", float(args.threshold)
+    )
+    release_floor_fixed = release_floor_summary["overall_at_threshold"]
+    release_floor_serine = release_floor_summary["serine"]
     v6_fixed = v6_summary["overall_at_threshold"]
     composition_fixed = v8_composition_summary["overall_at_threshold"]
     serine = representation_summary["serine"]
@@ -535,6 +540,23 @@ def run(args: argparse.Namespace) -> None:
         "overall_auc_ge_0_85": float(representation_summary["overall_auc"]) >= 0.85,
         "overall_precision_at_0_6_ge_0_75": float(current_fixed["precision"]) >= 0.75,
         "overall_fpr_at_0_6_le_0_10": float(current_fixed["false_positive_rate"]) <= 0.10,
+        "release_floor_precision_at_0_6_ge_0_75": (
+            float(release_floor_fixed["precision"]) >= 0.75
+        ),
+        "release_floor_fpr_at_0_6_le_0_10": (
+            float(release_floor_fixed["false_positive_rate"]) <= 0.10
+        ),
+        "release_floor_serine_recall_at_0_6_ge_0_40": (
+            float(release_floor_serine["recall"]) >= 0.40
+        ),
+        "heldout_hard_calls_have_zero_cyclic_start_threshold_disagreement": (
+            int(
+                representation_summary[
+                    "representation_threshold_disagreement_positions"
+                ]
+            )
+            == 0
+        ),
         "serine_auc_ge_0_70": serine["auc"] is not None and float(serine["auc"]) >= 0.70,
         "serine_recall_at_0_6_ge_0_40": float(serine["recall"]) >= 0.40,
         "serine_fpr_at_0_6_le_0_25": float(serine["false_positive_rate"]) <= 0.25,
@@ -551,6 +573,13 @@ def run(args: argparse.Namespace) -> None:
             and set(native_lengths) == set(targets)
             and all(
                 int(row["representation_count"]) == int(row["peptide_length"])
+                for row in native_summary
+            )
+        ),
+        "all_17_native_target_hard_calls_are_stable_across_cyclic_starts": (
+            len(native_summary) == 17
+            and all(
+                int(row["raw_all_representations_same_physical_annotation"]) == 1
                 for row in native_summary
             )
         ),
@@ -614,6 +643,7 @@ def run(args: argparse.Namespace) -> None:
         "test_reuse_limitation": model_manifest["test_reuse_limitation"],
         "development_status": model_manifest["development_status"],
         "serine_auc_tradeoff": serine_tradeoff,
+        "release_floor_metrics": release_floor_summary,
         "quality_checks": quality_checks,
         "device": str(device),
         "audit_batch_size": int(args.batch_size),

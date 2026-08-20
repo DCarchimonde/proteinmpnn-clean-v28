@@ -11,19 +11,24 @@ to the canonical parent.  There is no surrogate network or post-hoc weight
 splicing.  Lowercase target tokens are naturalized before every model forward
 so the methylation answer can never leak through the sequence embedding.
 
-Every training epoch receives an explicit cyclic designed-position rotation;
-the 30-epoch minimum covers every possible relative depth allowed by the frozen
-30-residue peptide cap.  The V6 option additionally enumerates every equivalent
-physical cyclic start by jointly rotating sequence/labels and N/CA/C/O
-coordinates while resetting the linear residue index.  Validation, test
-promotion, and downstream annotation then use the matching all-start and
-all-decoder-order ensemble mapped back to physical residues.
+The historical order-balanced mode receives one epoch-indexed cyclic decoder
+rotation.  The cyclic-stability mode instead evaluates the complete physical
+start x decoder-order grid on every optimizer step: it jointly rotates
+sequence/labels and N/CA/C/O coordinates through every physical cyclic start,
+resets the linear residue index, differentiably averages all L decoder orders
+within each start, maps those means back to physical residues, and optimizes the
+label-aware worst start plus a strictly positive consistency penalty.
+Validation, test promotion, and downstream annotation use that same complete
+grid at the frozen deployment temperature.
 
 The corrected 600-record training split is divided deterministically into a
 development-train and record-disjoint validation partition.  The original 151
-records are not accessed until epoch selection has finished.  Checkpoint
-promotion is blocked unless every non-expert tensor is bitwise identical to the
-parent and the fixed validation/test gates pass.
+records are not accessed until epoch selection has finished.  They are an
+internal development audit reused by historical V3--V9 work, not a new blind
+outer test set and not publication-level independent validation.  Checkpoint
+promotion depends only on frozen-input, state-isolation, and inner-validation
+checks; the separate downstream audit may still fail closed on the 151-record
+diagnostic set before any candidates are released.
 """
 
 from __future__ import annotations
@@ -89,11 +94,11 @@ ORDER_BALANCED_PROTOCOL = (
 )
 CYCLIC_REPRESENTATION_PROTOCOL = (
     "canonical_clean_v28_all_expert_heads_corrected_labels_"
-    "cyclic_representation_augmented_v6"
+    "cyclic_stability_worst_start_v9"
 )
 SERINE_ONLY_CYCLIC_PROTOCOL = (
     "canonical_clean_v28_serine_only_corrected_labels_"
-    "cyclic_representation_augmented_v7"
+    "cyclic_stability_worst_start_v9"
 )
 SERINE_EXPERT_INDEX = NATURAL_AA_ALPHABET.index("S")
 SERINE_EXPERT_STATE_KEYS = {
@@ -101,6 +106,8 @@ SERINE_EXPERT_STATE_KEYS = {
 }
 MINIMUM_ORDER_COVERAGE_EPOCHS = 30
 VALIDATION_INTERVAL_EPOCHS = 5
+DEFAULT_WORST_START_BCE_WEIGHT = 1.0
+DEFAULT_REPRESENTATION_CONSISTENCY_WEIGHT = 0.25
 
 
 def file_sha256(path: Path) -> str:
@@ -109,6 +116,20 @@ def file_sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def require_expected_sha256(path: Path, expected: str, label: str) -> str:
+    """Fail closed when a frozen V9 input is absent or byte-different."""
+
+    normalized = str(expected).strip().lower()
+    if len(normalized) != 64 or any(token not in "0123456789abcdef" for token in normalized):
+        raise ValueError(f"{label} expected SHA-256 is missing or malformed")
+    observed = file_sha256(path)
+    if observed != normalized:
+        raise RuntimeError(
+            f"{label} SHA-256 mismatch: expected {normalized}, observed {observed}"
+        )
+    return observed
 
 
 def tensor_sha256(tensor: torch.Tensor) -> str:
@@ -219,6 +240,51 @@ def cyclic_augmented_per_base_binary_counts(
     return counts
 
 
+def require_complete_cyclic_training_mask(
+    mask: torch.Tensor,
+    chain_M: torch.Tensor,
+    real_pos: torch.Tensor,
+    S_label: torch.Tensor,
+    context: str,
+) -> Tuple[int, ...]:
+    """Return lengths only when every designed cyclic site is loss-valid.
+
+    Dropping selected sites through a partial ``valid`` mask changes both the
+    physical-start grid and the decoder-order grid.  Cyclic training therefore
+    rejects malformed masks instead of silently optimizing a smaller ensemble.
+    """
+
+    if S_label.ndim != 2:
+        raise RuntimeError(f"{context}: cyclic labels must be rank 2")
+    if any(value.shape != S_label.shape for value in (mask, chain_M, real_pos)):
+        raise RuntimeError(f"{context}: cyclic mask tensor shapes do not match")
+    if not all(
+        bool(torch.isfinite(value).all()) for value in (mask, chain_M, real_pos)
+    ):
+        raise RuntimeError(f"{context}: cyclic masks contain non-finite values")
+    for name, value in (("mask", mask), ("chain_M", chain_M), ("real_pos", real_pos)):
+        if bool(((value != 0) & (value != 1)).any()):
+            raise RuntimeError(f"{context}: {name} must be binary")
+
+    selected = (mask > 0) & (chain_M > 0)
+    if bool(((mask > 0) & ~selected).any()):
+        raise RuntimeError(
+            f"{context}: cyclic training cannot contain visible receptor positions"
+        )
+    known_token = (S_label >= 0) & (S_label < len(EXTENDED_AA_ALPHABET))
+    complete_valid = (
+        selected & (real_pos > 0) & known_token & (S_label != X_INDEX)
+    )
+    if not torch.equal(complete_valid, selected):
+        raise RuntimeError(
+            f"{context}: every designed cyclic position must be a real, known token"
+        )
+    lengths = tuple(int(row.sum().item()) for row in selected)
+    if not lengths or min(lengths) <= 0:
+        raise RuntimeError(f"{context}: every cyclic row must be non-empty")
+    return lengths
+
+
 def expand_all_cyclic_training_representations(
     X: torch.Tensor,
     S_label: torch.Tensor,
@@ -236,12 +302,14 @@ def expand_all_cyclic_training_representations(
     column.  Padding is retained but never rotated.
     """
 
-    selected_mask = (mask * chain_M) > 0
-    if bool(((mask > 0) & ~selected_mask).any()):
-        raise RuntimeError(
-            "Cyclic representation training requires peptide-only input with "
-            "zero visible receptor positions"
-        )
+    require_complete_cyclic_training_mask(
+        mask,
+        chain_M,
+        real_pos,
+        S_label,
+        "cyclic representation expansion",
+    )
+    selected_mask = (mask > 0) & (chain_M > 0)
 
     expanded: List[List[torch.Tensor]] = [[] for _ in range(7)]
     for row_index in range(S_label.shape[0]):
@@ -571,6 +639,305 @@ def expert_probability_loss(
     return torch.stack(losses).mean()
 
 
+def active_representation_consistency_loss(
+    representation_span: torch.Tensor,
+    S_label: torch.Tensor,
+    valid: torch.Tensor,
+    active_base_indices: Sequence[int] | None = None,
+) -> torch.Tensor:
+    """Equal-expert penalty for physical-probability variation across starts."""
+
+    if representation_span.shape != S_label.shape or valid.shape != S_label.shape:
+        raise RuntimeError("Representation consistency tensor shapes do not match")
+    if valid.dtype != torch.bool:
+        raise RuntimeError("Representation consistency valid mask must be bool")
+    if not bool(torch.isfinite(representation_span[valid]).all()):
+        raise RuntimeError("Representation consistency span is non-finite")
+    if bool((representation_span[valid] < 0.0).any()):
+        raise RuntimeError("Representation consistency span cannot be negative")
+    true_base = naturalize_tensor_for_input(S_label)
+    losses: List[torch.Tensor] = []
+    for base_index in normalize_active_base_indices(active_base_indices):
+        selected = valid & (true_base == base_index)
+        if bool(selected.any()):
+            losses.append(representation_span[selected].square().mean())
+    if not losses:
+        raise RuntimeError("No valid consistency positions in batch")
+    return torch.stack(losses).mean()
+
+
+def expanded_cyclic_group_slices(
+    valid: torch.Tensor,
+    group_lengths: Sequence[int],
+) -> List[Tuple[int, int, torch.Tensor]]:
+    """Validate expanded-row boundaries and return fail-closed group slices."""
+
+    if valid.ndim != 2 or valid.dtype != torch.bool:
+        raise RuntimeError("Expanded cyclic valid mask must be rank-2 bool")
+    lengths: List[int] = []
+    for raw_length in group_lengths:
+        if isinstance(raw_length, bool):
+            raise RuntimeError("Expanded cyclic group length is malformed")
+        try:
+            length = int(raw_length)
+            exact = float(raw_length) == float(length)
+        except (TypeError, ValueError, OverflowError):
+            raise RuntimeError("Expanded cyclic group length is malformed") from None
+        if not exact or length <= 0:
+            raise RuntimeError("Expanded cyclic group length is malformed")
+        lengths.append(length)
+    if not lengths or sum(lengths) != int(valid.shape[0]):
+        raise RuntimeError(
+            "Expanded cyclic group boundaries do not cover the expanded batch"
+        )
+
+    result: List[Tuple[int, int, torch.Tensor]] = []
+    cursor = 0
+    for length in lengths:
+        end = cursor + length
+        positions = torch.where(valid[cursor])[0]
+        if int(positions.numel()) != length:
+            raise RuntimeError(
+                "Expanded cyclic group length does not match its valid positions"
+            )
+        for row_index in range(cursor, end):
+            row_positions = torch.where(valid[row_index])[0]
+            if not torch.equal(row_positions, positions):
+                raise RuntimeError(
+                    "Expanded cyclic group changed its valid-position mask"
+                )
+        result.append((cursor, length, positions))
+        cursor = end
+    if cursor != int(valid.shape[0]):
+        raise RuntimeError("Expanded cyclic group coverage is incomplete")
+    return result
+
+
+def differentiable_full_decoder_order_mean_probabilities(
+    model: torch.nn.Module,
+    X: torch.Tensor,
+    S_natural: torch.Tensor,
+    mask: torch.Tensor,
+    chain_M: torch.Tensor,
+    residue_idx: torch.Tensor,
+    chain_encoding_all: torch.Tensor,
+    valid: torch.Tensor,
+    group_lengths: Sequence[int],
+    temperature: float,
+) -> torch.Tensor:
+    """Differentiably average all L decoder orders for every expanded start.
+
+    The expanded batch contains L rows for an original length-L peptide.  Each
+    of those rows is a distinct physical cyclic serialization.  For every row
+    this function evaluates exactly its L unique cyclic decoder orders and
+    returns their probability mean without detaching the expert-head graph.
+    """
+
+    if not math.isfinite(float(temperature)) or temperature <= 0.0:
+        raise RuntimeError("Full-grid ensemble temperature must be positive")
+    if X.ndim != 4 or S_natural.ndim != 2:
+        raise RuntimeError("Full-grid X/S tensors have incompatible ranks")
+    if X.shape[:2] != S_natural.shape:
+        raise RuntimeError("Full-grid X/S batch shapes do not match")
+    for name, value in (
+        ("mask", mask),
+        ("chain_M", chain_M),
+        ("residue_idx", residue_idx),
+        ("chain_encoding_all", chain_encoding_all),
+        ("valid", valid),
+    ):
+        if value.shape != S_natural.shape:
+            raise RuntimeError(f"Full-grid {name} shape does not match sequence")
+
+    groups = expanded_cyclic_group_slices(valid, group_lengths)
+    selected = (mask > 0) & (chain_M > 0)
+    if not torch.equal(selected, valid):
+        raise RuntimeError(
+            "Full-grid valid mask must equal every designed peptide position"
+        )
+    if bool(((mask > 0) & ~selected).any()):
+        raise RuntimeError("Full-grid training cannot include a visible receptor")
+
+    safe_base = S_natural.clone()
+    invalid_base = (safe_base < 0) | (safe_base >= N_NATURAL)
+    if bool((invalid_base & valid).any()):
+        raise RuntimeError("Full-grid designed sequence contains a noncanonical base")
+    safe_base[invalid_base] = 0
+
+    row_lengths: List[int] = []
+    for _cursor, length, _positions in groups:
+        row_lengths.extend([length] * length)
+    if len(row_lengths) != int(S_natural.shape[0]):
+        raise RuntimeError("Full-grid row-length coverage is incomplete")
+
+    probability_sum = torch.zeros_like(S_natural, dtype=torch.float32)
+    probability_count = torch.zeros_like(S_natural, dtype=torch.float32)
+    for decoder_shift in range(max(row_lengths)):
+        decoding_order = cyclic_designed_decoding_order(
+            chain_M,
+            mask,
+            shift=decoder_shift,
+        )
+        _base_logits, expert_logits = model(
+            X,
+            S_natural,
+            mask,
+            chain_M,
+            residue_idx,
+            chain_encoding_all,
+            decoding_order=decoding_order,
+        )
+        if (
+            expert_logits.shape[:2] != S_natural.shape
+            or int(expert_logits.shape[-1]) != len(NATURAL_AA_ALPHABET)
+        ):
+            raise RuntimeError("Full-grid model returned malformed expert logits")
+        selected_logits = torch.gather(
+            expert_logits,
+            -1,
+            safe_base.unsqueeze(-1),
+        ).squeeze(-1)
+        probabilities = torch.sigmoid(selected_logits / float(temperature))
+        if not bool(torch.isfinite(probabilities[valid]).all()):
+            raise RuntimeError("Full-grid model returned non-finite probabilities")
+        active_rows = torch.tensor(
+            [decoder_shift < length for length in row_lengths],
+            device=valid.device,
+            dtype=torch.bool,
+        )
+        contribution = valid & active_rows.unsqueeze(-1)
+        contribution_float = contribution.to(dtype=probabilities.dtype)
+        probability_sum = probability_sum + probabilities * contribution_float
+        probability_count += contribution_float.to(dtype=probability_count.dtype)
+
+    expected_count = torch.tensor(
+        row_lengths,
+        device=valid.device,
+        dtype=probability_count.dtype,
+    ).unsqueeze(-1).expand_as(probability_count)
+    if not torch.equal(probability_count[valid], expected_count[valid]):
+        raise RuntimeError(
+            "Full-grid decoder-order coverage is incomplete or duplicated"
+        )
+    order_mean = probability_sum / probability_count.clamp_min(1.0)
+    return torch.where(valid, order_mean, torch.zeros_like(order_mean))
+
+
+def cyclic_worst_start_and_consistency_loss(
+    decoder_order_mean_probability: torch.Tensor,
+    S_label: torch.Tensor,
+    valid: torch.Tensor,
+    group_lengths: Sequence[int],
+    positive_weights: Mapping[int, float],
+    active_base_indices: Sequence[int] | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor, float, Dict[int, Tuple[int, int]]]:
+    """Map per-start order means back and optimize physical worst cases.
+
+    ``expand_all_cyclic_training_representations`` stores, for each original
+    row of length L, L consecutive left-shifted serializations.  The input must
+    already be the differentiable all-L-decoder-order mean for each such row.
+    This helper rolls those means back to physical order, uses min(probability)
+    for a methyl-positive label and max(probability) for a natural-negative
+    label, and penalizes the squared all-start probability span.
+    """
+
+    if decoder_order_mean_probability.shape != S_label.shape:
+        raise RuntimeError("Cyclic order-mean probability shape is malformed")
+    groups = expanded_cyclic_group_slices(valid, group_lengths)
+    if not bool(torch.isfinite(decoder_order_mean_probability[valid]).all()):
+        raise RuntimeError("Cyclic order-mean probabilities are non-finite")
+    if bool(
+        (
+            (decoder_order_mean_probability[valid] < 0.0)
+            | (decoder_order_mean_probability[valid] > 1.0)
+        ).any()
+    ):
+        raise RuntimeError("Cyclic order-mean probabilities are outside [0, 1]")
+
+    true_base = naturalize_tensor_for_input(S_label)
+    invalid_base = (true_base < 0) | (true_base >= N_NATURAL)
+    if bool((invalid_base & valid).any()):
+        raise RuntimeError("Cyclic loss contains an invalid physical base label")
+    labels_all = (S_label >= N_NATURAL).to(dtype=torch.float32)
+    worst_by_base: Dict[int, List[torch.Tensor]] = defaultdict(list)
+    labels_by_base: Dict[int, List[torch.Tensor]] = defaultdict(list)
+    span_by_base: Dict[int, List[torch.Tensor]] = defaultdict(list)
+    maximum_span = 0.0
+    active = set(normalize_active_base_indices(active_base_indices))
+    coverage: Dict[int, List[int]] = {index: [0, 0] for index in active}
+    for cursor, length, positions in groups:
+        mapped_probabilities: List[torch.Tensor] = []
+        mapped_bases: List[torch.Tensor] = []
+        mapped_labels: List[torch.Tensor] = []
+        for shift in range(length):
+            row_index = cursor + shift
+            row_bases = true_base[row_index, positions]
+            mapped_probabilities.append(
+                torch.roll(
+                    decoder_order_mean_probability[row_index, positions],
+                    shifts=shift,
+                    dims=0,
+                )
+            )
+            mapped_bases.append(torch.roll(row_bases, shifts=shift, dims=0))
+            mapped_labels.append(
+                torch.roll(labels_all[row_index, positions], shifts=shift, dims=0)
+            )
+        reference_bases = mapped_bases[0]
+        reference_labels = mapped_labels[0]
+        if any(not torch.equal(value, reference_bases) for value in mapped_bases[1:]):
+            raise RuntimeError("Cyclic representation base labels do not map physically")
+        if any(not torch.equal(value, reference_labels) for value in mapped_labels[1:]):
+            raise RuntimeError("Cyclic representation methyl labels do not map physically")
+        probability_stack = torch.stack(mapped_probabilities, dim=0)
+        minimum = probability_stack.min(dim=0).values
+        maximum = probability_stack.max(dim=0).values
+        span = maximum - minimum
+        worst = torch.where(reference_labels > 0.5, minimum, maximum)
+        maximum_span = max(maximum_span, float(span.detach().max().item()))
+        for base_index in active:
+            selected = reference_bases == base_index
+            if bool(selected.any()):
+                worst_by_base[base_index].append(worst[selected])
+                labels_by_base[base_index].append(reference_labels[selected])
+                span_by_base[base_index].append(span[selected])
+                positive_count = int(reference_labels[selected].sum().item())
+                coverage[base_index][0] += int(selected.sum().item()) - positive_count
+                coverage[base_index][1] += positive_count
+
+    worst_losses: List[torch.Tensor] = []
+    consistency_losses: List[torch.Tensor] = []
+    for base_index in sorted(active):
+        if not worst_by_base[base_index]:
+            continue
+        probability = torch.cat(worst_by_base[base_index]).clamp(1e-7, 1.0 - 1e-7)
+        labels = torch.cat(labels_by_base[base_index])
+        if base_index not in positive_weights:
+            raise RuntimeError(
+                f"Cyclic loss is missing the positive weight for expert {base_index}"
+            )
+        positive_weight = float(positive_weights[base_index])
+        if not math.isfinite(positive_weight) or positive_weight <= 0.0:
+            raise RuntimeError(
+                f"Cyclic loss has an invalid positive weight for expert {base_index}"
+            )
+        worst_losses.append(
+            -(
+                positive_weight * labels * torch.log(probability)
+                + (1.0 - labels) * torch.log1p(-probability)
+            ).mean()
+        )
+        consistency_losses.append(torch.cat(span_by_base[base_index]).square().mean())
+    if not worst_losses or not consistency_losses:
+        raise RuntimeError("Worst-start training produced no active expert positions")
+    return (
+        torch.stack(worst_losses).mean(),
+        torch.stack(consistency_losses).mean(),
+        maximum_span,
+        {index: tuple(counts) for index, counts in coverage.items()},
+    )
+
+
 def validation_balanced_bce(
     model: torch.nn.Module,
     records: Sequence[Mapping[str, Any]],
@@ -579,7 +946,22 @@ def validation_balanced_bce(
     positive_weights: Mapping[int, float],
     cyclic_representation_ensemble: bool = False,
     active_base_indices: Sequence[int] | None = None,
+    worst_start_bce_weight: float = DEFAULT_WORST_START_BCE_WEIGHT,
+    representation_consistency_weight: float = DEFAULT_REPRESENTATION_CONSISTENCY_WEIGHT,
+    ensemble_temperature: float = 0.5,
 ) -> float:
+    if cyclic_representation_ensemble and (
+        not math.isfinite(float(worst_start_bce_weight))
+        or not math.isfinite(float(representation_consistency_weight))
+        or worst_start_bce_weight <= 0.0
+        or representation_consistency_weight <= 0.0
+    ):
+        raise ValueError(
+            "Cyclic validation requires positive finite worst-start and "
+            "representation-consistency weights"
+        )
+    if not math.isfinite(float(ensemble_temperature)) or ensemble_temperature <= 0.0:
+        raise ValueError("Validation ensemble temperature must be positive")
     model.eval()
     losses: List[float] = []
     with torch.no_grad():
@@ -589,6 +971,14 @@ def validation_balanced_bce(
                 continue
             tensors, _metas = packed
             X, S_label, mask, chain_M, residue_idx, chain_encoding_all, real_pos = tensors
+            if cyclic_representation_ensemble:
+                require_complete_cyclic_training_mask(
+                    mask,
+                    chain_M,
+                    real_pos,
+                    S_label,
+                    "cyclic validation",
+                )
             valid = (
                 (mask > 0)
                 & (chain_M > 0)
@@ -612,10 +1002,21 @@ def validation_balanced_bce(
                         chain_M,
                         residue_idx,
                         chain_encoding_all,
-                        temperature=1.0,
+                        temperature=ensemble_temperature,
                     )
                 )
-                probabilities = representation["mean"]
+                labels = S_label >= N_NATURAL
+                probabilities = torch.where(
+                    labels,
+                    representation["representation_min"],
+                    representation["representation_max"],
+                )
+                consistency_loss = active_representation_consistency_loss(
+                    representation["representation_span"],
+                    S_label,
+                    valid,
+                    active_base_indices=active_base_indices,
+                )
             else:
                 probabilities, _order_std = (
                     cyclic_known_sequence_methyl_probabilities(
@@ -626,9 +1027,10 @@ def validation_balanced_bce(
                         chain_M,
                         residue_idx,
                         chain_encoding_all,
-                        temperature=1.0,
+                        temperature=ensemble_temperature,
                     )
                 )
+                consistency_loss = torch.zeros((), device=probabilities.device)
             loss = expert_probability_loss(
                 probabilities,
                 S_label,
@@ -636,6 +1038,11 @@ def validation_balanced_bce(
                 positive_weights,
                 active_base_indices=active_base_indices,
             )
+            if cyclic_representation_ensemble:
+                loss = (
+                    float(worst_start_bce_weight) * loss
+                    + float(representation_consistency_weight) * consistency_loss
+                )
             losses.append(float(loss.item()))
     if not losses:
         raise RuntimeError("Validation produced no expert-head loss")
@@ -654,7 +1061,22 @@ def train_all_expert_heads(
     seed: int,
     cyclic_representation_augmentation: bool = False,
     active_base_indices: Sequence[int] | None = None,
+    worst_start_bce_weight: float = DEFAULT_WORST_START_BCE_WEIGHT,
+    representation_consistency_weight: float = DEFAULT_REPRESENTATION_CONSISTENCY_WEIGHT,
+    ensemble_temperature: float = 0.5,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, torch.Tensor], Dict[str, Any]]:
+    if cyclic_representation_augmentation and (
+        not math.isfinite(float(worst_start_bce_weight))
+        or not math.isfinite(float(representation_consistency_weight))
+        or worst_start_bce_weight <= 0.0
+        or representation_consistency_weight <= 0.0
+    ):
+        raise ValueError(
+            "Cyclic training requires positive finite worst-start and "
+            "representation-consistency weights"
+        )
+    if not math.isfinite(float(ensemble_temperature)) or ensemble_temperature <= 0.0:
+        raise ValueError("Training ensemble temperature must be positive")
     active_indices = normalize_active_base_indices(active_base_indices)
     active_state_keys = {
         f"experts.{index}.{suffix}"
@@ -674,16 +1096,18 @@ def train_all_expert_heads(
 
     # The frozen trunk is always evaluated with dropout/augmentation disabled.
     model.eval()
-    expected_counts = (
-        cyclic_augmented_per_base_binary_counts(train_records)
-        if cyclic_representation_augmentation
-        else per_base_binary_counts(train_records)
-    )
+    # The full-grid objective collapses all starts back to each physical label,
+    # so loss coverage is counted once per physical site, not L times.
+    expected_counts = per_base_binary_counts(train_records)
     for epoch in range(1, epochs + 1):
         order = list(range(len(train_records)))
         random.Random(seed + epoch).shuffle(order)
         shuffled = [train_records[index] for index in order]
         batch_losses: List[float] = []
+        batch_mean_bce_losses: List[float] = []
+        batch_worst_start_losses: List[float] = []
+        batch_consistency_losses: List[float] = []
+        epoch_maximum_representation_span = 0.0
         optimizer_update_batches = 0
         skipped_no_active_position_batches = 0
         epoch_coverage = {
@@ -696,7 +1120,15 @@ def train_all_expert_heads(
                 continue
             tensors, _metas = packed
             X, S_label, mask, chain_M, residue_idx, chain_encoding_all, real_pos = tensors
+            cyclic_group_lengths: Tuple[int, ...] | None = None
             if cyclic_representation_augmentation:
+                cyclic_group_lengths = require_complete_cyclic_training_mask(
+                    mask,
+                    chain_M,
+                    real_pos,
+                    S_label,
+                    "cyclic optimizer batch before expansion",
+                )
                 (
                     X,
                     S_label,
@@ -729,31 +1161,82 @@ def train_all_expert_heads(
                 continue
             optimizer.zero_grad(set_to_none=True)
             S_forward = naturalize_tensor_for_input(S_label)
-            decoding_order = cyclic_designed_decoding_order(
-                chain_M,
-                mask,
-                shift=epoch - 1,
-            )
-            _base_logits, expert_logits = model(
-                X,
-                S_forward,
-                mask,
-                chain_M,
-                residue_idx,
-                chain_encoding_all,
-                decoding_order=decoding_order,
-            )
-            loss, coverage = expert_head_loss(
-                expert_logits,
-                S_label,
-                valid,
-                positive_weights,
-                active_base_indices=active_indices,
-            )
+            if cyclic_representation_augmentation:
+                if cyclic_group_lengths is None:
+                    raise RuntimeError("Cyclic group metadata was not preserved")
+                order_mean_probability = (
+                    differentiable_full_decoder_order_mean_probabilities(
+                        model,
+                        X,
+                        S_forward,
+                        mask,
+                        chain_M,
+                        residue_idx,
+                        chain_encoding_all,
+                        valid,
+                        cyclic_group_lengths,
+                        temperature=ensemble_temperature,
+                    )
+                )
+                (
+                    worst_start_loss,
+                    consistency_loss,
+                    batch_maximum_span,
+                    coverage,
+                ) = cyclic_worst_start_and_consistency_loss(
+                    order_mean_probability,
+                    S_label,
+                    valid,
+                    cyclic_group_lengths,
+                    positive_weights,
+                    active_base_indices=active_indices,
+                )
+                loss = (
+                    float(worst_start_bce_weight) * worst_start_loss
+                    + float(representation_consistency_weight) * consistency_loss
+                )
+                # This is a detached diagnostic only.  It is deliberately not
+                # added to the exact deployment-aligned full-grid objective.
+                mean_bce_loss = expert_probability_loss(
+                    order_mean_probability.detach(),
+                    S_label,
+                    valid,
+                    positive_weights,
+                    active_base_indices=active_indices,
+                )
+                batch_worst_start_losses.append(float(worst_start_loss.item()))
+                batch_consistency_losses.append(float(consistency_loss.item()))
+                epoch_maximum_representation_span = max(
+                    epoch_maximum_representation_span, batch_maximum_span
+                )
+            else:
+                decoding_order = cyclic_designed_decoding_order(
+                    chain_M,
+                    mask,
+                    shift=epoch - 1,
+                )
+                _base_logits, expert_logits = model(
+                    X,
+                    S_forward,
+                    mask,
+                    chain_M,
+                    residue_idx,
+                    chain_encoding_all,
+                    decoding_order=decoding_order,
+                )
+                mean_bce_loss, coverage = expert_head_loss(
+                    expert_logits,
+                    S_label,
+                    valid,
+                    positive_weights,
+                    active_base_indices=active_indices,
+                )
+                loss = mean_bce_loss
             loss.backward()
             torch.nn.utils.clip_grad_norm_(expert_parameters, 5.0)
             optimizer.step()
             batch_losses.append(float(loss.item()))
+            batch_mean_bce_losses.append(float(mean_bce_loss.item()))
             optimizer_update_batches += 1
             for base_index, (negative_count, positive_count) in coverage.items():
                 epoch_coverage[base_index][0] += negative_count
@@ -793,6 +1276,9 @@ def train_all_expert_heads(
                 positive_weights,
                 cyclic_representation_ensemble=cyclic_representation_augmentation,
                 active_base_indices=active_indices,
+                worst_start_bce_weight=worst_start_bce_weight,
+                representation_consistency_weight=representation_consistency_weight,
+                ensemble_temperature=ensemble_temperature,
             )
             if should_validate
             else None
@@ -816,6 +1302,24 @@ def train_all_expert_heads(
         row = {
             "epoch": epoch,
             "mean_balanced_train_bce": mean_train_loss,
+            "mean_per_start_full_decoder_order_mean_bce_diagnostic": (
+                sum(batch_mean_bce_losses) / len(batch_mean_bce_losses)
+            ),
+            "mean_worst_start_bce": (
+                sum(batch_worst_start_losses) / len(batch_worst_start_losses)
+                if batch_worst_start_losses
+                else ""
+            ),
+            "mean_representation_consistency_loss": (
+                sum(batch_consistency_losses) / len(batch_consistency_losses)
+                if batch_consistency_losses
+                else ""
+            ),
+            "maximum_training_representation_span": (
+                epoch_maximum_representation_span
+                if cyclic_representation_augmentation
+                else ""
+            ),
             "validation_balanced_bce": (
                 validation_loss if validation_loss is not None else ""
             ),
@@ -867,6 +1371,21 @@ def train_all_expert_heads(
         },
         "cyclic_representation_augmentation": bool(
             cyclic_representation_augmentation
+        ),
+        "worst_start_bce_weight": float(worst_start_bce_weight),
+        "representation_consistency_weight": float(
+            representation_consistency_weight
+        ),
+        "training_ensemble_temperature": float(ensemble_temperature),
+        "full_physical_start_by_full_decoder_order_grid": bool(
+            cyclic_representation_augmentation
+        ),
+        "training_objective": (
+            "full_physical_start_x_full_decoder_order_grid_differentiable_"
+            "order_mean_then_label_aware_worst_start_balanced_bce_plus_"
+            "all_label_all_start_probability_span_squared"
+            if cyclic_representation_augmentation
+            else "standard_balanced_bce"
         ),
         "active_expert_indices": list(active_indices),
         "active_expert_tokens": [NATURAL_AA_ALPHABET[index] for index in active_indices],
@@ -924,7 +1443,10 @@ def evaluate(
                         temperature=deployment_temperature,
                     )
                 )
-                probability = representation["mean"]
+                ranking_probability = representation["mean"]
+                probability = representation["representation_min"]
+                representation_min = representation["representation_min"]
+                representation_max = representation["representation_max"]
                 order_std = representation["decoder_order_std_mean"]
                 representation_std = representation["representation_std"]
                 representation_span = representation["representation_span"]
@@ -941,6 +1463,9 @@ def evaluate(
                 )
                 representation_std = torch.zeros_like(probability)
                 representation_span = torch.zeros_like(probability)
+                ranking_probability = probability
+                representation_min = probability
+                representation_max = probability
             true_base = naturalize_tensor_for_input(S_label)
 
             for row_index, meta in enumerate(metas):
@@ -948,6 +1473,9 @@ def evaluate(
                 for position in torch.where(valid[row_index])[0].cpu().tolist():
                     base_index = int(true_base[row_index, position].item())
                     target_index = int(S_label[row_index, position].item())
+                    is_methyl_true = int(target_index >= N_NATURAL)
+                    minimum = float(representation_min[row_index, position].item())
+                    maximum = float(representation_max[row_index, position].item())
                     position_rows.append(
                         {
                             "checkpoint": checkpoint_label,
@@ -956,9 +1484,32 @@ def evaluate(
                             "position_in_model_0based": position,
                             "target_token": EXTENDED_AA_ALPHABET[target_index],
                             "base_token": NATURAL_AA_ALPHABET[base_index],
-                            "is_methyl_true": int(target_index >= N_NATURAL),
+                            "is_methyl_true": is_methyl_true,
                             "probability_methyl_deployment_scaled": float(
                                 probability[row_index, position].item()
+                            ),
+                            "probability_methyl_ranking_mean": float(
+                                ranking_probability[row_index, position].item()
+                            ),
+                            "probability_representation_min": minimum,
+                            "probability_representation_max": maximum,
+                            "probability_label_aware_adversarial": (
+                                minimum if is_methyl_true else maximum
+                            ),
+                            "representation_threshold_disagreement": int(
+                                round(
+                                    float(
+                                        representation_min[row_index, position].item()
+                                    ),
+                                    8,
+                                )
+                                <= threshold
+                                < round(
+                                    float(
+                                        representation_max[row_index, position].item()
+                                    ),
+                                    8,
+                                )
                             ),
                             "probability_order_std": float(
                                 order_std[row_index, position].item()
@@ -992,6 +1543,10 @@ def evaluate(
         [row["probability_methyl_deployment_scaled"] for row in position_rows],
         dtype=np.float64,
     )
+    p_auc_all = np.asarray(
+        [row["probability_label_aware_adversarial"] for row in position_rows],
+        dtype=np.float64,
+    )
     order_std_all = np.asarray(
         [row["probability_order_std"] for row in position_rows],
         dtype=np.float64,
@@ -1009,6 +1564,7 @@ def evaluate(
         idx = np.asarray(grouped_indices.get(base_token, []), dtype=np.int64)
         y = y_all[idx] if len(idx) else np.asarray([], dtype=np.int64)
         p = p_all[idx] if len(idx) else np.asarray([], dtype=np.float64)
+        p_auc = p_auc_all[idx] if len(idx) else np.asarray([], dtype=np.float64)
         threshold_metrics = binary_metrics(y, p, [threshold])[0] if len(idx) else {}
         per_residue.append(
             {
@@ -1017,7 +1573,7 @@ def evaluate(
                 "positions": int(len(idx)),
                 "natural_negatives": int(np.sum(y == 0)),
                 "methyl_positives": int(np.sum(y == 1)),
-                "auc": roc_auc_score_simple(y, p),
+                "auc": roc_auc_score_simple(y, p_auc),
                 **threshold_metrics,
             }
         )
@@ -1042,9 +1598,17 @@ def evaluate(
         "positions": len(position_rows),
         "threshold": threshold,
         "deployment_temperature": deployment_temperature,
-        "overall_auc": roc_auc_score_simple(y_all, p_all),
+        "overall_auc": roc_auc_score_simple(y_all, p_auc_all),
+        "overall_auc_release_min": roc_auc_score_simple(y_all, p_all),
+        "auc_probability_policy": (
+            "label_aware_adversarial_positive_min_negative_max"
+            if cyclic_representation_ensemble
+            else "decoder_order_mean"
+        ),
         "overall_at_threshold": overall_threshold,
-        "non_ser_auc": roc_auc_score_simple(y_all[non_ser_idx], p_all[non_ser_idx]),
+        "non_ser_auc": roc_auc_score_simple(
+            y_all[non_ser_idx], p_auc_all[non_ser_idx]
+        ),
         "non_ser_at_threshold": non_ser_threshold,
         "supported_expert_count": len(supported_rows),
         "supported_macro_auc": float(
@@ -1060,6 +1624,17 @@ def evaluate(
         ),
         "mean_probability_representation_span": float(
             np.mean(representation_span_all)
+        ),
+        "representation_threshold_disagreement_positions": int(
+            sum(
+                int(row["representation_threshold_disagreement"])
+                for row in position_rows
+            )
+        ),
+        "deployment_probability_policy": (
+            "representation_min_strict_gt_threshold; representation_mean_ranking_only"
+            if cyclic_representation_ensemble
+            else "decoder_order_mean_strict_gt_threshold"
         ),
         "serine": serine,
         "proline": proline,
@@ -1086,7 +1661,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stopping-patience", type=int, default=12)
     parser.add_argument("--threshold", type=float, default=0.6)
     parser.add_argument("--deployment-temperature", type=float, default=0.5)
+    parser.add_argument(
+        "--worst-start-bce-weight",
+        type=float,
+        default=DEFAULT_WORST_START_BCE_WEIGHT,
+        help="Weight for label-aware worst-cyclic-start balanced BCE.",
+    )
+    parser.add_argument(
+        "--representation-consistency-weight",
+        type=float,
+        default=DEFAULT_REPRESENTATION_CONSISTENCY_WEIGHT,
+        help=(
+            "Strictly positive weight for squared all-start probability-span "
+            "consistency loss."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--expected-parent-sha256", default="")
+    parser.add_argument("--expected-train-sha256", default="")
+    parser.add_argument("--expected-test-sha256", default="")
+    parser.add_argument("--require-frozen-input-sha256", action="store_true")
     parser.add_argument("--allow-cpu", action="store_true")
     parser.add_argument(
         "--expert-scope",
@@ -1103,8 +1697,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "jointly rotate sequence/labels and N/CA/C/O coordinates through "
-            "every physical cyclic start during training, and use the matching "
-            "all-start deployment ensemble for validation and test"
+            "every physical cyclic start, differentiably average every decoder "
+            "order within each start, and use the identical deployment grid for "
+            "validation and test"
         ),
     )
     parser.add_argument("--no-fail-on-quality-gate", action="store_true")
@@ -1137,10 +1732,25 @@ def main() -> None:
             f"epochs must be at least {MINIMUM_ORDER_COVERAGE_EPOCHS}; batch-size, "
             "learning-rate, and early-stopping-patience must be positive"
         )
-    if not 0.0 < args.threshold < 1.0 or args.deployment_temperature <= 0.0:
+    if (
+        not math.isfinite(float(args.threshold))
+        or not math.isfinite(float(args.deployment_temperature))
+        or not 0.0 < args.threshold < 1.0
+        or args.deployment_temperature <= 0.0
+    ):
         raise ValueError(
             "threshold must be between zero and one and deployment-temperature "
             "must be positive"
+        )
+    if (
+        not math.isfinite(float(args.worst_start_bce_weight))
+        or not math.isfinite(float(args.representation_consistency_weight))
+        or args.worst_start_bce_weight <= 0.0
+        or args.representation_consistency_weight <= 0.0
+    ):
+        raise ValueError(
+            "worst-start-bce-weight must be positive and "
+            "representation-consistency-weight must be strictly positive"
         )
 
     model_path = Path(args.model_path).resolve()
@@ -1151,17 +1761,39 @@ def main() -> None:
         if not required.is_file():
             raise FileNotFoundError(required)
 
+    frozen_input_hashes: Dict[str, str] = {}
+    expected_hashes = (
+        args.expected_parent_sha256,
+        args.expected_train_sha256,
+        args.expected_test_sha256,
+    )
+    if args.require_frozen_input_sha256 and not all(expected_hashes):
+        raise ValueError(
+            "--require-frozen-input-sha256 requires parent/train/test expected hashes"
+        )
+    if any(expected_hashes) and not all(expected_hashes):
+        raise ValueError("parent/train/test expected hashes must be supplied together")
+    if all(expected_hashes):
+        frozen_input_hashes = {
+            "parent_checkpoint_sha256": require_expected_sha256(
+                model_path, args.expected_parent_sha256, "parent checkpoint"
+            ),
+            "train_jsonl_sha256": require_expected_sha256(
+                train_path, args.expected_train_sha256, "corrected training JSONL"
+            ),
+            "test_jsonl_sha256": require_expected_sha256(
+                test_path, args.expected_test_sha256, "internal audit JSONL"
+            ),
+        }
+
     if not torch.cuda.is_available() and not args.allow_cpu:
         raise RuntimeError("CUDA is required unless --allow-cpu is explicit")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_deterministic_seed(args.seed)
 
     train_records = read_jsonl(str(train_path))
-    test_records = read_jsonl(str(test_path))
     train_context_audit = require_peptide_only_training_context(train_records, "train")
-    test_context_audit = require_peptide_only_training_context(test_records, "test")
     require_corrected_counts(train_records, EXPECTED_TRAIN_COUNTS, "train")
-    require_corrected_counts(test_records, EXPECTED_TEST_COUNTS, "test")
     development_records, validation_records, split_manifest = (
         deterministic_train_validation_split(
             train_records,
@@ -1183,6 +1815,9 @@ def main() -> None:
         positive_weights_by_base(development_records, active_indices),
         cyclic_representation_ensemble=args.cyclic_representation_augmentation,
         active_base_indices=active_indices,
+        worst_start_bce_weight=args.worst_start_bce_weight,
+        representation_consistency_weight=args.representation_consistency_weight,
+        ensemble_temperature=args.deployment_temperature,
     )
     history, _best_expert_state, training_selection = train_all_expert_heads(
         model,
@@ -1196,7 +1831,15 @@ def main() -> None:
         args.seed,
         cyclic_representation_augmentation=args.cyclic_representation_augmentation,
         active_base_indices=active_indices,
+        worst_start_bce_weight=args.worst_start_bce_weight,
+        representation_consistency_weight=args.representation_consistency_weight,
+        ensemble_temperature=args.deployment_temperature,
     )
+    # The internal 151-record audit is opened only after epoch selection and
+    # the selected expert-head state have been frozen in memory.
+    test_records = read_jsonl(str(test_path))
+    test_context_audit = require_peptide_only_training_context(test_records, "test")
+    require_corrected_counts(test_records, EXPECTED_TEST_COUNTS, "test")
     after_hashes = state_hashes(model.state_dict())
     changed_keys = sorted(
         key for key in before_hashes if before_hashes[key] != after_hashes[key]
@@ -1274,14 +1917,14 @@ def main() -> None:
         )
     )
     training_order_policy = (
-        "all_cyclic_sequence_coordinate_starts_with_epoch_indexed_"
-        "decoder_rotation_mapped_to_physical_labels"
+        "complete_physical_cyclic_start_x_complete_L_decoder_order_grid_"
+        "differentiably_meaned_per_start_then_mapped_to_physical_labels"
         if args.cyclic_representation_augmentation
         else "epoch_indexed_cyclic_designed_position_rotation"
     )
     deployment_policy = (
         "all_cyclic_starts_and_all_decoder_orders_mapped_to_physical_"
-        "residues_probability_mean"
+        "residues_probability_mean_for_ranking_representation_min_for_release"
         if args.cyclic_representation_augmentation
         else "complete_natural_sequence_all_cyclic_rotations_probability_mean"
     )
@@ -1319,6 +1962,15 @@ def main() -> None:
                 else "serialized_cyclic_start_fixed"
             ),
             "deployment_annotation_policy": deployment_policy,
+            "worst_start_bce_weight": float(args.worst_start_bce_weight),
+            "representation_consistency_weight": float(
+                args.representation_consistency_weight
+            ),
+            "training_ensemble_temperature": float(args.deployment_temperature),
+            "full_physical_start_by_full_decoder_order_grid": bool(
+                args.cyclic_representation_augmentation
+            ),
+            "training_objective": training_selection["training_objective"],
             "expert_training_context_policy": (
                 "peptide_chain_only_no_visible_receptor_chains"
             ),
@@ -1431,6 +2083,52 @@ def main() -> None:
                 )
             )
         ),
+        "cyclic_training_uses_worst_start_bce_and_consistency_loss": (
+            not args.cyclic_representation_augmentation
+            or (
+                float(training_selection.get("worst_start_bce_weight", 0.0)) > 0.0
+                and float(
+                    training_selection.get(
+                        "representation_consistency_weight", -1.0
+                    )
+                )
+                > 0.0
+                and "worst_start" in str(
+                    training_selection.get("training_objective", "")
+                )
+            )
+        ),
+        "cyclic_training_full_grid_matches_deployment_temperature": (
+            not args.cyclic_representation_augmentation
+            or (
+                bool(
+                    training_selection.get(
+                        "full_physical_start_by_full_decoder_order_grid"
+                    )
+                )
+                and "full_physical_start_x_full_decoder_order_grid"
+                in str(training_selection.get("training_objective", ""))
+                and math.isclose(
+                    float(
+                        training_selection.get(
+                            "training_ensemble_temperature", -1.0
+                        )
+                    ),
+                    float(args.deployment_temperature),
+                    rel_tol=0.0,
+                    abs_tol=0.0,
+                )
+            )
+        ),
+        "heldout_hard_calls_have_zero_cyclic_start_threshold_disagreement": (
+            not args.cyclic_representation_augmentation
+            or int(
+                corrected_summary[
+                    "representation_threshold_disagreement_positions"
+                ]
+            )
+            == 0
+        ),
         "serine_only_scope_metadata_is_exact": (
             not serine_only
             or training_selection.get("active_expert_tokens") == ["S"]
@@ -1470,7 +2168,37 @@ def main() -> None:
             float(overall_fixed["false_positive_rate"]) <= 0.10
         ),
     }
-    quality_gate = "PASS" if all(quality_checks.values()) else "FAIL"
+    internal_development_check_names = {
+        "heldout_hard_calls_have_zero_cyclic_start_threshold_disagreement",
+        "all_19_supported_experts_present_in_test",
+        "serine_test_has_both_classes",
+        "serine_auc_ge_0_70",
+        "serine_deployment_t05_recall_at_0_6_ge_0_40",
+        "serine_deployment_t05_fpr_at_0_6_le_0_25",
+        "proline_deployment_t05_no_p_fpr_le_0_05",
+        "overall_auc_ge_0_85",
+        "supported_macro_auc_ge_0_70",
+        "overall_deployment_t05_precision_at_0_6_ge_0_75",
+        "overall_deployment_t05_recall_at_0_6_ge_0_40",
+        "overall_deployment_t05_fpr_at_0_6_le_0_10",
+    }
+    checkpoint_quality_checks = {
+        name: passed
+        for name, passed in quality_checks.items()
+        if name not in internal_development_check_names
+    }
+    internal_development_checks = {
+        name: passed
+        for name, passed in quality_checks.items()
+        if name in internal_development_check_names
+    }
+    # The historical 151 records never choose an epoch or promote a checkpoint.
+    # They remain a separate internal release diagnostic downstream, not a
+    # publication-grade blind outer test set.
+    quality_gate = "PASS" if all(checkpoint_quality_checks.values()) else "FAIL"
+    internal_development_gate = (
+        "PASS" if all(internal_development_checks.values()) else "FAIL"
+    )
     if quality_gate == "PASS":
         os.replace(candidate_checkpoint_path, checkpoint_path)
         checkpoint_artifact_path = checkpoint_path
@@ -1485,6 +2213,8 @@ def main() -> None:
         "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "parent_checkpoint": str(model_path),
         "parent_checkpoint_sha256": file_sha256(model_path),
+        "trainer_program_sha256": file_sha256(SCRIPT_PATH),
+        "frozen_input_sha256_contract": frozen_input_hashes,
         "checkpoint_ready_for_generation": quality_gate == "PASS",
         "output_checkpoint": str(checkpoint_path) if quality_gate == "PASS" else None,
         "candidate_checkpoint": str(checkpoint_artifact_path),
@@ -1493,6 +2223,14 @@ def main() -> None:
         "active_expert_tokens": [
             NATURAL_AA_ALPHABET[index] for index in active_indices
         ],
+        "worst_start_bce_weight": float(args.worst_start_bce_weight),
+        "representation_consistency_weight": float(
+            args.representation_consistency_weight
+        ),
+        "training_ensemble_temperature": float(args.deployment_temperature),
+        "full_physical_start_by_full_decoder_order_grid": bool(
+            args.cyclic_representation_augmentation
+        ),
         "expected_changed_state_keys": sorted(expected_changed_keys),
         "changed_state_keys": changed_keys,
         "unchanged_state_key_count": len(before_hashes) - len(changed_keys),
@@ -1520,8 +2258,9 @@ def main() -> None:
         },
         "training_decoding_order_policy": (
             "all physical cyclic starts jointly rotate sequence, labels, and "
-            "N/CA/C/O coordinates with residue_idx reset; an epoch-indexed "
-            "decoder rotation is applied to every representation"
+            "N/CA/C/O coordinates with residue_idx reset; every representation "
+            "differentiably averages all L decoder orders before physical "
+            "worst-start and consistency losses"
             if args.cyclic_representation_augmentation
             else "epoch-indexed cyclic designed-position rotation per batch row; "
             "receptor/padding positions are prefixed, every relative depth is "
@@ -1537,8 +2276,9 @@ def main() -> None:
         ),
         "deployment_gate_policy": (
             f"expert probabilities are sigmoid(logit / {args.deployment_temperature}) "
-            "for every cyclic order, then averaged, followed by the exact strict "
-            f">{args.threshold} generation decision"
+            "for the full physical-start x full decoder-order grid; decoder "
+            "orders are meaned within start and the representation minimum is "
+            f"used for the exact strict >{args.threshold} generation decision"
         ),
         "training": {
             "maximum_epochs": args.epochs,
@@ -1561,12 +2301,19 @@ def main() -> None:
             "baseline_validation_balanced_bce": baseline_validation_loss,
             "selection": training_selection,
         },
-        "corrected_test": corrected_summary,
+        "internal_development_audit_not_blind_outer_test": corrected_summary,
+        "internal_development_diagnostic_gate": internal_development_gate,
+        "internal_development_diagnostic_checks": internal_development_checks,
+        "validation_scope_limitation": (
+            "The 151-record set was reused during V3-V9 development. It is an "
+            "internal safety audit only; publication requires a structure/scaffold-"
+            "grouped outer set never used for tuning or release decisions."
+        ),
         "canonical_parent_test_before_serine_only_repair": parent_test_summary,
         "maximum_non_ser_probability_difference_from_parent": (
             maximum_non_ser_probability_difference
         ),
-        "quality_checks": quality_checks,
+        "quality_checks": checkpoint_quality_checks,
     }
     atomic_write_json(out_dir / "expert_heads_retrain_manifest.json", manifest)
     atomic_write_csv(
@@ -1590,6 +2337,11 @@ def main() -> None:
         flush=True,
     )
     print(f"Quality gate: {quality_gate}", flush=True)
+    print(
+        "Internal-development diagnostic (not blind outer test): "
+        f"{internal_development_gate}",
+        flush=True,
+    )
     print(
         f"Changed tensors: {len(changed_keys)} / {len(expected_changed_keys)} expected",
         flush=True,
@@ -1639,7 +2391,9 @@ def main() -> None:
         )
 
     if quality_gate != "PASS" and not args.no_fail_on_quality_gate:
-        failed = [name for name, passed in quality_checks.items() if not passed]
+        failed = [
+            name for name, passed in checkpoint_quality_checks.items() if not passed
+        ]
         raise RuntimeError("Quality gate failed: " + ", ".join(failed))
 
 

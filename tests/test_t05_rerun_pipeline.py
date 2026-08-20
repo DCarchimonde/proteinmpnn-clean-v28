@@ -68,6 +68,23 @@ class GenerationProtocolTests(unittest.TestCase):
             "target_name": "T1",
             "design_seq": "AcDE",
             "design_methyl_count": 1,
+            "methyl_threshold": 0.6,
+            "methyl_probabilities": "[0.1, 0.9, 0.1, 0.1]",
+            "methyl_probability_representation_min": "[0.1, 0.8, 0.1, 0.1]",
+            "methyl_probability_representation_max": "[0.1, 0.95, 0.1, 0.1]",
+            "methyl_probability_representation_span": "[0.0, 0.15, 0.0, 0.0]",
+            "methyl_probability_representation_std": "[0.0, 0.06373774, 0.0, 0.0]",
+            "methyl_probability_representation_by_start": (
+                "[[0.1, 0.8, 0.1, 0.1], [0.1, 0.9, 0.1, 0.1], "
+                "[0.1, 0.95, 0.1, 0.1], [0.1, 0.95, 0.1, 0.1]]"
+            ),
+            "annotation_mode": (
+                "peptide_only_all_cyclic_starts_and_decoder_orders_mapped_to_physical_residues"
+            ),
+            "annotation_decoder_order_ensemble_size": 4,
+            "annotation_representation_ensemble_size": 4,
+            "annotation_total_probability_ensemble_size": 16,
+            "representation_threshold_disagreement_count": 0,
             "base_log_probability_mean": -1.0,
             "seed": 101,
             "draw_index_within_seed": 1,
@@ -91,6 +108,35 @@ class GenerationProtocolTests(unittest.TestCase):
         self.assertEqual(by_sequence["AcDF"]["eligible_for_new_permeability_screen"], 1)
         self.assertEqual(by_sequence["AcDG"]["seen_in_prior_1333"], 1)
         self.assertEqual(by_sequence["AcDG"]["eligible_for_new_permeability_screen"], 0)
+
+    def test_quota_resume_canonicalization_never_rewrites_preferred_source(self):
+        source = {
+            "candidate_id": "z_existing_source",
+            "target_name": "T1",
+            "design_seq": "AcDE",
+            "design_natural_seq": "ACDE",
+            "methyl_probabilities": "[0.1, 0.9, 0.1, 0.1]",
+        }
+        lexicographically_earlier_topup = {
+            "candidate_id": "a_new_topup",
+            "target_name": "T1",
+            "design_seq": "ACdE",
+            "design_natural_seq": "ACDE",
+            "methyl_probabilities": "[0.1, 0.1, 0.9, 0.1]",
+        }
+        rows = [source, lexicographically_earlier_topup]
+        result = generator.canonicalize_repeated_natural_annotations(
+            rows, preferred_candidate_ids={"z_existing_source"}
+        )
+        self.assertEqual(result["rows_rewritten_to_canonical_payload"], 1)
+        self.assertEqual(source["design_seq"], "AcDE")
+        self.assertEqual(
+            lexicographically_earlier_topup["design_seq"], source["design_seq"]
+        )
+        self.assertEqual(
+            lexicographically_earlier_topup["methyl_probabilities"],
+            source["methyl_probabilities"],
+        )
 
 
 class PermeabilitySelectionTests(unittest.TestCase):

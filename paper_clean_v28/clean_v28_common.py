@@ -266,6 +266,12 @@ def cyclic_representation_known_sequence_methyl_probabilities(
     back to the original physical residues before averaging.  The returned mean
     is therefore invariant to which residue was chosen as array position 1.
 
+    ``mean``/``ranking_mean`` is a ranking statistic only.  A release caller
+    must use ``representation_min``/``release_floor`` with a strict threshold
+    and must reject any position whose min/max straddles that threshold.  This
+    prevents an averaged score from hiding a hard-call change across equivalent
+    cyclic serializations.
+
     The deployment contract is deliberately narrow: every non-padding position
     must belong to one designed peptide chain and there may be no visible
     receptor positions.  That is exactly the expert-head train/test and final
@@ -364,6 +370,12 @@ def cyclic_representation_known_sequence_methyl_probabilities(
     )
     decoder_order_std_sum = torch.zeros_like(S_natural, dtype=torch.float32)
     representation_count = torch.zeros_like(S_natural, dtype=torch.float32)
+    mapped_probability_by_start = torch.full(
+        (S_natural.shape[0], max(lengths), S_natural.shape[1]),
+        float("nan"),
+        device=S_natural.device,
+        dtype=torch.float32,
+    )
 
     for expanded_index, (row_index, shift) in enumerate(representation_map):
         positions = selected_rows[row_index]
@@ -389,6 +401,7 @@ def cyclic_representation_known_sequence_methyl_probabilities(
         )
         decoder_order_std_sum[row_index, positions] += mapped_order_std
         representation_count[row_index, positions] += 1.0
+        mapped_probability_by_start[row_index, shift, positions] = mapped_probability
 
     expected_count = torch.tensor(
         lengths,
@@ -410,16 +423,21 @@ def cyclic_representation_known_sequence_methyl_probabilities(
     decoder_order_std_mean = decoder_order_std_sum / safe_count
 
     zero = torch.zeros_like(mean)
+    ranking_mean = torch.where(selected_mask, mean, zero)
+    release_floor = torch.where(selected_mask, probability_min, zero)
     return {
-        "mean": torch.where(selected_mask, mean, zero),
+        "mean": ranking_mean,
+        "ranking_mean": ranking_mean,
         "representation_std": torch.where(selected_mask, representation_std, zero),
-        "representation_min": torch.where(selected_mask, probability_min, zero),
+        "representation_min": release_floor,
+        "release_floor": release_floor,
         "representation_max": torch.where(selected_mask, probability_max, zero),
         "representation_span": torch.where(selected_mask, representation_span, zero),
         "decoder_order_std_mean": torch.where(
             selected_mask, decoder_order_std_mean, zero
         ),
         "representation_count": representation_count,
+        "representation_probability_by_start": mapped_probability_by_start,
     }
 
 

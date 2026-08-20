@@ -549,7 +549,9 @@ def run(args: argparse.Namespace) -> None:
         else len(source_rows)
     )
 
-    generator.canonicalize_repeated_natural_annotations(raw_rows)
+    generator.canonicalize_repeated_natural_annotations(
+        raw_rows, preferred_candidate_ids=source_ids
+    )
     unique_rows, eligible_rows = eligible_pool(
         generator,
         raw_rows,
@@ -755,7 +757,9 @@ def run(args: argparse.Namespace) -> None:
                     produced_for_seed += current_batch
                     target_draws_this_run += current_batch
 
-                generator.canonicalize_repeated_natural_annotations(raw_rows)
+                generator.canonicalize_repeated_natural_annotations(
+                    raw_rows, preferred_candidate_ids=source_ids
+                )
                 unique_rows, eligible_rows = eligible_pool(
                     generator,
                     raw_rows,
@@ -782,7 +786,9 @@ def run(args: argparse.Namespace) -> None:
                     flush=True,
                 )
 
-    canonicalization = generator.canonicalize_repeated_natural_annotations(raw_rows)
+    canonicalization = generator.canonicalize_repeated_natural_annotations(
+        raw_rows, preferred_candidate_ids=source_ids
+    )
     unique_rows, eligible_rows = eligible_pool(
         generator,
         raw_rows,
@@ -1004,6 +1010,15 @@ def run(args: argparse.Namespace) -> None:
             "raw_candidates_expected": len(raw_rows),
             "raw_candidates_generated": len(raw_rows),
             "unique_candidates": len(unique_rows),
+            "all_candidates_csv_sha256": sha256_file(
+                out_dir / "all_candidates.csv"
+            ),
+            "unique_candidates_csv_sha256": sha256_file(
+                out_dir / "unique_candidates.csv"
+            ),
+            "methylated_new_candidates_csv_sha256": sha256_file(
+                out_dir / "methylated_new_candidates.csv"
+            ),
             "new_methylated_candidates_for_permeability": len(eligible_rows),
             "targets_below_pre_permeability_quota": targets_below_quota,
             "annotation_payload_canonicalization": canonicalization,

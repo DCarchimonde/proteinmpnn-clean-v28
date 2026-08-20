@@ -9,3 +9,4 @@ raw_external/
 nmethyl_data/train_set/
 paper_clean_v28_outputs/structure_metrics/*.tmp
 paper_clean_v28_outputs/structure_metrics/*.log
+paper_clean_v28_outputs/cyclic_stability_v9_1700/

@@ -10,11 +10,13 @@ residue indices, and averages every physical cyclic start and every decoder
 order.  Only if that corrected re-audit still releases no candidate does the
 program run a fixed six-round methyl/base dual-objective search.
 
-Release gates remain unchanged: rounded methyl probability strictly greater
-than 0.6, the exact cyclic-start ProteinMPNN 1st-percentile floor, independent
-batch-one re-scoring, and exact/forward-cyclic novelty.  Exhausting the fixed
-budget without a real candidate is an explicit failure, never an abstention or
-fabricated success.
+Release gates are fail-closed: explicit representation min/max/span/std,
+representation-minimum probability strictly greater than 0.6 at the exact
+lowercase sites, zero cyclic-start threshold disagreement, the exact
+cyclic-start ProteinMPNN 1st-percentile floor, independent batch-one re-scoring,
+and exact/forward-cyclic novelty.  Representation means rank candidates but
+never authorize release.  Exhausting the fixed budget without a real candidate
+is an explicit failure, never an abstention or fabricated success.
 """
 
 from __future__ import annotations
@@ -1139,16 +1141,16 @@ def evaluate_candidates(
         point = physical_argmax_summary(sequence, probabilities)
         search_maximum = float(row["maximum_probability"])
         full_maximum = float(point["physical_argmax_probability"])
+        full_release_floor_maximum = old.release_floor_actionable_max(
+            payload, sequence
+        )
         full_difference = abs(full_maximum - search_maximum)
         base_pass = float(base["cyclic_base_log_probability_mean"]) >= floor
         reason = duplicate_reason(old, sequence, novelty_sets)
         cyclic_key = old.forward_cyclic_identity(sequence)
         if not reason and cyclic_key in accepted_cyclic:
             reason = "accepted_forward_cyclic_equivalent"
-        strict_full = (
-            int(payload["design_methyl_count"]) > 0
-            and old.strict_rounded_pass(full_maximum)
-        )
+        strict_full = old.stable_cyclic_methyl_release_gate(payload, sequence)
         preeligible = (
             not reason
             and base_pass
@@ -1158,9 +1160,17 @@ def evaluate_candidates(
         evidence_row = {
             "target_name": target,
             "sequence": sequence,
+            "design_seq": payload["design_seq"],
+            "design_natural_seq": sequence,
+            "design_methyl_count": payload["design_methyl_count"],
+            "methyl_positions_1based": payload["methyl_positions_1based"],
+            "methyl_probabilities": payload["methyl_probabilities"],
             "search_stage": row.get("search_stage", ""),
             "search_maximum_probability": search_maximum,
             "qualified_full_maximum_probability": full_maximum,
+            "qualified_full_release_floor_maximum_probability": (
+                full_release_floor_maximum
+            ),
             "qualified_full_rescore_absolute_difference": full_difference,
             **base,
             "cyclic_base_plausibility_floor_1pct": floor,
@@ -1181,9 +1191,22 @@ def evaluate_candidates(
             "methyl_probability_representation_span_max": payload[
                 "methyl_probability_representation_span_max"
             ],
+            "methyl_probability_representation_std": payload[
+                "methyl_probability_representation_std"
+            ],
+            "methyl_probability_representation_std_max": payload[
+                "methyl_probability_representation_std_max"
+            ],
             "representation_threshold_disagreement_positions_1based": payload[
                 "representation_threshold_disagreement_positions_1based"
             ],
+            "representation_threshold_disagreement_count": payload[
+                "representation_threshold_disagreement_count"
+            ],
+            "stable_cyclic_release_gate": int(strict_full),
+            "annotation_release_probability_policy": (
+                "representation_min_strict_gt_threshold_zero_disagreement"
+            ),
             "annotation_representation_ensemble_size": payload[
                 "annotation_representation_ensemble_size"
             ],
@@ -1208,11 +1231,17 @@ def evaluate_candidates(
             ]
             independent_point = physical_argmax_summary(sequence, independent_values)
             independent_max = float(independent_point["physical_argmax_probability"])
+            independent_release_floor_maximum = old.release_floor_actionable_max(
+                independent, sequence
+            )
             independent_difference = abs(independent_max - full_maximum)
+            independent_release_floor_difference = abs(
+                independent_release_floor_maximum - full_release_floor_maximum
+            )
             batch_pass = (
-                int(independent["design_methyl_count"]) > 0
-                and old.strict_rounded_pass(independent_max)
+                old.stable_cyclic_methyl_release_gate(independent, sequence)
                 and independent_difference <= RESCORE_TOLERANCE
+                and independent_release_floor_difference <= RESCORE_TOLERANCE
                 and int(independent_point["physical_argmax_position_1based"])
                 == int(point["physical_argmax_position_1based"])
             )
@@ -1220,7 +1249,13 @@ def evaluate_candidates(
                 {
                     "batch_one_checked": 1,
                     "batch_one_maximum_probability": independent_max,
+                    "batch_one_release_floor_maximum_probability": (
+                        independent_release_floor_maximum
+                    ),
                     "batch_one_rescore_absolute_difference": independent_difference,
+                    "batch_one_release_floor_rescore_absolute_difference": (
+                        independent_release_floor_difference
+                    ),
                     "release_eligible": int(batch_pass),
                 }
             )
@@ -1247,7 +1282,13 @@ def evaluate_candidates(
                         "qualified_full_maximum_probability": full_maximum,
                         "qualified_full_rescore_absolute_difference": full_difference,
                         "batch_one_maximum_probability": independent_max,
+                        "batch_one_release_floor_maximum_probability": (
+                            independent_release_floor_maximum
+                        ),
                         "batch_rescore_absolute_difference": independent_difference,
+                        "batch_one_release_floor_rescore_absolute_difference": (
+                            independent_release_floor_difference
+                        ),
                         "base_log_probability_mean": "",
                         "base_log_probability_mean_all_orders": base[
                             "cyclic_base_log_probability_mean"
@@ -2517,16 +2558,29 @@ def run(args: argparse.Namespace) -> None:
             conditional_search_ran == (len(legacy_releases) == 0)
         ),
         "conditional_fixed_budget_completed_without_early_stop": full_budget_complete,
-        "strict_threshold_remains_greater_than_0_6": all(
-            old.strict_rounded_pass(float(row["batch_one_maximum_probability"]))
+        "no_release_eligible_evidence_row_uses_representation_mean_alone": all(
+            not int(row["release_eligible"])
+            or old.stable_cyclic_methyl_release_gate(
+                row, str(row["design_natural_seq"])
+            )
+            for row in combined_evidence
+        ),
+        "strict_threshold_remains_greater_than_0_6_and_requires_stable_cyclic_floor": all(
+            old.stable_cyclic_methyl_release_gate(
+                row, str(row["design_natural_seq"])
+            )
             for row in release_rows
         ),
         "every_release_passes_cyclic_base_floor": all(
             float(row["cyclic_base_log_probability_mean"]) >= floor
             for row in release_rows
         ),
-        "every_release_passes_independent_batch_one": all(
+        "every_release_passes_independent_stable_cyclic_batch_one": all(
             float(row["batch_rescore_absolute_difference"]) <= RESCORE_TOLERANCE
+            and float(
+                row["batch_one_release_floor_rescore_absolute_difference"]
+            )
+            <= RESCORE_TOLERANCE
             for row in release_rows
         ),
         "at_least_one_real_3zgc_candidate_is_released": bool(release_rows),

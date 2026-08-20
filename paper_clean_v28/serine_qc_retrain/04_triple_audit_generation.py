@@ -530,16 +530,36 @@ def audit(
         ):
             row_errors.append(f"{row_id}: inconsistent representation min/max/span")
         if len(probabilities) == len(sequence):
-            for index, (token, probability) in enumerate(
-                zip(sequence, probabilities), start=1
+            release_probabilities = (
+                representation_min if representation_mode else probabilities
+            )
+            for index, (token, release_probability) in enumerate(
+                zip(sequence, release_probabilities), start=1
             ):
                 should_be_lower = (
-                    token.upper() in METHYLATABLE_AA and probability > threshold
+                    token.upper() in METHYLATABLE_AA
+                    and round(float(release_probability), 8) > threshold
                 )
                 if token.islower() != should_be_lower:
                     row_errors.append(
                         f"{row_id}: threshold/annotation mismatch at position {index}"
                     )
+            disagreement_positions = [
+                index
+                for index, (minimum, maximum) in enumerate(
+                    zip(representation_min, representation_max), start=1
+                )
+                if round(float(minimum), 8) <= threshold
+                < round(float(maximum), 8)
+            ]
+            if (
+                int(row.get("eligible_for_new_permeability_screen", 0)) == 1
+                and disagreement_positions
+            ):
+                row_errors.append(
+                    f"{row_id}: eligible row has cyclic-start threshold "
+                    f"disagreement at {disagreement_positions}"
+                )
         if order_std:
             recorded_max = float(row.get("methyl_probability_order_std_max", "nan"))
             if not math.isfinite(recorded_max) or abs(recorded_max - max(order_std)) > 1e-6:
@@ -651,6 +671,46 @@ def audit(
         if int(row.get("design_methyl_count", 0)) <= 0:
             eligible_row_errors.append(
                 f"non-methyl row in eligible file: {row.get('candidate_id')}"
+            )
+        if not representation_mode:
+            continue
+        try:
+            minima = [
+                float(value)
+                for value in json.loads(
+                    str(row["methyl_probability_representation_min"])
+                )
+            ]
+            maxima = [
+                float(value)
+                for value in json.loads(
+                    str(row["methyl_probability_representation_max"])
+                )
+            ]
+            sequence = str(row["design_seq"])
+            row_threshold = float(row.get("methyl_threshold", threshold))
+            disagreements = [
+                index
+                for index, (minimum, maximum) in enumerate(
+                    zip(minima, maxima), start=1
+                )
+                if round(minimum, 8) <= row_threshold < round(maximum, 8)
+            ]
+            expected_positions = [
+                index
+                for index, (token, minimum) in enumerate(
+                    zip(sequence, minima), start=1
+                )
+                if token.upper() in METHYLATABLE_AA
+                and round(minimum, 8) > row_threshold
+            ]
+            if disagreements or methyl_positions(sequence) != expected_positions:
+                eligible_row_errors.append(
+                    f"unstable cyclic release row: {row.get('candidate_id')}"
+                )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            eligible_row_errors.append(
+                f"missing cyclic stability evidence: {row.get('candidate_id')}"
             )
 
     pass_1_checks = {
@@ -848,8 +908,8 @@ def audit(
             for row in concentration_rows
             if str(row["target_name"]) == "ALL"
         ),
-        "dominant_position_concentration_has_heldout_provenance_support": (
-            str(structural_support.get("quality_gate", "")) == "PASS"
+        "no_global_or_target_physical_position_concentration_above_80_percent": all(
+            bool(row["position_gate_pass"]) for row in concentration_rows
         ),
         "every_concentrated_target_was_structurally_audited": (
             {
@@ -861,7 +921,7 @@ def audit(
                 for row in structural_support.get("concentrated_targets", [])
             }
         ),
-        "absolute_position_and_residue_concentration_are_reported_not_filtered": True,
+        "structural_support_is_reported_but_never_overrides_position_gate": True,
         "generation_manifest_annotation_audit_recomputes": (
             reported_positions == dict(position_all)
             and reported_residues == dict(residue_all)

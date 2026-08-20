@@ -60,11 +60,20 @@ def audit_row(
     design = "".join(sequence)
     probabilities = [0.1] * len(sequence)
     probabilities[methyl_position - 1] = probability
+    zeros = [0.0] * len(sequence)
     return {
         "target_name": target,
         "design_seq": design,
         "design_natural_seq": design.upper(),
         "methyl_probabilities": json.dumps(probabilities),
+        "methyl_threshold": 0.6,
+        "methyl_probability_representation_min": json.dumps(probabilities),
+        "methyl_probability_representation_max": json.dumps(probabilities),
+        "methyl_probability_representation_span": json.dumps(zeros),
+        "methyl_probability_representation_std": json.dumps(zeros),
+        "methyl_probability_representation_by_start": json.dumps([probabilities]),
+        "representation_threshold_disagreement_positions_1based": "[]",
+        "representation_threshold_disagreement_count": 0,
         "methyl_probability_order_std_max": 0.05,
         "annotation_mode": (
             "peptide_only_cyclic_order_ensemble_known_natural_sequence"
@@ -73,11 +82,14 @@ def audit_row(
             "peptide_chain_only_no_visible_receptor_chains"
         ),
         "annotation_visible_receptor_chains": 0,
+        "annotation_decoder_order_ensemble_size": len(sequence),
+        "annotation_representation_ensemble_size": 1,
+        "annotation_total_probability_ensemble_size": len(sequence),
     }
 
 
 class ResultAnomalyGateTests(unittest.TestCase):
-    def test_single_point_concentration_is_preserved_as_a_diagnostic(self):
+    def test_single_point_concentration_is_a_hard_release_block(self):
         residues = "ACDEFGHIKLMNQRSTVWY"
         rows = []
         for index in range(120):
@@ -85,14 +97,41 @@ class ResultAnomalyGateTests(unittest.TestCase):
             natural = "AAAAAA" + residue + "A"
             rows.append(audit_row("3AVB", natural, 7, residue))
         report = generator.audit_annotation_stability(rows, rows)
-        self.assertEqual(report["quality_gate"], "PASS")
+        self.assertEqual(report["quality_gate"], "FAIL")
         self.assertEqual(report["eligible_site_position_counts"], {7: 120})
         self.assertFalse(
             report["concentration_diagnostics"][
                 "no_single_position_exceeds_80_percent_of_sites"
             ]
         )
-        self.assertIn("independent audit", report["concentration_gate_policy"])
+        self.assertFalse(
+            report["quality_checks"]
+            ["no_target_has_single_position_above_80_percent_when_n_ge_30"]
+        )
+        self.assertIn("HARD_BLOCK", report["concentration_gate_policy"])
+
+    def test_threshold_straddling_candidate_is_rejected(self):
+        row = audit_row("T1", "ACDEFGHI", 2, "C", probability=0.9)
+        row.update(
+            {
+                "candidate_id": "straddle",
+                "methyl_threshold": 0.6,
+                "methyl_probability_representation_min": json.dumps(
+                    [0.1, 0.59, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+                ),
+                "methyl_probability_representation_max": json.dumps(
+                    [0.1, 0.9, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+                ),
+                "representation_threshold_disagreement_count": 1,
+            }
+        )
+        self.assertFalse(generator.stable_cyclic_release_gate(row))
+        report = generator.audit_annotation_stability([row], [row])
+        self.assertEqual(report["quality_gate"], "FAIL")
+        self.assertFalse(
+            report["quality_checks"]
+            ["every_eligible_candidate_is_stable_across_all_cyclic_starts"]
+        )
 
     def test_old_global_all_serine_signature_remains_blocked(self):
         rows = []
@@ -106,6 +145,29 @@ class ResultAnomalyGateTests(unittest.TestCase):
                 "no_single_residue_exceeds_80_percent_of_sites"
             ]
         )
+
+    def test_one_all_serine_target_cannot_be_hidden_by_global_residue_mix(self):
+        rows = []
+        for index in range(40):
+            position = index % 8 + 1
+            rows.append(audit_row("BAD", "SSSSSSSS", position, "S"))
+        residues = "ACDEFGHIKLMNQRSTVWY"
+        for index in range(120):
+            position = index % 8 + 1
+            residue = residues[index % len(residues)]
+            natural = list("ACDEFGHI")
+            natural[position - 1] = residue
+            rows.append(audit_row("MIXED", "".join(natural), position, residue))
+        report = generator.audit_annotation_stability(rows, rows)
+        self.assertTrue(
+            report["quality_checks"]["no_single_residue_exceeds_80_percent_of_sites"]
+        )
+        self.assertFalse(
+            report["quality_checks"][
+                "no_target_has_single_residue_above_80_percent_when_n_ge_30"
+            ]
+        )
+        self.assertEqual(report["quality_gate"], "FAIL")
 
     def test_same_natural_sequence_with_different_annotation_is_blocked(self):
         first = audit_row("3AVA", "ACDEFGHI", 2, "C")
@@ -262,6 +324,7 @@ class IndependentTripleAuditIntegrationTests(unittest.TestCase):
                 design = "".join(design_tokens)
                 probabilities = [0.1] * 8
                 probabilities[position - 1] = 0.9
+                zeros = [0.0] * 8
                 shift = (index // 8) % 8
                 order = list(range(8))[shift:] + list(range(8))[:shift]
                 rows.append(
@@ -275,6 +338,16 @@ class IndependentTripleAuditIntegrationTests(unittest.TestCase):
                         "design_methyl_count": 1,
                         "methyl_positions_1based": json.dumps([position]),
                         "methyl_probabilities": json.dumps(probabilities),
+                        "methyl_threshold": 0.6,
+                        "methyl_probability_representation_min": json.dumps(probabilities),
+                        "methyl_probability_representation_max": json.dumps(probabilities),
+                        "methyl_probability_representation_span": json.dumps(zeros),
+                        "methyl_probability_representation_std": json.dumps(zeros),
+                        "methyl_probability_representation_by_start": json.dumps(
+                            [probabilities]
+                        ),
+                        "representation_threshold_disagreement_positions_1based": "[]",
+                        "representation_threshold_disagreement_count": 0,
                         "methyl_probability_order_std": json.dumps([0.02] * 8),
                         "methyl_probability_order_std_max": 0.02,
                         "annotation_mode": (
@@ -285,6 +358,9 @@ class IndependentTripleAuditIntegrationTests(unittest.TestCase):
                         ),
                         "annotation_visible_receptor_chains": 0,
                         "annotation_order_ensemble_size": 8,
+                        "annotation_decoder_order_ensemble_size": 8,
+                        "annotation_representation_ensemble_size": 1,
+                        "annotation_total_probability_ensemble_size": 8,
                         "decoding_order_absolute": json.dumps(order),
                         "occurrence_count": 1,
                         "eligible_for_new_permeability_screen": 1,

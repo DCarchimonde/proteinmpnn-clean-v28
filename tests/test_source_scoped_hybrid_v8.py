@@ -255,6 +255,114 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
         self.assertFalse(v8_search.strict_rounded_pass(float("inf")))
         self.assertFalse(v8_search.strict_rounded_pass(1.01))
 
+    def test_official_cyclic_release_gate_is_minimum_based_and_fail_closed(self):
+        stable = {
+            "design_seq": "aC",
+            "design_natural_seq": "AC",
+            "design_methyl_count": 1,
+            "methyl_positions_1based": "[1]",
+            "methyl_probabilities": "[0.7, 0.2]",
+            "methyl_probability_representation_min": "[0.69, 0.19]",
+            "methyl_probability_representation_max": "[0.71, 0.21]",
+            "methyl_probability_representation_span": "[0.02, 0.02]",
+            "methyl_probability_representation_std": "[0.01, 0.01]",
+            "representation_threshold_disagreement_positions_1based": "[]",
+            "representation_threshold_disagreement_count": 0,
+            "stable_cyclic_release_gate": 1,
+        }
+        self.assertTrue(v8_search.stable_cyclic_methyl_release_gate(stable))
+        self.assertAlmostEqual(v8_search.release_floor_actionable_max(stable), 0.69)
+
+        mean_only_straddle = dict(stable)
+        mean_only_straddle.update(
+            {
+                "design_seq": "aC",
+                "methyl_probabilities": "[0.7, 0.2]",
+                "methyl_probability_representation_min": "[0.59, 0.19]",
+                "methyl_probability_representation_max": "[0.71, 0.21]",
+                "methyl_probability_representation_span": "[0.12, 0.02]",
+                "representation_threshold_disagreement_positions_1based": "[1]",
+                "representation_threshold_disagreement_count": 1,
+                "stable_cyclic_release_gate": 0,
+            }
+        )
+        self.assertFalse(
+            v8_search.stable_cyclic_methyl_release_gate(mean_only_straddle)
+        )
+        self.assertTrue(
+            any(
+                "disagreement" in error or "lowercase" in error
+                for error in v8_search.stable_cyclic_methyl_release_errors(
+                    mean_only_straddle
+                )
+            )
+        )
+
+        missing_std = dict(stable)
+        missing_std.pop("methyl_probability_representation_std")
+        self.assertFalse(v8_search.stable_cyclic_methyl_release_gate(missing_std))
+        wrong_pattern = dict(stable, design_seq="AC")
+        self.assertFalse(v8_search.stable_cyclic_methyl_release_gate(wrong_pattern))
+
+    def test_v2_release_path_rejects_mean_high_representation_straddle(self):
+        sequence = "GTEWGPS"
+        mean = [0.1] * 6 + [0.7]
+        minimum = [0.1] * 6 + [0.59]
+        maximum = [0.1] * 6 + [0.71]
+        payload = {
+            "design_seq": "GTEWGPs",
+            "design_natural_seq": sequence,
+            "design_methyl_count": 1,
+            "methyl_positions_1based": "[7]",
+            "methyl_probabilities": json.dumps(mean),
+            "methyl_probability_representation_min": json.dumps(minimum),
+            "methyl_probability_representation_max": json.dumps(maximum),
+            "methyl_probability_representation_span": json.dumps(
+                [upper - lower for lower, upper in zip(minimum, maximum)]
+            ),
+            "methyl_probability_representation_span_max": 0.12,
+            "methyl_probability_representation_std": json.dumps([0.0] * 7),
+            "methyl_probability_representation_std_max": 0.0,
+            "representation_threshold_disagreement_positions_1based": "[7]",
+            "representation_threshold_disagreement_count": 1,
+            "annotation_representation_ensemble_size": 7,
+            "annotation_decoder_order_ensemble_size": 7,
+            "stable_cyclic_release_gate": 0,
+        }
+
+        class MustNotReplay:
+            def score_full(self, *_args, **_kwargs):
+                raise AssertionError("unstable mean-only row reached batch-one release")
+
+        novelty = {
+            f"{label}_{kind}": set()
+            for label in ("historical", "prior", "pool", "native")
+            for kind in ("natural", "cyclic")
+        }
+        evidence, releases = v8_cyclic_recovery.evaluate_candidates(
+            old=v8_search,
+            target="3ZGC",
+            candidates={
+                sequence: {
+                    "sequence": sequence,
+                    "maximum_probability": 0.7,
+                    "search_stage": "test",
+                }
+            },
+            base_scores={
+                sequence: {"cyclic_base_log_probability_mean": -1.0}
+            },
+            floor=-2.0,
+            full_payload={sequence: payload},
+            novelty_sets=novelty,
+            batch_one_scorer=MustNotReplay(),
+            selected_chain="C",
+            max_release=1,
+            id_prefix="test",
+        )
+        self.assertEqual(releases, [])
+        self.assertEqual(evidence[0]["pre_batch_one_release_eligible"], 0)
+
     def test_baseline_seed_ranking_excludes_non_methylatable_proline_signal(self):
         rows = [
             {
@@ -337,6 +445,24 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
                 "strict threshold" in error or "8 decimals" in error
                 for error in borderline_errors
             )
+        )
+
+        straddling = dict(row)
+        straddling.update(
+            {
+                "candidate_id": "straddling",
+                "methyl_probabilities": "[0.7, 0.2]",
+                "methyl_probability_representation_min": "[0.59, 0.19]",
+                "methyl_probability_representation_max": "[0.71, 0.21]",
+                "methyl_probability_representation_span": "[0.12, 0.02]",
+                "methyl_probability_representation_span_max": 0.12,
+                "representation_threshold_disagreement_positions_1based": "[1]",
+                "representation_threshold_disagreement_count": 1,
+            }
+        )
+        straddling_errors = v8_finalizer.validate_annotation_row(straddling)
+        self.assertTrue(
+            any("cyclic-start threshold disagreement" in error for error in straddling_errors)
         )
 
     def test_output_paths_cannot_overlap_immutable_inputs(self):
@@ -1692,6 +1818,7 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
                     probabilities = [0.0] * 6 + [0.60483360]
                     result[sequence] = {
                         "design_seq": sequence[:-1] + sequence[-1].lower(),
+                        "design_natural_seq": sequence,
                         "design_methyl_count": 1,
                         "methyl_positions_1based": "[7]",
                         "methyl_probabilities": json.dumps(probabilities),
@@ -1701,7 +1828,17 @@ class SourceScopedHybridV8Tests(unittest.TestCase):
                         "methyl_probability_representation_max": json.dumps(
                             probabilities
                         ),
+                        "methyl_probability_representation_span": json.dumps(
+                            [0.0] * 7
+                        ),
+                        "methyl_probability_representation_span_max": 0.0,
+                        "methyl_probability_representation_std": json.dumps(
+                            [0.0] * 7
+                        ),
+                        "methyl_probability_representation_std_max": 0.0,
                         "representation_threshold_disagreement_positions_1based": "[]",
+                        "representation_threshold_disagreement_count": 0,
+                        "stable_cyclic_release_gate": 1,
                     }
                 return result
 

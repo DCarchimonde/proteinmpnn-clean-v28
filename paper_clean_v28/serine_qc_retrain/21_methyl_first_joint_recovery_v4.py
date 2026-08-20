@@ -7,10 +7,13 @@ passed both frozen hard gates.  V4 is deliberately narrower: it reuses every
 hash-pinned exact score, builds deterministic acquisition-only surrogates, and
 spends one final bounded methyl screen on crossover/local-lattice candidates.
 
-The release policy cannot be relaxed.  A released row must have a rounded
-methyl probability strictly greater than 0.6, an explicit methylated design
-token, an exact cyclic-base score at or above the frozen 3ZGC 1st-percentile
-floor, independent batch-one agreement, and exact/forward-cyclic novelty.
+The release policy cannot be relaxed.  A released or advisor-review row must
+have explicit representation min/max/span/std, a representation minimum
+strictly greater than 0.6 at every lowercase site, zero cyclic-start threshold
+disagreement, and the exact minimum-derived lowercase pattern.  A release must
+also pass the frozen 3ZGC cyclic-base floor, independent batch-one agreement,
+and exact/forward-cyclic novelty.  Representation means have acquisition and
+ranking authority only.
 
 If the joint gate remains empty, V4 does *not* fabricate a release.  It writes a
 separate advisor-review table containing only independently replayed methyl
@@ -902,18 +905,20 @@ def stable_methyl_review_rows(
         replay_point = v2.physical_argmax_summary(sequence, replay_values)
         full_max = float(full_point["physical_argmax_probability"])
         replay_max = float(replay_point["physical_argmax_probability"])
+        full_release_floor_max = old.release_floor_actionable_max(full, sequence)
+        replay_release_floor_max = old.release_floor_actionable_max(replay, sequence)
         methyl_positions = [
             index
             for index, token in enumerate(str(replay["design_seq"]), start=1)
             if token.islower()
         ]
         stable = (
-            int(full["design_methyl_count"]) > 0
-            and int(replay["design_methyl_count"]) > 0
+            old.stable_cyclic_methyl_release_gate(full, sequence)
+            and old.stable_cyclic_methyl_release_gate(replay, sequence)
             and bool(methyl_positions)
-            and old.strict_rounded_pass(full_max)
-            and old.strict_rounded_pass(replay_max)
             and abs(full_max - replay_max) <= RESCORE_TOLERANCE
+            and abs(full_release_floor_max - replay_release_floor_max)
+            <= RESCORE_TOLERANCE
             and int(full_point["physical_argmax_position_1based"])
             == int(replay_point["physical_argmax_position_1based"])
             and str(full_point["physical_argmax_residue"])
@@ -930,15 +935,22 @@ def stable_methyl_review_rows(
                 "design_seq": replay["design_seq"],
                 "design_natural_seq": sequence,
                 "predicted_methyl_positions_1based": replay["methyl_positions_1based"],
+                "methyl_positions_1based": replay["methyl_positions_1based"],
                 "design_methyl_count": replay["design_methyl_count"],
                 "methyl_threshold": THRESHOLD,
                 "strict_threshold_operator": ">",
                 "batch_one_maximum_probability": replay_max,
+                "batch_one_release_floor_maximum_probability": (
+                    replay_release_floor_max
+                ),
                 "batch_one_argmax_position_1based": replay_point[
                     "physical_argmax_position_1based"
                 ],
                 "batch_one_argmax_residue": replay_point["physical_argmax_residue"],
                 "batch_rescore_absolute_difference": abs(full_max - replay_max),
+                "batch_one_release_floor_rescore_absolute_difference": abs(
+                    full_release_floor_max - replay_release_floor_max
+                ),
                 "passes_methylation_hard_gate": 1,
                 "cyclic_base_log_probability_mean": base,
                 "cyclic_base_floor_1pct": floor,
@@ -958,9 +970,28 @@ def stable_methyl_review_rows(
                 "methyl_probability_representation_max": replay[
                     "methyl_probability_representation_max"
                 ],
+                "methyl_probability_representation_span": replay[
+                    "methyl_probability_representation_span"
+                ],
+                "methyl_probability_representation_span_max": replay[
+                    "methyl_probability_representation_span_max"
+                ],
+                "methyl_probability_representation_std": replay[
+                    "methyl_probability_representation_std"
+                ],
+                "methyl_probability_representation_std_max": replay[
+                    "methyl_probability_representation_std_max"
+                ],
                 "representation_threshold_disagreement_positions_1based": replay[
                     "representation_threshold_disagreement_positions_1based"
                 ],
+                "representation_threshold_disagreement_count": replay[
+                    "representation_threshold_disagreement_count"
+                ],
+                "stable_cyclic_release_gate": 1,
+                "annotation_release_probability_policy": (
+                    "representation_min_strict_gt_threshold_zero_disagreement"
+                ),
             }
         )
     return selected
@@ -1001,6 +1032,7 @@ def run(args: argparse.Namespace) -> None:
         historical_path,
         prior_handoff_path,
         SCRIPT_PATH,
+        LEGACY_SEARCH_PATH,
         V2_SEARCH_PATH,
         V3_HELPER_PATH,
     )
@@ -1132,6 +1164,7 @@ def run(args: argparse.Namespace) -> None:
         "prior_v3_manifest_sha256": sha256_file(
             prior_v3_dir / "cyclic_base_recovery_manifest.json"
         ),
+        "legacy_search_program_sha256": sha256_file(LEGACY_SEARCH_PATH),
         "v2_program_sha256": sha256_file(V2_SEARCH_PATH),
         "v3_program_sha256": sha256_file(V3_HELPER_PATH),
         "v4_program_sha256": sha256_file(SCRIPT_PATH),
@@ -1449,6 +1482,9 @@ def run(args: argparse.Namespace) -> None:
         "surrogates_have_no_release_authority": True,
         "every_release_passes_both_hard_gates": all(
             int(row["passes_methylation_hard_gate"]) == 1
+            and old.stable_cyclic_methyl_release_gate(
+                row, str(row["design_natural_seq"])
+            )
             and float(row["base_log_probability_mean_all_orders"]) >= floor
             and any(token.islower() for token in str(row["design_seq"]))
             for row in releases
@@ -1459,7 +1495,13 @@ def run(args: argparse.Namespace) -> None:
             and int(row["passes_joint_hard_gate"]) == 0
             and int(row["design_methyl_count"]) > 0
             and any(token.islower() for token in str(row["design_seq"]))
-            and old.strict_rounded_pass(float(row["batch_one_maximum_probability"]))
+            and old.stable_cyclic_methyl_release_gate(
+                row, str(row["design_natural_seq"])
+            )
+            and float(
+                row["batch_one_release_floor_rescore_absolute_difference"]
+            )
+            <= RESCORE_TOLERANCE
             and float(row["cyclic_base_log_probability_mean"]) < floor
             for row in near_misses
         ),

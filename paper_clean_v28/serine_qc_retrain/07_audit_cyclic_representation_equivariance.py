@@ -81,33 +81,33 @@ DEFAULT_OUT = (
 )
 REQUIRED_EXPERT_PROTOCOL = (
     "canonical_clean_v28_all_expert_heads_corrected_labels_"
-    "cyclic_representation_augmented_v6"
+    "cyclic_stability_worst_start_v9"
 )
 SERINE_ONLY_EXPERT_PROTOCOL = (
     "canonical_clean_v28_serine_only_corrected_labels_"
-    "cyclic_representation_augmented_v7"
+    "cyclic_stability_worst_start_v9"
 )
-V6_AUDIT_PROTOCOL = "cyclic_representation_equivariance_heldout_gate_v1"
+V6_AUDIT_PROTOCOL = "cyclic_stability_worst_start_heldout_gate_v9"
 V7_AUDIT_PROTOCOL = (
-    "cyclic_representation_equivariance_heldout_gate_v2_serine_only"
+    "cyclic_stability_worst_start_heldout_gate_v9_serine_only"
 )
 V6_AUTHORIZATION = (
-    "REPRESENTATION_ENSEMBLE_VALIDATED_FOR_ISOLATED_V6_REGENERATION"
+    "CYCLIC_STABILITY_V9_VALIDATED_FOR_UNIFORM_REGENERATION"
 )
 V7_AUTHORIZATION = (
-    "SERINE_ONLY_REPAIR_VALIDATED_FOR_ISOLATED_V7_REANNOTATION"
+    "SERINE_ONLY_CYCLIC_STABILITY_V9_VALIDATED_FOR_REANNOTATION"
 )
 REQUIRED_TRAINING_REPRESENTATION_POLICY = (
     "all_physical_cyclic_starts_jointly_rotate_sequence_labels_and_"
     "backbone_coordinates_with_residue_index_reset"
 )
 REQUIRED_TRAINING_ORDER_POLICY = (
-    "all_cyclic_sequence_coordinate_starts_with_epoch_indexed_"
-    "decoder_rotation_mapped_to_physical_labels"
+    "complete_physical_cyclic_start_x_complete_L_decoder_order_grid_"
+    "differentiably_meaned_per_start_then_mapped_to_physical_labels"
 )
 REQUIRED_DEPLOYMENT_POLICY = (
     "all_cyclic_starts_and_all_decoder_orders_mapped_to_physical_"
-    "residues_probability_mean"
+    "residues_probability_mean_for_ranking_representation_min_for_release"
 )
 DECODER_ONLY_MODE = "peptide_only_cyclic_order_ensemble_known_natural_sequence"
 REPRESENTATION_MODE = (
@@ -119,6 +119,17 @@ SUPPORTED_METHYL_BASES = set(NATURAL_AA_ALPHABET) - {"P"}
 
 def read_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def strict_rounded_probability_pass(value: float, threshold: float) -> bool:
+    """Match the exact eight-decimal release decision persisted by generation."""
+
+    numeric = float(value)
+    return (
+        math.isfinite(numeric)
+        and 0.0 <= numeric <= 1.0
+        and round(numeric, 8) > float(threshold)
+    )
 
 
 def read_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -245,12 +256,17 @@ def metric_summary(
     position_rows: Sequence[Mapping[str, Any]],
     probability_field: str,
     threshold: float,
+    auc_probability_field: str | None = None,
 ) -> Dict[str, Any]:
     y_all = np.asarray(
         [int(row["is_methyl_true"]) for row in position_rows], dtype=np.int64
     )
     probability_all = np.asarray(
         [float(row[probability_field]) for row in position_rows], dtype=np.float64
+    )
+    auc_field = auc_probability_field or probability_field
+    auc_probability_all = np.asarray(
+        [float(row[auc_field]) for row in position_rows], dtype=np.float64
     )
     grouped: MutableMapping[str, List[int]] = defaultdict(list)
     for index, row in enumerate(position_rows):
@@ -260,13 +276,18 @@ def metric_summary(
         indices = np.asarray(grouped.get(base, []), dtype=np.int64)
         y = y_all[indices] if len(indices) else np.asarray([], dtype=np.int64)
         p = probability_all[indices] if len(indices) else np.asarray([], dtype=np.float64)
+        auc_p = (
+            auc_probability_all[indices]
+            if len(indices)
+            else np.asarray([], dtype=np.float64)
+        )
         per_residue.append(
             {
                 "base_token": base,
                 "positions": int(len(indices)),
                 "natural_negatives": int(np.sum(y == 0)),
                 "methyl_positives": int(np.sum(y == 1)),
-                "auc": roc_auc_score_simple(y, p),
+                "auc": roc_auc_score_simple(y, auc_p),
                 **(binary_metrics(y, p, threshold) if len(indices) else {}),
             }
         )
@@ -288,10 +309,13 @@ def metric_summary(
     return {
         "positions": len(position_rows),
         "threshold": threshold,
-        "overall_auc": roc_auc_score_simple(y_all, probability_all),
+        "threshold_probability_field": probability_field,
+        "auc_probability_field": auc_field,
+        "overall_auc": roc_auc_score_simple(y_all, auc_probability_all),
+        "overall_auc_release_min": roc_auc_score_simple(y_all, probability_all),
         "overall_at_threshold": binary_metrics(y_all, probability_all, threshold),
         "non_ser_auc": roc_auc_score_simple(
-            y_all[non_ser_indices], probability_all[non_ser_indices]
+            y_all[non_ser_indices], auc_probability_all[non_ser_indices]
         ),
         "non_ser_at_threshold": binary_metrics(
             y_all[non_ser_indices], probability_all[non_ser_indices], threshold
@@ -373,6 +397,7 @@ def evaluate_heldout(
                     maximum = float(
                         representation["representation_max"][row_index, position].item()
                     )
+                    is_methyl_true = int(target_index >= N_NATURAL)
                     position_rows.append(
                         {
                             "sample_name": meta["name"],
@@ -380,7 +405,7 @@ def evaluate_heldout(
                             "position_in_peptide_1based": physical_index,
                             "target_token": EXTENDED_AA_ALPHABET[target_index],
                             "base_token": NATURAL_AA_ALPHABET[base_index],
-                            "is_methyl_true": int(target_index >= N_NATURAL),
+                            "is_methyl_true": is_methyl_true,
                             "probability_decoder_order_only": float(
                                 decoder_probability[row_index, position].item()
                             ),
@@ -402,13 +427,21 @@ def evaluate_heldout(
                             ),
                             "probability_representation_min": minimum,
                             "probability_representation_max": maximum,
+                            "probability_label_aware_adversarial": (
+                                minimum if is_methyl_true else maximum
+                            ),
                             "probability_representation_span": float(
                                 representation["representation_span"][
                                     row_index, position
                                 ].item()
                             ),
                             "representation_threshold_disagreement": int(
-                                minimum <= threshold < maximum
+                                not strict_rounded_probability_pass(
+                                    minimum, threshold
+                                )
+                                and strict_rounded_probability_pass(
+                                    maximum, threshold
+                                )
                             ),
                             "annotation_mode": REPRESENTATION_MODE,
                             "annotation_context_policy": ANNOTATION_CONTEXT,
@@ -550,11 +583,17 @@ def audit_native_targets(
                 mapped = np.roll(np.asarray(raw, dtype=np.float64), shift).tolist()
                 mapped_by_shift.append(mapped)
                 raw_selected = [
-                    index + 1 for index, value in enumerate(raw) if value > threshold
+                    index + 1
+                    for index, value in enumerate(raw)
+                    if strict_rounded_probability_pass(value, threshold)
                 ]
                 raw_tensor_selected.update(raw_selected)
                 mapped_annotation_sets.append(
-                    [index + 1 for index, value in enumerate(mapped) if value > threshold]
+                    [
+                        index + 1
+                        for index, value in enumerate(mapped)
+                        if strict_rounded_probability_pass(value, threshold)
+                    ]
                 )
                 for physical_position, value in enumerate(mapped, start=1):
                     tensor_position = (physical_position - shift - 1) % length + 1
@@ -574,7 +613,9 @@ def audit_native_targets(
             reported = ensemble["mean"][0].detach().cpu().numpy()
             maximum_recompute_difference = float(np.max(np.abs(recomputed - reported)))
             ensemble_selected = [
-                index + 1 for index, value in enumerate(reported) if value > threshold
+                index + 1
+                for index, value in enumerate(reported)
+                if strict_rounded_probability_pass(value, threshold)
             ]
             most_common_tensor_count = (
                 max(raw_tensor_selected.values()) if raw_tensor_selected else 0
@@ -636,6 +677,12 @@ def checkpoint_metadata(
         == REQUIRED_TRAINING_ORDER_POLICY
         and str(metadata.get("deployment_annotation_policy", ""))
         == REQUIRED_DEPLOYMENT_POLICY
+        and float(metadata.get("worst_start_bce_weight", 0.0)) > 0.0
+        and float(metadata.get("representation_consistency_weight", -1.0)) > 0.0
+        and bool(metadata.get("full_physical_start_by_full_decoder_order_grid"))
+        and float(metadata.get("training_ensemble_temperature", -1.0)) == 0.5
+        and "full_physical_start_x_full_decoder_order_grid"
+        in str(metadata.get("training_objective", ""))
     ):
         raise RuntimeError(
             "Representation audit requires the requested promoted checkpoint "
@@ -661,6 +708,11 @@ def run(args: argparse.Namespace) -> None:
     for required in (model_path, test_path, native_path, best_path, plan_path):
         if not required.is_file():
             raise FileNotFoundError(required)
+    if float(args.temperature) != 0.5 or float(args.threshold) != 0.6:
+        raise ValueError(
+            "The V9 held-out authorization is frozen to temperature 0.5 and "
+            "methyl threshold 0.6"
+        )
     if out_dir.exists() and any(out_dir.iterdir()) and not args.overwrite:
         raise FileExistsError(
             f"Representation audit output already exists; use --overwrite: {out_dir}"
@@ -734,9 +786,15 @@ def run(args: argparse.Namespace) -> None:
         float(args.threshold),
     )
 
-    overall = representation_summary["overall_at_threshold"]
-    serine = representation_summary["serine"]
-    proline = representation_summary["proline"]
+    release_floor_summary = metric_summary(
+        position_rows,
+        "probability_representation_min",
+        float(args.threshold),
+        auc_probability_field="probability_label_aware_adversarial",
+    )
+    overall = release_floor_summary["overall_at_threshold"]
+    serine = release_floor_summary["serine"]
+    proline = release_floor_summary["proline"]
     quality_checks = {
         "checkpoint_provenance_and_expert_scope_are_pinned": (
             metadata.get("protocol") == required_protocol
@@ -750,7 +808,9 @@ def run(args: argparse.Namespace) -> None:
         ),
         "heldout_test_record_count_is_151": len(test_records) == 151,
         "heldout_test_position_count_is_1505": len(position_rows) == 1505,
-        "overall_auc_ge_0_85": float(representation_summary["overall_auc"]) >= 0.85,
+        "release_floor_overall_auc_ge_0_85": (
+            float(release_floor_summary["overall_auc"]) >= 0.85
+        ),
         "overall_fpr_at_0_6_le_0_10": float(overall["false_positive_rate"]) <= 0.10,
         "overall_precision_at_0_6_ge_0_75": float(overall["precision"]) >= 0.75,
         "overall_recall_at_0_6_ge_0_40": float(overall["recall"]) >= 0.40,
@@ -761,14 +821,26 @@ def run(args: argparse.Namespace) -> None:
         "serine_recall_at_0_6_ge_0_40": float(serine["recall"]) >= 0.40,
         "proline_fpr_at_0_6_le_0_05": float(proline["false_positive_rate"]) <= 0.05,
         "supported_macro_auc_ge_0_70": (
-            representation_summary["supported_macro_auc"] is not None
-            and float(representation_summary["supported_macro_auc"]) >= 0.70
+            release_floor_summary["supported_macro_auc"] is not None
+            and float(release_floor_summary["supported_macro_auc"]) >= 0.70
         ),
         "all_17_targets_audited_for_uniform_regeneration": (
             len(native_summary) == len(targets) == 17
         ),
         "every_native_target_used_all_cyclic_starts": all(
             int(row["representation_count"]) == int(row["peptide_length"])
+            for row in native_summary
+        ),
+        "heldout_hard_calls_have_zero_cyclic_start_threshold_disagreement": (
+            int(
+                representation_summary[
+                    "representation_threshold_disagreement_positions"
+                ]
+            )
+            == 0
+        ),
+        "every_native_target_hard_call_is_stable_across_cyclic_starts": all(
+            int(row["raw_all_representations_same_physical_annotation"]) == 1
             for row in native_summary
         ),
         "mapped_ensemble_recomputes_from_raw_rotations": all(
@@ -815,9 +887,16 @@ def run(args: argparse.Namespace) -> None:
         "scientific_scope": (
             "Outer ensemble jointly rotates sequence and N/CA/C/O coordinates, resets "
             "linear residue indices, maps probabilities back to physical residues, and "
-            "then averages. This repairs arbitrary cyclic-start dependence; it does not "
-            "is paired with a checkpoint trained on every cyclic start rather than "
-            "claiming that the decoder-order-only V3 checkpoint was equivariant."
+            "uses the mean only for ranking while the all-start minimum controls release. "
+            "This repairs the training/deployment cyclic-grid mismatch and is paired "
+            "with a checkpoint trained on every cyclic start. It does not prove that "
+            "the trained heads eliminated target-level methyl-site concentration; "
+            "candidate generation and final selection enforce that separately."
+        ),
+        "validation_scope": (
+            "Internal development safety audit only. The 151 records were reused "
+            "during V3-V9 development and are not a blind publication outer test; "
+            "a structure/scaffold-grouped untouched outer set is still required."
         ),
         "quality_checks": quality_checks,
         "device": str(device),
@@ -837,6 +916,7 @@ def run(args: argparse.Namespace) -> None:
         "plan_sha256": sha256_file(plan_path),
         "decoder_order_only_heldout": decoder_summary,
         "cyclic_representation_ensemble_heldout": representation_summary,
+        "cyclic_representation_release_floor_heldout": release_floor_summary,
         "native_target_summary": native_summary,
         "annotation_mode": REPRESENTATION_MODE,
         "annotation_context_policy": ANNOTATION_CONTEXT,
@@ -847,6 +927,28 @@ def run(args: argparse.Namespace) -> None:
             if serine_only
             else "BLOCKED_PENDING_V6_RESULT_REVIEW"
         ),
+        "artifacts": {
+            "heldout_position_probabilities": {
+                "path": str(out_dir / "heldout_position_probabilities.csv"),
+                "sha256": sha256_file(
+                    out_dir / "heldout_position_probabilities.csv"
+                ),
+            },
+            "native_target_representation_probabilities": {
+                "path": str(
+                    out_dir / "native_target_representation_probabilities.csv"
+                ),
+                "sha256": sha256_file(
+                    out_dir / "native_target_representation_probabilities.csv"
+                ),
+            },
+            "native_target_representation_summary": {
+                "path": str(out_dir / "native_target_representation_summary.csv"),
+                "sha256": sha256_file(
+                    out_dir / "native_target_representation_summary.csv"
+                ),
+            },
+        },
     }
     atomic_write_json(out_dir / "cyclic_representation_audit.json", report)
 
