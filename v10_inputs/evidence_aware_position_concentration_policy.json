@@ -1,0 +1,33 @@
+{
+  "protocol": "historical_joint_lt5_supported_position_concentration_v10",
+  "development_csv_sha256": "d754c905e00d03c18ce0610b740c9bd6da09ee0a9e9d5d7ce953dc73d86aad05",
+  "maximum_share_without_exemption": 0.8,
+  "derivation": {
+    "minimum_historical_candidate_presence_rate": 0.8,
+    "minimum_joint_lt5_success_count": 3,
+    "minimum_conditional_success_rate_relative_to_target_baseline": 0.75
+  },
+  "supported_positions_1based_by_target": {
+    "1SFI": [4],
+    "3P8F": [4, 11],
+    "3WNE": [2],
+    "3ZGC": [1],
+    "4K1E": [1, 2, 4, 8],
+    "4KEL": [2, 4, 8]
+  },
+  "strict_no_exemption_targets": [
+    "3AV9",
+    "3AVA",
+    "3AVB",
+    "3AVF",
+    "3AVG",
+    "3AVH",
+    "3AVI",
+    "3AVJ",
+    "3AVK",
+    "3AVM",
+    "3AVN"
+  ],
+  "scope": "Position concentration only. Methyl-residue concentration remains a strict 0.8 gate for every target.",
+  "warning": "An exemption prevents a known structurally supported site from being rejected solely for concentration; it is not evidence that a new candidate has RMSD below 5 A."
+}

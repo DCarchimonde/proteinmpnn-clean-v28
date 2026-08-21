@@ -4,7 +4,13 @@
 import os
 import csv
 import argparse
+import math
 from collections import defaultdict
+
+
+DEFAULT_THRESHOLD = 0.6
+THRESHOLD_OPERATOR = ">"
+ROUNDING_POLICY = "round(prob,8)"
 
 
 def safe_name(x):
@@ -36,8 +42,34 @@ def write_csv(path, rows):
         w.writerows(rows)
 
 
+def validate_probability(prob):
+    try:
+        prob = float(prob)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid methylation probability: {prob!r}") from exc
+    if not math.isfinite(prob) or not 0.0 <= prob <= 1.0:
+        raise ValueError(
+            f"methylation probability must be finite and within [0, 1]: {prob!r}"
+        )
+    return prob
+
+
+def validate_threshold(threshold):
+    threshold = float(threshold)
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError(
+            f"methylation threshold must be finite and within [0, 1]: {threshold!r}"
+        )
+    return threshold
+
+
+def passes_methylation_threshold(prob, threshold):
+    prob = validate_probability(prob)
+    return round(prob, 8) > threshold
+
+
 def lower_if_methyl(aa, prob, threshold):
-    if float(prob) >= threshold:
+    if passes_methylation_threshold(prob, threshold):
         return aa.lower()
     return aa.upper()
 
@@ -47,8 +79,9 @@ def main():
     parser.add_argument("--position_csv", required=True)
     parser.add_argument("--out_csv", required=True)
     parser.add_argument("--input_mode", default="strict_naturalized_input")
-    parser.add_argument("--threshold", type=float, default=0.3)
+    parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
     args = parser.parse_args()
+    threshold = validate_threshold(args.threshold)
 
     rows = read_csv(args.position_csv)
 
@@ -72,7 +105,7 @@ def main():
             lower_if_methyl(
                 r["true_base_token"],
                 r["prob_methyl_known_sequence"],
-                args.threshold
+                threshold
             )
             for r in items
         )
@@ -82,7 +115,7 @@ def main():
             lower_if_methyl(
                 r["pred_base_token"],
                 r["prob_methyl_end_to_end"],
-                args.threshold
+                threshold
             )
             for r in items
         )
@@ -90,13 +123,15 @@ def main():
         known_methyl_positions = [
             str(i + 1)
             for i, r in enumerate(items)
-            if float(r["prob_methyl_known_sequence"]) >= args.threshold
+            if passes_methylation_threshold(
+                r["prob_methyl_known_sequence"], threshold
+            )
         ]
 
         e2e_methyl_positions = [
             str(i + 1)
             for i, r in enumerate(items)
-            if float(r["prob_methyl_end_to_end"]) >= args.threshold
+            if passes_methylation_threshold(r["prob_methyl_end_to_end"], threshold)
         ]
 
         out.append({
@@ -104,7 +139,9 @@ def main():
             "sample_name": sample_name,
             "selected_chains": selected_chains,
             "input_mode": args.input_mode,
-            "threshold": args.threshold,
+            "threshold": threshold,
+            "threshold_operator": THRESHOLD_OPERATOR,
+            "rounding_policy": ROUNDING_POLICY,
 
             "reference_original_sequence": reference_original,
             "reference_natural_sequence": reference_natural,
@@ -127,7 +164,9 @@ def main():
     print("已生成:", args.out_csv)
     print("任务数:", len(out))
     print("input_mode:", args.input_mode)
-    print("threshold:", args.threshold)
+    print("threshold:", threshold)
+    print("threshold_operator:", THRESHOLD_OPERATOR)
+    print("rounding_policy:", ROUNDING_POLICY)
 
 
 if __name__ == "__main__":

@@ -873,7 +873,11 @@ def binary_metrics(y_true: np.ndarray, prob: np.ndarray, thresholds: List[float]
     prob = np.asarray(prob, dtype=np.float32)
     rows = []
     for thr in thresholds:
-        pred = (prob > thr).astype(np.int64)
+        # Release decisions throughout V9/V10 use a strict threshold after an
+        # explicit eight-decimal normalization.  Evaluation must use the same
+        # contract so values such as 0.600000004 cannot change class merely
+        # because one CSV retained more floating-point digits.
+        pred = (np.round(prob.astype(np.float64), 8) > float(thr)).astype(np.int64)
         tp = int(np.sum((y_true == 1) & (pred == 1)))
         tn = int(np.sum((y_true == 0) & (pred == 0)))
         fp = int(np.sum((y_true == 0) & (pred == 1)))
@@ -886,6 +890,8 @@ def binary_metrics(y_true: np.ndarray, prob: np.ndarray, thresholds: List[float]
         fpr = fp / (fp + tn) if (fp + tn) else 0.0
         rows.append({
             "threshold": thr,
+            "threshold_operator": ">",
+            "probability_rounding_policy": "round(prob,8)",
             "accuracy": acc,
             "precision": prec,
             "recall": rec,
@@ -898,6 +904,39 @@ def binary_metrics(y_true: np.ndarray, prob: np.ndarray, thresholds: List[float]
             "fn": fn,
         })
     return rows
+
+
+def average_precision_score_simple(
+    y_true: np.ndarray, scores: np.ndarray
+) -> Optional[float]:
+    """Tie-aware non-interpolated average precision without sklearn."""
+
+    y_true = np.asarray(y_true, dtype=np.int64)
+    scores = np.asarray(scores, dtype=np.float64)
+    n_pos = int(np.sum(y_true == 1))
+    if n_pos == 0:
+        return None
+    order = np.argsort(-scores, kind="stable")
+    sorted_scores = scores[order]
+    sorted_labels = y_true[order]
+    true_positives = 0
+    false_positives = 0
+    previous_recall = 0.0
+    average_precision = 0.0
+    start = 0
+    while start < len(scores):
+        end = start + 1
+        while end < len(scores) and sorted_scores[end] == sorted_scores[start]:
+            end += 1
+        group = sorted_labels[start:end]
+        true_positives += int(np.sum(group == 1))
+        false_positives += int(np.sum(group == 0))
+        recall = true_positives / n_pos
+        precision = true_positives / (true_positives + false_positives)
+        average_precision += (recall - previous_recall) * precision
+        previous_recall = recall
+        start = end
+    return float(average_precision)
 
 
 def roc_auc_score_simple(y_true: np.ndarray, scores: np.ndarray) -> Optional[float]:

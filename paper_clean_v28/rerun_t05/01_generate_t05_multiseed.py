@@ -561,6 +561,104 @@ def torch_seed_all(torch_module: Any, seed: int) -> None:
         torch_module.cuda.manual_seed_all(seed)
 
 
+def generation_runtime_contract(
+    torch_module: Any,
+    numpy_module: Any,
+    device: Any,
+) -> Dict[str, Any]:
+    """Pin the numeric environment before any persisted generation rows exist."""
+    device_type = str(getattr(device, "type", str(device).split(":", 1)[0]))
+    cuda_active = device_type == "cuda"
+    cuda = getattr(torch_module, "cuda", None)
+    backend = getattr(torch_module, "backends", None)
+    cudnn = getattr(backend, "cudnn", None)
+    cuda_backend = getattr(backend, "cuda", None)
+    matmul_backend = getattr(cuda_backend, "matmul", None)
+    gpu: Dict[str, Any] | None = None
+    if cuda_active:
+        device_index = getattr(device, "index", None)
+        if device_index is None:
+            device_index = int(cuda.current_device())
+        properties = cuda.get_device_properties(device_index)
+        gpu = {
+            "index": int(device_index),
+            "name": str(cuda.get_device_name(device_index)),
+            "capability": [
+                int(value) for value in cuda.get_device_capability(device_index)
+            ],
+            "total_memory": int(getattr(properties, "total_memory", -1)),
+            "multi_processor_count": int(
+                getattr(properties, "multi_processor_count", -1)
+            ),
+            "uuid": str(getattr(properties, "uuid", "")),
+        }
+    deterministic_warn_only = None
+    warn_only_reader = getattr(
+        torch_module, "is_deterministic_algorithms_warn_only_enabled", None
+    )
+    if callable(warn_only_reader):
+        deterministic_warn_only = bool(warn_only_reader())
+    float32_precision_reader = getattr(torch_module, "get_float32_matmul_precision", None)
+    return {
+        "python_implementation": platform.python_implementation(),
+        "python_version": platform.python_version(),
+        "torch_version": str(torch_module.__version__),
+        "numpy_version": str(numpy_module.__version__),
+        "torch_cuda_version": str(getattr(torch_module.version, "cuda", None)),
+        "cudnn_version": (
+            int(cudnn.version())
+            if cudnn is not None and cudnn.version() is not None
+            else None
+        ),
+        "device": str(device),
+        "device_type": device_type,
+        "gpu": gpu,
+        "deterministic": {
+            "algorithms_enabled": bool(
+                torch_module.are_deterministic_algorithms_enabled()
+            ),
+            "algorithms_warn_only": deterministic_warn_only,
+            "cudnn_deterministic": bool(getattr(cudnn, "deterministic", False)),
+            "cudnn_benchmark": bool(getattr(cudnn, "benchmark", False)),
+            "cudnn_allow_tf32": bool(getattr(cudnn, "allow_tf32", False)),
+            "cuda_matmul_allow_tf32": bool(
+                getattr(matmul_backend, "allow_tf32", False)
+            ),
+            "float32_matmul_precision": (
+                str(float32_precision_reader())
+                if callable(float32_precision_reader)
+                else None
+            ),
+            "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+            "pythonhashseed": os.environ.get("PYTHONHASHSEED"),
+        },
+    }
+
+
+def initial_generation_numerical_contract(
+    args: argparse.Namespace,
+    plan: Mapping[str, Any],
+    validated: Mapping[str, Any],
+    device: Any,
+) -> Dict[str, Any]:
+    return {
+        "protocol": str(plan["protocol"]),
+        "temperature": float(plan["temperature"]),
+        "methyl_threshold": float(plan["methyl_threshold"]),
+        "batch_size": int(args.batch_size),
+        "device_argument": str(args.device),
+        "resolved_device": str(device),
+        "allow_cpu": bool(args.allow_cpu),
+        "initial_seeds": [int(value) for value in validated["seeds"]],
+        "cyclic_representation_ensemble": bool(
+            args.cyclic_representation_ensemble
+        ),
+        "sampling_context": SAMPLING_CONTEXT_POLICY,
+        "annotation_context": PEPTIDE_ONLY_ANNOTATION_CONTEXT,
+        "effective_seed_policy": "base_seed_x_100000_plus_stable_target_offset",
+    }
+
+
 def repeat_batch(tensor: Any, batch_size: int) -> Any:
     repeats = [batch_size] + [1] * (tensor.ndim - 1)
     return tensor.repeat(*repeats)
@@ -1152,6 +1250,7 @@ def native_manifest_all_targets(
 def audit_annotation_stability(
     raw_rows: Sequence[Mapping[str, Any]],
     eligible_rows: Sequence[Mapping[str, Any]],
+    position_concentration_policy: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Detect the two failure signatures that invalidated earlier reruns."""
     observed_annotation_modes = {
@@ -1223,6 +1322,35 @@ def audit_annotation_stability(
     max_residue_share = (
         max(site_residues.values()) / total_sites if total_sites else 0.0
     )
+    supported_positions_by_target: Dict[str, set[int]] = {}
+    concentration_policy_protocol = (
+        "HARD_BLOCK_ABOVE_80_PERCENT_PENDING_INDEPENDENT_MANUAL_"
+        "SCIENTIFIC_RELEASE; structural homology alone cannot override"
+    )
+    if position_concentration_policy is not None:
+        if (
+            position_concentration_policy.get("protocol")
+            != "historical_joint_lt5_supported_position_concentration_v10"
+            or float(
+                position_concentration_policy.get(
+                    "maximum_share_without_exemption", -1.0
+                )
+            )
+            != 0.80
+        ):
+            raise ValueError("Invalid V10 position-concentration policy")
+        raw_support = position_concentration_policy.get(
+            "supported_positions_1based_by_target", {}
+        )
+        if not isinstance(raw_support, Mapping):
+            raise ValueError("V10 position-concentration support must be an object")
+        supported_positions_by_target = {
+            str(target).upper(): {int(value) for value in values}
+            for target, values in raw_support.items()
+        }
+        concentration_policy_protocol = str(
+            position_concentration_policy["protocol"]
+        )
     per_target_concentration = []
     for target in sorted(set(target_site_positions) | set(target_site_residues)):
         target_total = int(sum(target_site_positions[target].values()))
@@ -1236,6 +1364,23 @@ def audit_annotation_stability(
             if target_total
             else 0.0
         )
+        maximum_position_count = max(
+            target_site_positions[target].values(), default=0
+        )
+        dominant_positions = sorted(
+            position
+            for position, count in target_site_positions[target].items()
+            if count == maximum_position_count
+        )
+        supported_dominant_positions = sorted(
+            set(dominant_positions)
+            & supported_positions_by_target.get(str(target).upper(), set())
+        )
+        position_exemption_applied = bool(
+            target_total >= 30
+            and target_position_share > 0.80
+            and supported_dominant_positions
+        )
         per_target_concentration.append(
             {
                 "target_name": target,
@@ -1245,7 +1390,18 @@ def audit_annotation_stability(
                 "maximum_single_position_share": target_position_share,
                 "maximum_single_residue_share": target_residue_share,
                 "concentration_gate_applies": target_total >= 30,
-                "position_gate_pass": target_total < 30 or target_position_share <= 0.80,
+                "dominant_positions_1based": dominant_positions,
+                "historically_supported_dominant_positions_1based": (
+                    supported_dominant_positions
+                ),
+                "position_concentration_exemption_applied": (
+                    position_exemption_applied
+                ),
+                "position_gate_pass": (
+                    target_total < 30
+                    or target_position_share <= 0.80
+                    or position_exemption_applied
+                ),
                 "residue_gate_pass": target_total < 30 or target_residue_share <= 0.80,
             }
         )
@@ -1264,7 +1420,11 @@ def audit_annotation_stability(
         "no_target_has_single_residue_above_80_percent_when_n_ge_30": all(
             bool(row["residue_gate_pass"]) for row in per_target_concentration
         ),
-        "no_target_has_single_position_above_80_percent_when_n_ge_30": all(
+        (
+            "no_target_has_unsupported_single_position_above_80_percent_when_n_ge_30"
+            if position_concentration_policy is not None
+            else "no_target_has_single_position_above_80_percent_when_n_ge_30"
+        ): all(
             bool(row["position_gate_pass"]) for row in per_target_concentration
         ),
     }
@@ -1305,7 +1465,11 @@ def audit_annotation_stability(
         "no_single_position_exceeds_80_percent_of_sites": (
             not concentration_gate_applies or max_position_share <= 0.80
         ),
-        "no_target_has_single_position_above_80_percent_when_n_ge_30": all(
+        (
+            "no_target_has_unsupported_single_position_above_80_percent_when_n_ge_30"
+            if position_concentration_policy is not None
+            else "no_target_has_single_position_above_80_percent_when_n_ge_30"
+        ): all(
             bool(row["position_gate_pass"]) for row in per_target_concentration
         ),
         "no_single_residue_exceeds_80_percent_of_sites": (
@@ -1328,9 +1492,11 @@ def audit_annotation_stability(
         "maximum_single_residue_share": max_residue_share,
         "concentration_gate_applies": concentration_gate_applies,
         "concentration_diagnostics": concentration_diagnostics,
-        "concentration_gate_policy": (
-            "HARD_BLOCK_ABOVE_80_PERCENT_PENDING_INDEPENDENT_MANUAL_"
-            "SCIENTIFIC_RELEASE; structural homology alone cannot override"
+        "concentration_gate_policy": concentration_policy_protocol,
+        "position_concentration_policy": (
+            dict(position_concentration_policy)
+            if position_concentration_policy is not None
+            else None
         ),
         "unstable_release_candidate_count": len(unstable_release_candidate_ids),
         "unstable_release_candidate_ids_first_100": unstable_release_candidate_ids[:100],
@@ -1392,6 +1558,16 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
     old_path = Path(args.old_designs_csv).resolve()
     prior_path = (
         Path(args.prior_designs_csv).resolve() if args.prior_designs_csv else None
+    )
+    concentration_policy_path = (
+        Path(args.position_concentration_policy).resolve()
+        if args.position_concentration_policy
+        else None
+    )
+    concentration_policy = (
+        read_json(concentration_policy_path)
+        if concentration_policy_path is not None
+        else None
     )
     out_dir = Path(args.out_dir).resolve()
     for required in (model_path, native_path, best_path, old_path):
@@ -1581,6 +1757,12 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
             raise RuntimeError(
                 "No CUDA device is available. Activate the GPU torch environment, or pass --allow-cpu knowingly."
             )
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    initial_runtime_contract = generation_runtime_contract(torch, np, device)
+    initial_numerical_contract = initial_generation_numerical_contract(
+        args, plan, validated, device
+    )
 
     best_rows = read_csv(best_path)
     selected_chains = selected_chain_index(best_rows)
@@ -1824,7 +2006,9 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
         list(summary_rows[0].keys()),
     )
 
-    annotation_audit = audit_annotation_stability(raw_rows, eligible_rows)
+    annotation_audit = audit_annotation_stability(
+        raw_rows, eligible_rows, concentration_policy
+    )
     targets_below_quota = [
         row["target_name"]
         for row in summary_rows
@@ -1850,9 +2034,21 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
         "python_version": platform.python_version(),
         "torch_version": str(torch.__version__),
         "numpy_version": str(np.__version__),
+        "initial_generation_runtime_contract": initial_runtime_contract,
+        "initial_generation_numerical_contract": initial_numerical_contract,
         "model_path": str(model_path),
         "model_sha256": model_sha256,
         "model_expert_qc_protocol": checkpoint_metadata.get("protocol"),
+        "position_concentration_policy": (
+            str(concentration_policy_path)
+            if concentration_policy_path is not None
+            else None
+        ),
+        "position_concentration_policy_sha256": (
+            sha256_file(concentration_policy_path)
+            if concentration_policy_path is not None
+            else None
+        ),
         "native_jsonl": str(native_path),
         "best_csv": str(best_path),
         "historical_design_csv": str(old_path),
@@ -1876,6 +2072,75 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
         "methylated_new_candidates_csv_sha256": sha256_file(
             out_dir / "methylated_new_candidates.csv"
         ),
+        "program": {
+            "path": str(SCRIPT_PATH),
+            "sha256": sha256_file(SCRIPT_PATH),
+        },
+        "dependencies": {
+            "clean_v28_common": {
+                "path": str(REPO_ROOT / "paper_clean_v28" / "clean_v28_common.py"),
+                "sha256": sha256_file(REPO_ROOT / "paper_clean_v28" / "clean_v28_common.py"),
+            },
+            "model_utils": {
+                "path": str(REPO_ROOT / "model_utils.py"),
+                "sha256": sha256_file(REPO_ROOT / "model_utils.py"),
+            },
+            "nmethyl_config": {
+                "path": str(REPO_ROOT / "nmethyl" / "utils" / "nmethyl_config.py"),
+                "sha256": sha256_file(REPO_ROOT / "nmethyl" / "utils" / "nmethyl_config.py"),
+            },
+        },
+        "inputs": {
+            "plan": {
+                "path": str(Path(args.plan).resolve()),
+                "sha256": sha256_file(Path(args.plan).resolve()),
+            },
+            "model": {"path": str(model_path), "sha256": model_sha256},
+            "native_jsonl": {
+                "path": str(native_path),
+                "sha256": sha256_file(native_path),
+            },
+            "best_csv": {"path": str(best_path), "sha256": sha256_file(best_path)},
+            "historical_csv": {
+                "path": str(old_path),
+                "sha256": sha256_file(old_path),
+            },
+            "prior_csv": (
+                {"path": str(prior_path), "sha256": sha256_file(prior_path)}
+                if prior_path is not None
+                else None
+            ),
+            "position_concentration_policy": (
+                {
+                    "path": str(concentration_policy_path),
+                    "sha256": sha256_file(concentration_policy_path),
+                }
+                if concentration_policy_path is not None
+                else None
+            ),
+        },
+        "artifacts": {
+            "all_candidates": {
+                "path": str(out_dir / "all_candidates.csv"),
+                "sha256": sha256_file(out_dir / "all_candidates.csv"),
+            },
+            "unique_candidates": {
+                "path": str(out_dir / "unique_candidates.csv"),
+                "sha256": sha256_file(out_dir / "unique_candidates.csv"),
+            },
+            "methylated_new_candidates": {
+                "path": str(out_dir / "methylated_new_candidates.csv"),
+                "sha256": sha256_file(out_dir / "methylated_new_candidates.csv"),
+            },
+            "generation_summary_by_target": {
+                "path": str(out_dir / "generation_summary_by_target.csv"),
+                "sha256": sha256_file(out_dir / "generation_summary_by_target.csv"),
+            },
+            "target_manifest": {
+                "path": str(out_dir / "target_manifest.csv"),
+                "sha256": sha256_file(out_dir / "target_manifest.csv"),
+            },
+        },
         "new_methylated_candidates_for_permeability": len(eligible_rows),
         "workflow_order": (
             "STRUCTURE_FIRST_THEN_PERMEABILITY"
@@ -1993,6 +2258,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--best_csv", default=str(DEFAULT_BEST))
     parser.add_argument("--old_designs_csv", default=str(DEFAULT_OLD))
     parser.add_argument("--prior_designs_csv")
+    parser.add_argument(
+        "--position-concentration-policy",
+        help=(
+            "optional frozen V10 evidence-aware position policy; residue "
+            "concentration remains a strict hard gate"
+        ),
+    )
     parser.add_argument("--out_dir", default=str(DEFAULT_OUT))
     parser.add_argument("--seeds", type=int, nargs="*")
     parser.add_argument("--batch_size", type=int, default=16)

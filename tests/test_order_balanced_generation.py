@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import csv
+import hashlib
 import json
 import sys
 import tempfile
@@ -89,6 +90,75 @@ def audit_row(
 
 
 class ResultAnomalyGateTests(unittest.TestCase):
+    @staticmethod
+    def evidence_policy():
+        return {
+            "protocol": "historical_joint_lt5_supported_position_concentration_v10",
+            "maximum_share_without_exemption": 0.8,
+            "supported_positions_1based_by_target": {"3WNE": [2]},
+        }
+
+    @staticmethod
+    def balanced_background_rows():
+        residues = "ACDEFGHIKLMNQRSTVWY"
+        rows = []
+        for target_index, target in enumerate(("T1", "T2", "T3", "T4")):
+            for index in range(120):
+                position = index % 4 + 1
+                residue = residues[(index + target_index) % len(residues)]
+                digest = hashlib.sha256(
+                    f"{target}:{index}".encode("ascii")
+                ).digest()
+                natural = [residues[value % len(residues)] for value in digest[:12]]
+                natural[position - 1] = residue
+                rows.append(audit_row(target, "".join(natural), position, residue))
+        return rows
+
+    def test_v10_historical_position_support_can_exempt_3wne_only(self):
+        residues = "ACDEFGHIKLMNQRSTVWY"
+        concentrated = [
+            audit_row(
+                "3WNE",
+                "A" + residues[index % len(residues)] + "DEFGHI",
+                2,
+                residues[index % len(residues)],
+            )
+            for index in range(120)
+        ]
+        report = generator.audit_annotation_stability(
+            [*concentrated, *self.balanced_background_rows()],
+            [*concentrated, *self.balanced_background_rows()],
+            self.evidence_policy(),
+        )
+        target = next(
+            row for row in report["per_target_concentration"]
+            if row["target_name"] == "3WNE"
+        )
+        self.assertEqual(report["quality_gate"], "PASS")
+        self.assertTrue(target["position_concentration_exemption_applied"])
+        self.assertEqual(
+            target["historically_supported_dominant_positions_1based"], [2]
+        )
+
+    def test_v10_policy_does_not_exempt_unlabelled_3av_collapse(self):
+        residues = "ACDEFGHIKLMNQRSTVWY"
+        concentrated = []
+        for index in range(120):
+            residue = residues[index % len(residues)]
+            natural = "AAAAAA" + residue + "A"
+            concentrated.append(audit_row("3AV9", natural, 7, residue))
+        rows = [*concentrated, *self.balanced_background_rows()]
+        report = generator.audit_annotation_stability(
+            rows, rows, self.evidence_policy()
+        )
+        target = next(
+            row for row in report["per_target_concentration"]
+            if row["target_name"] == "3AV9"
+        )
+        self.assertEqual(report["quality_gate"], "FAIL")
+        self.assertFalse(target["position_concentration_exemption_applied"])
+        self.assertFalse(target["position_gate_pass"])
+
     def test_single_point_concentration_is_a_hard_release_block(self):
         residues = "ACDEFGHIKLMNQRSTVWY"
         rows = []

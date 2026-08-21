@@ -1,0 +1,5 @@
+﻿dataset,ground_truth,task,positions,positives,negatives,base_recovery,auc,threshold,operator,accuracy,precision,recall,f1,false_positive_rate,pred_methyl_rate,tp,tn,fp,fn,reportability
+Monomer held-out positions,Ser-provenance-corrected labels,Known natural sequence,1505,261,1244,0.1607973422,0.9002907442,0.6,>,0.8617940199,0.6402116402,0.4636015326,0.5377777778,0.0546623794,0.1255813953,121,1176,68,140,reportable
+Monomer held-out positions,Ser-provenance-corrected labels,End-to-end,1505,261,1244,0.1607973422,0.9081660938,0.6,>,0.8910299003,0.888,0.4252873563,0.5751295337,0.0112540193,0.0830564784,111,1230,14,150,reportable
+"Six complexes, seven selected peptide chains",All observed positions are unmethylated,Known natural sequence,75,0,75,0.3866666667,,0.6,>,0.9466666667,,,,0.0533333333,0.0533333333,0,71,4,0,AUC/precision/recall/F1 not reportable: no positive labels
+"Six complexes, seven selected peptide chains",All observed positions are unmethylated,End-to-end,75,0,75,0.3866666667,,0.6,>,0.9733333333,,,,0.0266666667,0.0266666667,0,73,2,0,AUC/precision/recall/F1 not reportable: no positive labels

@@ -228,7 +228,13 @@ def binary_metrics(
     probability: np.ndarray,
     threshold: float,
 ) -> Dict[str, Any]:
-    predicted = probability > threshold
+    predicted = np.asarray(
+        [
+            strict_rounded_probability_pass(value, threshold)
+            for value in probability
+        ],
+        dtype=bool,
+    )
     true = y_true == 1
     tp = int(np.sum(predicted & true))
     fp = int(np.sum(predicted & ~true))
@@ -239,6 +245,8 @@ def binary_metrics(
     f1 = 2.0 * precision * recall / (precision + recall) if precision + recall else 0.0
     return {
         "threshold": threshold,
+        "threshold_operator": ">",
+        "probability_rounding_policy": "round(prob,8)",
         "tp": tp,
         "fp": fp,
         "tn": tn,
@@ -361,6 +369,15 @@ def evaluate_heldout(
                 & (S_label != X_INDEX)
             )
             S_forward = naturalize_tensor_for_input(S_label)
+            base_logits, _unused_expert_logits = model(
+                X,
+                S_forward,
+                mask,
+                chain_M,
+                residue_idx,
+                chain_encoding_all,
+            )
+            pred_base = torch.argmax(base_logits, dim=-1)
             decoder_probability, decoder_order_std = (
                 cyclic_known_sequence_methyl_probabilities(
                     model,
@@ -385,6 +402,18 @@ def evaluate_heldout(
                     temperature=temperature,
                 )
             )
+            end_to_end_representation = (
+                cyclic_representation_known_sequence_methyl_probabilities(
+                    model,
+                    X,
+                    pred_base,
+                    mask,
+                    chain_M,
+                    residue_idx,
+                    chain_encoding_all,
+                    temperature=temperature,
+                )
+            )
             true_base = naturalize_tensor_for_input(S_label)
             for row_index, meta in enumerate(metas):
                 positions = torch.where(valid[row_index])[0].cpu().tolist()
@@ -397,6 +426,16 @@ def evaluate_heldout(
                     maximum = float(
                         representation["representation_max"][row_index, position].item()
                     )
+                    end_to_end_minimum = float(
+                        end_to_end_representation["representation_min"][
+                            row_index, position
+                        ].item()
+                    )
+                    end_to_end_maximum = float(
+                        end_to_end_representation["representation_max"][
+                            row_index, position
+                        ].item()
+                    )
                     is_methyl_true = int(target_index >= N_NATURAL)
                     position_rows.append(
                         {
@@ -405,6 +444,12 @@ def evaluate_heldout(
                             "position_in_peptide_1based": physical_index,
                             "target_token": EXTENDED_AA_ALPHABET[target_index],
                             "base_token": NATURAL_AA_ALPHABET[base_index],
+                            "pred_base_token": NATURAL_AA_ALPHABET[
+                                int(pred_base[row_index, position].item())
+                            ],
+                            "base_correct": int(
+                                int(pred_base[row_index, position].item()) == base_index
+                            ),
                             "is_methyl_true": is_methyl_true,
                             "probability_decoder_order_only": float(
                                 decoder_probability[row_index, position].item()
@@ -443,6 +488,36 @@ def evaluate_heldout(
                                     maximum, threshold
                                 )
                             ),
+                            "probability_end_to_end_representation_ensemble": float(
+                                end_to_end_representation["mean"][
+                                    row_index, position
+                                ].item()
+                            ),
+                            "probability_end_to_end_representation_std": float(
+                                end_to_end_representation["representation_std"][
+                                    row_index, position
+                                ].item()
+                            ),
+                            "probability_end_to_end_representation_min": end_to_end_minimum,
+                            "probability_end_to_end_representation_max": end_to_end_maximum,
+                            "probability_end_to_end_label_aware_adversarial": (
+                                end_to_end_minimum
+                                if is_methyl_true
+                                else end_to_end_maximum
+                            ),
+                            "probability_end_to_end_representation_span": float(
+                                end_to_end_representation["representation_span"][
+                                    row_index, position
+                                ].item()
+                            ),
+                            "end_to_end_representation_threshold_disagreement": int(
+                                not strict_rounded_probability_pass(
+                                    end_to_end_minimum, threshold
+                                )
+                                and strict_rounded_probability_pass(
+                                    end_to_end_maximum, threshold
+                                )
+                            ),
                             "annotation_mode": REPRESENTATION_MODE,
                             "annotation_context_policy": ANNOTATION_CONTEXT,
                             "annotation_representation_ensemble_size": len(positions),
@@ -468,6 +543,45 @@ def evaluate_heldout(
     )
     representation_summary["representation_threshold_disagreement_rate"] = (
         disagreements / len(position_rows)
+    )
+    end_to_end_representation_summary = metric_summary(
+        position_rows,
+        "probability_end_to_end_representation_ensemble",
+        threshold,
+    )
+    end_to_end_release_floor_summary = metric_summary(
+        position_rows,
+        "probability_end_to_end_representation_min",
+        threshold,
+        auc_probability_field="probability_end_to_end_label_aware_adversarial",
+    )
+    end_to_end_spans = [
+        float(row["probability_end_to_end_representation_span"])
+        for row in position_rows
+    ]
+    end_to_end_disagreements = sum(
+        int(row["end_to_end_representation_threshold_disagreement"])
+        for row in position_rows
+    )
+    end_to_end_representation_summary.update(
+        {
+            "maximum_probability_representation_span": max(end_to_end_spans),
+            "mean_probability_representation_span": float(
+                np.mean(end_to_end_spans)
+            ),
+            "representation_threshold_disagreement_positions": (
+                end_to_end_disagreements
+            ),
+            "representation_threshold_disagreement_rate": (
+                end_to_end_disagreements / len(position_rows)
+            ),
+        }
+    )
+    representation_summary["end_to_end_representation_ensemble"] = (
+        end_to_end_representation_summary
+    )
+    representation_summary["end_to_end_release_floor"] = (
+        end_to_end_release_floor_summary
     )
     return position_rows, decoder_summary, representation_summary
 
@@ -575,12 +689,41 @@ def audit_native_targets(
                 chain_encoding_all,
                 temperature=temperature,
             )
+            base_logits, _unused_expert_logits = model(
+                X,
+                S,
+                mask,
+                chain_M,
+                residue_idx,
+                chain_encoding_all,
+            )
+            pred_base = torch.argmax(base_logits, dim=-1)
+            end_to_end_ensemble = (
+                cyclic_representation_known_sequence_methyl_probabilities(
+                    model,
+                    X,
+                    pred_base,
+                    mask,
+                    chain_M,
+                    residue_idx,
+                    chain_encoding_all,
+                    temperature=temperature,
+                )
+            )
             mapped_by_shift: List[List[float]] = []
             raw_tensor_selected: Counter[int] = Counter()
             mapped_annotation_sets: List[List[int]] = []
+            end_to_end_annotation_sets: List[List[int]] = []
             for shift in range(length):
                 raw = raw_probability[shift].detach().cpu().tolist()
                 mapped = np.roll(np.asarray(raw, dtype=np.float64), shift).tolist()
+                mapped_end_to_end = (
+                    end_to_end_ensemble["representation_probability_by_start"]
+                    [0, shift, :length]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
                 mapped_by_shift.append(mapped)
                 raw_selected = [
                     index + 1
@@ -595,8 +738,18 @@ def audit_native_targets(
                         if strict_rounded_probability_pass(value, threshold)
                     ]
                 )
+                end_to_end_annotation_sets.append(
+                    [
+                        index + 1
+                        for index, value in enumerate(mapped_end_to_end)
+                        if strict_rounded_probability_pass(value, threshold)
+                    ]
+                )
                 for physical_position, value in enumerate(mapped, start=1):
                     tensor_position = (physical_position - shift - 1) % length + 1
+                    end_to_end_value = float(
+                        mapped_end_to_end[physical_position - 1]
+                    )
                     detail_rows.append(
                         {
                             "target_name": target,
@@ -606,7 +759,19 @@ def audit_native_targets(
                             "tensor_position_1based": tensor_position,
                             "base_token": sequence[physical_position - 1],
                             "mapped_probability": value,
-                            "above_threshold": int(value > threshold),
+                            "mapped_probability_known_sequence": value,
+                            "mapped_probability_end_to_end": end_to_end_value,
+                            "above_threshold": int(
+                                strict_rounded_probability_pass(value, threshold)
+                            ),
+                            "known_sequence_above_threshold": int(
+                                strict_rounded_probability_pass(value, threshold)
+                            ),
+                            "end_to_end_above_threshold": int(
+                                strict_rounded_probability_pass(
+                                    end_to_end_value, threshold
+                                )
+                            ),
                         }
                     )
             recomputed = np.mean(np.asarray(mapped_by_shift), axis=0)
@@ -631,6 +796,18 @@ def audit_native_targets(
                     "raw_all_representations_same_physical_annotation": int(
                         len({tuple(value) for value in mapped_annotation_sets}) == 1
                     ),
+                    "end_to_end_mapped_annotation_sets": json.dumps(
+                        end_to_end_annotation_sets
+                    ),
+                    "end_to_end_all_representations_same_physical_annotation": int(
+                        len(
+                            {
+                                tuple(value)
+                                for value in end_to_end_annotation_sets
+                            }
+                        )
+                        == 1
+                    ),
                     "raw_tensor_position_counts_above_threshold": json.dumps(
                         dict(sorted(raw_tensor_selected.items()))
                     ),
@@ -647,6 +824,37 @@ def audit_native_targets(
                         [
                             round(float(value), 8)
                             for value in ensemble["representation_span"][0]
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        ]
+                    ),
+                    "end_to_end_ensemble_probability_vector": json.dumps(
+                        [
+                            round(float(value), 8)
+                            for value in end_to_end_ensemble["mean"][0]
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        ]
+                    ),
+                    "end_to_end_ensemble_representation_min_vector": json.dumps(
+                        [
+                            round(float(value), 8)
+                            for value in end_to_end_ensemble[
+                                "representation_min"
+                            ][0]
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        ]
+                    ),
+                    "end_to_end_ensemble_representation_max_vector": json.dumps(
+                        [
+                            round(float(value), 8)
+                            for value in end_to_end_ensemble[
+                                "representation_max"
+                            ][0]
                             .detach()
                             .cpu()
                             .tolist()
@@ -839,8 +1047,25 @@ def run(args: argparse.Namespace) -> None:
             )
             == 0
         ),
+        "heldout_end_to_end_hard_calls_have_zero_cyclic_start_threshold_disagreement": (
+            int(
+                representation_summary["end_to_end_representation_ensemble"][
+                    "representation_threshold_disagreement_positions"
+                ]
+            )
+            == 0
+        ),
         "every_native_target_hard_call_is_stable_across_cyclic_starts": all(
             int(row["raw_all_representations_same_physical_annotation"]) == 1
+            for row in native_summary
+        ),
+        "every_native_target_end_to_end_hard_call_is_stable_across_cyclic_starts": all(
+            int(
+                row[
+                    "end_to_end_all_representations_same_physical_annotation"
+                ]
+            )
+            == 1
             for row in native_summary
         ),
         "mapped_ensemble_recomputes_from_raw_rotations": all(
@@ -855,6 +1080,11 @@ def run(args: argparse.Namespace) -> None:
                 "probability_representation_ensemble",
                 "probability_representation_std",
                 "probability_representation_span",
+                "probability_end_to_end_representation_ensemble",
+                "probability_end_to_end_representation_std",
+                "probability_end_to_end_representation_min",
+                "probability_end_to_end_representation_max",
+                "probability_end_to_end_representation_span",
             )
         ),
     }
@@ -914,6 +1144,30 @@ def run(args: argparse.Namespace) -> None:
         "native_jsonl_sha256": sha256_file(native_path),
         "plan": str(plan_path),
         "plan_sha256": sha256_file(plan_path),
+        "best_csv": str(best_path),
+        "best_csv_sha256": sha256_file(best_path),
+        "program": {"path": str(SCRIPT_PATH), "sha256": sha256_file(SCRIPT_PATH)},
+        "dependencies": {
+            "clean_v28_common": {
+                "path": str(REPO_ROOT / "paper_clean_v28" / "clean_v28_common.py"),
+                "sha256": sha256_file(REPO_ROOT / "paper_clean_v28" / "clean_v28_common.py"),
+            },
+            "model_utils": {
+                "path": str(REPO_ROOT / "model_utils.py"),
+                "sha256": sha256_file(REPO_ROOT / "model_utils.py"),
+            },
+            "nmethyl_config": {
+                "path": str(REPO_ROOT / "nmethyl" / "utils" / "nmethyl_config.py"),
+                "sha256": sha256_file(REPO_ROOT / "nmethyl" / "utils" / "nmethyl_config.py"),
+            },
+        },
+        "inputs": {
+            "model": {"path": str(model_path), "sha256": sha256_file(model_path)},
+            "test_jsonl": {"path": str(test_path), "sha256": sha256_file(test_path)},
+            "native_jsonl": {"path": str(native_path), "sha256": sha256_file(native_path)},
+            "best_csv": {"path": str(best_path), "sha256": sha256_file(best_path)},
+            "plan": {"path": str(plan_path), "sha256": sha256_file(plan_path)},
+        },
         "decoder_order_only_heldout": decoder_summary,
         "cyclic_representation_ensemble_heldout": representation_summary,
         "cyclic_representation_release_floor_heldout": release_floor_summary,

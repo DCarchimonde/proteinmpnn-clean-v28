@@ -2,24 +2,29 @@
 
 本仓库用于 clean V28 结果交接。
 
-## 当前17×100流程：V9循环稳定性修复（需GPU实跑验收）
+## 当前入口：V10 循环稳定、RMSD 优先、17×100 与单体重算
 
-V8根因已经定位：训练每个循环起点只见一个decoder order，而部署对全部
-decoder orders求均值；旧3AV候选还出现4,080/4,080最高甲基化位点集中在第7位。
-V9修复完整物理起点×完整decoder-order训练网格，并在最终候选层硬执行
-`round(min_probability, 8) > 0.6`、零跨起点分歧、17×100精确配额、去重和
-单点/单残基不超过80%的集中度门。它不会把旧V8池过滤后冒充新结果。
+V8 的训练、部署和释放合同存在确定错误；旧 6,964 条候选中有 5,196 条跨循环
+表示发生 `0.6` 阈值分歧。V10 从原始 `frankenstein_v28.pt` 重新训练甲基
+expert heads，硬执行 `round(min_probability, 8) > 0.6`、零分歧、严格去重和
+证据感知的塌缩门；每靶点先取得至少 500 条严格候选，最终 100 条只能来自
+去重后不少于 400 条池的 RMSD-priority 前四分位。旧 V8 候选不会混入新结果。
+
+六个非 3AV 复合物旧结果的主要瓶颈是环肽 pose，而非全复合物 global RMSD。
+V10 因而增加冻结的、按 target 留一外验证的低容量 RMSD 优先排序器，并重跑
+151 个单体的序列/甲基化/循环表示指标。该排序分数只用于结构预测前优先级，
+真正的 RMSD 改善必须等尚哥返回新结构后按同一协议复算。
 
 在Linux/CUDA环境运行：
 
 ```bash
-bash run_cyclic_stability_v9_1700.sh
+bash run_v10_rmsd_aware_1700_and_monomer.sh
 ```
 
-注意：当前分支修好的是训练/释放合同；新checkpoint是否真正消除位点塌缩，
-必须由这次GPU实跑的17靶点审计证明。151-record集合仅是内部开发安全审计，
-不是论文blind outer test。完整说明见
-`V9_CYCLIC_STABILITY_17X100_运行与验收.md`。
+当前 GitHub 只保存代码和冻结输入，不保存被忽略的 AutoDL GPU 输出，也不包含
+新 PDB。全部机器边界、放行门和 Windows 后续命令见
+`V10_TASK2_TASK3_运行与验收.md`。`run_cyclic_stability_v9_1700.sh` 与
+`V9_CYCLIC_STABILITY_17X100_运行与验收.md` 仅保留为历史版本。
 
 ## 给师兄的文件
 
@@ -30,7 +35,8 @@ paper_clean_v28_outputs/monomer_design_structure_manifest.csv
 nmethyl_data/test_set/test.jsonl
 ```
 
-复合物不用重新预测结构，复用之前结果。
+以下“复用旧复合物结构”只适用于历史 V28 结果；V10 新生成的 1,700 条必须
+重新预测结构，不能复用旧 PDB。
 
 复合物对齐文件：
 
@@ -39,9 +45,9 @@ paper_clean_v28_outputs/generated_fasta_clean_auto_single/all_designs.csv
 paper_clean_v28_outputs/af3_manifest.csv
 ```
 
-## 当前恢复流程：Ser 来源质控、循环起点不变性、结构先行（V8）
+## 历史恢复流程：Ser 来源质控、循环起点不变性、结构先行（V8）
 
-当前只运行：
+以下入口只为历史复现保留，**不要用于当前 Task 2/3**：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\paper_clean_v28\run_serine_qc_source_scoped_hybrid_v8.ps1

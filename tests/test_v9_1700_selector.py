@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import importlib.util
+import inspect
 import json
 import math
 import sys
@@ -343,9 +344,10 @@ class DeduplicationAndSelectionTests(unittest.TestCase):
         )
 
     def test_selection_searches_the_complete_scored_pool(self):
-        source = Path(selector.__file__).read_text(encoding="utf-8")
-        self.assertIn("frontier = ranked", source)
-        self.assertNotIn("ranked[: max(quota, quota * frontier_multiplier)]", source)
+        source = inspect.getsource(selector.select_diverse)
+        self.assertIn("if rmsd_mode", source)
+        self.assertIn("else ranked", source)
+        self.assertNotIn("quota * frontier_multiplier", source)
 
     def test_external_exclusion_canonicalizes_forward_rotation(self):
         with tempfile.TemporaryDirectory() as temp_name:

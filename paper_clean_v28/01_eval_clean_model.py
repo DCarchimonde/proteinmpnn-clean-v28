@@ -22,6 +22,10 @@ import os
 os.environ["OMP_NUM_THREADS"] = "1"
 
 import argparse
+import hashlib
+import random
+import sys
+from pathlib import Path
 from typing import List, Dict, Any
 
 import numpy as np
@@ -41,6 +45,7 @@ from clean_v28_common import (
     naturalize_tensor_for_input,
     binary_metrics,
     roc_auc_score_simple,
+    average_precision_score_simple,
 )
 
 
@@ -75,6 +80,14 @@ def safe_expert_gather(logits_experts: torch.Tensor, index_tensor: torch.Tensor)
     safe_index = index_tensor.clone()
     safe_index[(safe_index < 0) | (safe_index >= N_NATURAL)] = 0
     return torch.gather(logits_experts, -1, safe_index.unsqueeze(-1)).squeeze(-1)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def run_input_mode(model, loader, device, args, input_mode: str, thresholds: List[float]):
@@ -189,6 +202,8 @@ def run_input_mode(model, loader, device, args, input_mode: str, thresholds: Lis
 
     auc_known = roc_auc_score_simple(y_true, prob_known)
     auc_e2e = roc_auc_score_simple(y_true, prob_e2e)
+    average_precision_known = average_precision_score_simple(y_true, prob_known)
+    average_precision_e2e = average_precision_score_simple(y_true, prob_e2e)
 
     summary = {
         "input_mode": input_mode,
@@ -202,6 +217,8 @@ def run_input_mode(model, loader, device, args, input_mode: str, thresholds: Lis
         "base_recovery": base_recovery,
         "known_sequence_auc": auc_known,
         "end_to_end_auc": auc_e2e,
+        "known_sequence_average_precision": average_precision_known,
+        "end_to_end_average_precision": average_precision_e2e,
         "known_sequence_best_by_f1": best_row(known_rows, "f1"),
         "end_to_end_best_by_f1": best_row(e2e_rows, "f1"),
     }
@@ -218,12 +235,28 @@ def main():
     parser.add_argument("--max_peptide_len", type=int, default=30)
     parser.add_argument("--chain_ids", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help=(
+            "Deterministic decoder-order seed. Use the same value when comparing "
+            "the frozen parent checkpoint with a retrained expert-head checkpoint."
+        ),
+    )
     parser.add_argument("--thresholds", type=str, default="0.3,0.4,0.5,0.6,0.7,0.8,0.9,0.95,0.98,0.99")
     parser.add_argument("--out_dir", required=True)
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
     thresholds = [float(x) for x in args.thresholds.split(",") if x.strip()]
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("=" * 100)
@@ -232,6 +265,7 @@ def main():
     print(f"模型: {args.model_path}")
     print(f"数据: {args.data_jsonl}")
     print(f"设备: {device}")
+    print(f"确定性随机种子: {args.seed}")
     print(f"评价链: {args.eval_chains}")
     print(f"输出目录: {args.out_dir}")
 
@@ -265,16 +299,86 @@ def main():
         print(f"  已知序列最佳 F1: {summary['known_sequence_best_by_f1'].get('f1', 0) * 100:.2f}%")
         print(f"  端到端最佳 F1: {summary['end_to_end_best_by_f1'].get('f1', 0) * 100:.2f}%")
 
-    write_json(os.path.join(args.out_dir, "summary.json"), summaries)
-    write_csv(os.path.join(args.out_dir, "position_predictions.csv"), all_positions)
-    write_csv(os.path.join(args.out_dir, "sample_manifest.csv"), all_metas)
-    write_csv(os.path.join(args.out_dir, "threshold_metrics.csv"), all_thresholds)
+    out_dir = Path(args.out_dir).resolve()
+    summary_path = out_dir / "summary.json"
+    position_path = out_dir / "position_predictions.csv"
+    sample_path = out_dir / "sample_manifest.csv"
+    threshold_path = out_dir / "threshold_metrics.csv"
+    write_json(str(summary_path), summaries)
+    write_csv(str(position_path), all_positions)
+    write_csv(str(sample_path), all_metas)
+    write_csv(str(threshold_path), all_thresholds)
+    model_path = Path(args.model_path).resolve()
+    data_path = Path(args.data_jsonl).resolve()
+    program_path = Path(__file__).resolve()
+    quality_checks = {
+        "three_input_modes_were_evaluated": len(summaries) == 3,
+        "position_output_is_nonempty": bool(all_positions),
+        "sample_manifest_is_nonempty": bool(all_metas),
+        "threshold_output_is_nonempty": bool(all_thresholds),
+        "all_named_artifacts_exist_and_are_nonempty": all(
+            path.is_file() and path.stat().st_size > 0
+            for path in (summary_path, position_path, sample_path, threshold_path)
+        ),
+    }
+    eval_manifest = {
+        "quality_gate": "PASS" if all(quality_checks.values()) else "FAIL",
+        "protocol": "clean_v28_three_input_mode_evaluation_provenance_v2_deterministic",
+        "quality_checks": quality_checks,
+        "mode": args.mode,
+        "eval_chains": args.eval_chains,
+        "thresholds": thresholds,
+        "seed": int(args.seed),
+        "batch_size": int(args.batch_size),
+        "deterministic_cudnn": True,
+        "python_version": sys.version.split()[0],
+        "torch_version": torch.__version__,
+        "program": {"path": str(program_path), "sha256": sha256_file(program_path)},
+        "dependencies": {
+            "clean_v28_common": {
+                "path": str(program_path.with_name("clean_v28_common.py")),
+                "sha256": sha256_file(program_path.with_name("clean_v28_common.py")),
+            },
+            "model_utils": {
+                "path": str(program_path.parent.parent / "model_utils.py"),
+                "sha256": sha256_file(program_path.parent.parent / "model_utils.py"),
+            },
+            "nmethyl_config": {
+                "path": str(
+                    program_path.parent.parent
+                    / "nmethyl"
+                    / "utils"
+                    / "nmethyl_config.py"
+                ),
+                "sha256": sha256_file(
+                    program_path.parent.parent
+                    / "nmethyl"
+                    / "utils"
+                    / "nmethyl_config.py"
+                ),
+            },
+        },
+        "inputs": {
+            "model": {"path": str(model_path), "sha256": sha256_file(model_path)},
+            "data_jsonl": {"path": str(data_path), "sha256": sha256_file(data_path)},
+        },
+        "artifacts": {
+            "summary": {"path": str(summary_path), "sha256": sha256_file(summary_path)},
+            "position_predictions": {"path": str(position_path), "sha256": sha256_file(position_path)},
+            "sample_manifest": {"path": str(sample_path), "sha256": sha256_file(sample_path)},
+            "threshold_metrics": {"path": str(threshold_path), "sha256": sha256_file(threshold_path)},
+        },
+    }
+    write_json(str(out_dir / "eval_manifest.json"), eval_manifest)
+    if eval_manifest["quality_gate"] != "PASS":
+        raise RuntimeError("Evaluation provenance manifest failed")
 
     print("\n完成。输出文件：")
     print(os.path.join(args.out_dir, "summary.json"))
     print(os.path.join(args.out_dir, "position_predictions.csv"))
     print(os.path.join(args.out_dir, "sample_manifest.csv"))
     print(os.path.join(args.out_dir, "threshold_metrics.csv"))
+    print(os.path.join(args.out_dir, "eval_manifest.json"))
     print("\n论文主口径建议优先看 strict_naturalized_input 下的 known_sequence_methylation。")
 
 

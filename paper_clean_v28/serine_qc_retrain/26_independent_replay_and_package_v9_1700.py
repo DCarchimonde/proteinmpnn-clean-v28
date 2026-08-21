@@ -1278,6 +1278,17 @@ def main() -> None:
         "device": str(device),
         "python_version": platform.python_version(),
         "torch_version": torch.__version__,
+        "program": {"path": str(SCRIPT_PATH), "sha256": sha256_file(SCRIPT_PATH)},
+        "dependencies": {
+            "generator_module": {
+                "path": str(GENERATOR_PATH),
+                "sha256": sha256_file(GENERATOR_PATH),
+            },
+            "cyclic_base_scorer_module": {
+                "path": str(SCORER_PATH),
+                "sha256": sha256_file(SCORER_PATH),
+            },
+        },
         "inputs": inputs,
     }
     if quality_gate != "PASS":

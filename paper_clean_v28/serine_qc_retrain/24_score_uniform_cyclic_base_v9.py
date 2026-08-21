@@ -137,6 +137,213 @@ def text_sha256(values: Sequence[str]) -> str:
     return digest.hexdigest()
 
 
+def torch_runtime_contract(torch_module: Any, device: Any) -> Dict[str, Any]:
+    """Capture every runtime switch that may change persisted numeric scores."""
+    device_type = str(getattr(device, "type", str(device).split(":", 1)[0]))
+    cuda_active = device_type == "cuda"
+    cuda = getattr(torch_module, "cuda", None)
+    backend = getattr(torch_module, "backends", None)
+    cudnn = getattr(backend, "cudnn", None)
+    cuda_backend = getattr(backend, "cuda", None)
+    matmul_backend = getattr(cuda_backend, "matmul", None)
+    gpu: Dict[str, Any] | None = None
+    if cuda_active:
+        device_index = getattr(device, "index", None)
+        if device_index is None:
+            device_index = int(cuda.current_device())
+        properties = cuda.get_device_properties(device_index)
+        gpu = {
+            "index": int(device_index),
+            "name": str(cuda.get_device_name(device_index)),
+            "capability": [
+                int(value) for value in cuda.get_device_capability(device_index)
+            ],
+            "total_memory": int(getattr(properties, "total_memory", -1)),
+            "multi_processor_count": int(
+                getattr(properties, "multi_processor_count", -1)
+            ),
+            "uuid": str(getattr(properties, "uuid", "")),
+        }
+    deterministic_warn_only = None
+    warn_only_reader = getattr(
+        torch_module, "is_deterministic_algorithms_warn_only_enabled", None
+    )
+    if callable(warn_only_reader):
+        deterministic_warn_only = bool(warn_only_reader())
+    float32_precision_reader = getattr(torch_module, "get_float32_matmul_precision", None)
+    return {
+        "python_implementation": platform.python_implementation(),
+        "python_version": platform.python_version(),
+        "torch_version": str(torch_module.__version__),
+        "torch_cuda_version": str(getattr(torch_module.version, "cuda", None)),
+        "cudnn_version": (
+            int(cudnn.version())
+            if cudnn is not None and cudnn.version() is not None
+            else None
+        ),
+        "device": str(device),
+        "device_type": device_type,
+        "gpu": gpu,
+        "deterministic": {
+            "algorithms_enabled": bool(
+                torch_module.are_deterministic_algorithms_enabled()
+            ),
+            "algorithms_warn_only": deterministic_warn_only,
+            "cudnn_deterministic": bool(getattr(cudnn, "deterministic", False)),
+            "cudnn_benchmark": bool(getattr(cudnn, "benchmark", False)),
+            "cudnn_allow_tf32": bool(getattr(cudnn, "allow_tf32", False)),
+            "cuda_matmul_allow_tf32": bool(
+                getattr(matmul_backend, "allow_tf32", False)
+            ),
+            "float32_matmul_precision": (
+                str(float32_precision_reader())
+                if callable(float32_precision_reader)
+                else None
+            ),
+            "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+            "pythonhashseed": os.environ.get("PYTHONHASHSEED"),
+        },
+    }
+
+
+def scoring_input_records(
+    *,
+    candidate_path: Path,
+    baseline_path: Path,
+    model_path: Path,
+    generation_manifest_path: Path,
+    audit_path: Path,
+    native_path: Path,
+    best_path: Path,
+    plan_path: Path,
+) -> Dict[str, Dict[str, str]]:
+    """Build path-bound records used by the runner's PASS-cache validator."""
+    return {
+        "candidate_csv": {
+            "path": str(candidate_path),
+            "sha256": sha256_file(candidate_path),
+        },
+        "baseline_csv": {
+            "path": str(baseline_path),
+            "sha256": sha256_file(baseline_path),
+        },
+        "model": {"path": str(model_path), "sha256": sha256_file(model_path)},
+        "generation_manifest": {
+            "path": str(generation_manifest_path),
+            "sha256": sha256_file(generation_manifest_path),
+        },
+        "representation_audit": {
+            "path": str(audit_path),
+            "sha256": sha256_file(audit_path),
+        },
+        "native_jsonl": {
+            "path": str(native_path),
+            "sha256": sha256_file(native_path),
+        },
+        "best_csv": {"path": str(best_path), "sha256": sha256_file(best_path)},
+        "plan": {"path": str(plan_path), "sha256": sha256_file(plan_path)},
+    }
+
+
+def target_checkpoint_is_reusable(
+    checkpoint: Mapping[str, Any],
+    *,
+    target: str,
+    config_sha256: str,
+    program_hashes: Mapping[str, str],
+    runtime_contract: Mapping[str, Any],
+    scoring_parameters: Mapping[str, Any],
+    sequence_set_sha256: str,
+    sequences: Sequence[str],
+) -> bool:
+    scores = checkpoint.get("scores")
+    return bool(
+        checkpoint.get("protocol") == SCORE_PROTOCOL
+        and checkpoint.get("target_name") == target
+        and checkpoint.get("config_sha256") == config_sha256
+        and all(
+            checkpoint.get(name) == value for name, value in program_hashes.items()
+        )
+        and checkpoint.get("runtime_contract") == dict(runtime_contract)
+        and checkpoint.get("scoring_parameters") == dict(scoring_parameters)
+        and checkpoint.get("sequence_set_sha256") == sequence_set_sha256
+        and int(checkpoint.get("sequence_count", -1)) == len(sequences)
+        and isinstance(scores, dict)
+        and set(scores) == set(sequences)
+        and all(
+            score_payload_is_valid(sequence, scores[sequence])
+            for sequence in sequences
+        )
+    )
+
+
+def score_payload_is_valid(sequence: str, payload: object) -> bool:
+    """Reject truncated, non-finite, or internally inconsistent score caches."""
+    if not isinstance(payload, Mapping):
+        return False
+    length = len(sequence)
+    try:
+        matrix = json.loads(
+            str(payload["cyclic_base_log_probability_start_by_decoder_order"])
+        )
+        by_start = json.loads(str(payload["cyclic_base_log_probability_by_start"]))
+        if not (
+            payload.get("cyclic_base_score_protocol") == SCORE_PROTOCOL
+            and int(payload.get("cyclic_base_physical_start_count", -1)) == length
+            and int(payload.get("cyclic_base_decoder_order_count_per_start", -1))
+            == length
+            and int(payload.get("cyclic_base_total_ensemble_size", -1))
+            == length * length
+            and isinstance(matrix, list)
+            and len(matrix) == length
+            and all(isinstance(row, list) and len(row) == length for row in matrix)
+            and isinstance(by_start, list)
+            and len(by_start) == length
+        ):
+            return False
+        matrix_values = [[float(value) for value in row] for row in matrix]
+        start_values = [float(value) for value in by_start]
+        scalars = {
+            "mean": float(payload["cyclic_base_log_probability_mean"]),
+            "minimum": float(payload["cyclic_base_log_probability_min"]),
+            "maximum": float(payload["cyclic_base_log_probability_max"]),
+            "span": float(payload["cyclic_base_log_probability_span"]),
+            "std": float(payload["cyclic_base_log_probability_std"]),
+        }
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not all(
+        math.isfinite(value)
+        for value in [
+            *[item for row in matrix_values for item in row],
+            *start_values,
+            *scalars.values(),
+        ]
+    ):
+        return False
+    recomputed_by_start = [sum(row) / length for row in matrix_values]
+    mean = sum(recomputed_by_start) / length
+    minimum = min(recomputed_by_start)
+    maximum = max(recomputed_by_start)
+    std = math.sqrt(
+        sum((value - mean) ** 2 for value in recomputed_by_start) / length
+    )
+    expected_scalars = {
+        "mean": mean,
+        "minimum": minimum,
+        "maximum": maximum,
+        "span": maximum - minimum,
+        "std": std,
+    }
+    return all(
+        math.isclose(observed, expected, rel_tol=1e-12, abs_tol=1e-12)
+        for observed, expected in zip(start_values, recomputed_by_start)
+    ) and all(
+        math.isclose(scalars[name], expected, rel_tol=1e-12, abs_tol=1e-12)
+        for name, expected in expected_scalars.items()
+    )
+
+
 def batches(values: Sequence[str], batch_size: int) -> Iterable[List[str]]:
     for start in range(0, len(values), batch_size):
         yield list(values[start : start + batch_size])
@@ -348,6 +555,14 @@ def main() -> None:
     if args.device == "cpu" and not args.allow_cpu:
         raise RuntimeError("CPU scoring requires explicit --allow-cpu")
     device = torch.device(args.device)
+    runtime_contract = torch_runtime_contract(torch, device)
+    scoring_parameters = {
+        "batch_size": int(args.batch_size),
+        "device_argument": str(args.device),
+        "allow_cpu": bool(args.allow_cpu),
+        "floor_policy": FLOOR_POLICY,
+        "floor_fraction": FLOOR_FRACTION,
+    }
 
     generator = load_generator()
     clean_dir = REPO_ROOT / "paper_clean_v28"
@@ -487,6 +702,19 @@ def main() -> None:
     enriched: List[Dict[str, Any]] = []
     summary_rows: List[Dict[str, Any]] = []
     checkpoint_artifacts: List[Dict[str, Any]] = []
+    checkpoint_program_hashes = {
+        "scorer_program_sha256": sha256_file(SCRIPT_PATH),
+        "generator_dependency_sha256": sha256_file(GENERATOR_PATH),
+        "clean_v28_common_dependency_sha256": sha256_file(
+            REPO_ROOT / "paper_clean_v28" / "clean_v28_common.py"
+        ),
+        "model_utils_dependency_sha256": sha256_file(
+            REPO_ROOT / "model_utils.py"
+        ),
+        "nmethyl_config_dependency_sha256": sha256_file(
+            REPO_ROOT / "nmethyl" / "utils" / "nmethyl_config.py"
+        ),
+    }
     checkpoint_config_sha256 = text_sha256(
         [
             SCORE_PROTOCOL,
@@ -497,7 +725,12 @@ def main() -> None:
             sha256_file(baseline_path),
             sha256_file(native_path),
             sha256_file(best_path),
-            str(args.batch_size),
+            json.dumps(scoring_parameters, sort_keys=True, separators=(",", ":")),
+            json.dumps(runtime_contract, sort_keys=True, separators=(",", ":")),
+            *[
+                f"{name}={value}"
+                for name, value in sorted(checkpoint_program_hashes.items())
+            ],
         ]
     )
     for target in target_names:
@@ -508,14 +741,15 @@ def main() -> None:
         checkpoint_path = checkpoint_dir / f"{target.lower()}_exact_base.json.gz"
         if checkpoint_path.is_file():
             checkpoint = read_gzip_json(checkpoint_path)
-            if not (
-                checkpoint.get("protocol") == SCORE_PROTOCOL
-                and checkpoint.get("target_name") == target
-                and checkpoint.get("config_sha256") == checkpoint_config_sha256
-                and checkpoint.get("sequence_set_sha256") == union_sha256
-                and int(checkpoint.get("sequence_count", -1)) == len(union)
-                and isinstance(checkpoint.get("scores"), dict)
-                and set(checkpoint["scores"]) == set(union)
+            if not target_checkpoint_is_reusable(
+                checkpoint,
+                target=target,
+                config_sha256=checkpoint_config_sha256,
+                program_hashes=checkpoint_program_hashes,
+                runtime_contract=runtime_contract,
+                scoring_parameters=scoring_parameters,
+                sequence_set_sha256=union_sha256,
+                sequences=union,
             ):
                 raise RuntimeError(
                     f"Target checkpoint is stale or malformed; use --overwrite: {checkpoint_path}"
@@ -530,6 +764,9 @@ def main() -> None:
                     "protocol": SCORE_PROTOCOL,
                     "target_name": target,
                     "config_sha256": checkpoint_config_sha256,
+                    **checkpoint_program_hashes,
+                    "runtime_contract": runtime_contract,
+                    "scoring_parameters": scoring_parameters,
                     "sequence_set_sha256": union_sha256,
                     "sequence_count": len(union),
                     "scores": score,
@@ -598,16 +835,40 @@ def main() -> None:
         "device": str(device),
         "python_version": platform.python_version(),
         "torch_version": torch.__version__,
+        "runtime_contract": runtime_contract,
+        "scoring_parameters": scoring_parameters,
+        "checkpoint_config_sha256": checkpoint_config_sha256,
         "model_sha256": model_sha256,
         "plan_sha256": plan_sha256,
-        "inputs": {
-            "candidate_csv": {"path": str(candidate_path), "sha256": sha256_file(candidate_path)},
-            "baseline_csv": {"path": str(baseline_path), "sha256": sha256_file(baseline_path)},
-            "generation_manifest": {"path": str(generation_manifest_path), "sha256": sha256_file(generation_manifest_path)},
-            "representation_audit": {"path": str(audit_path), "sha256": sha256_file(audit_path)},
-            "native_jsonl": {"path": str(native_path), "sha256": sha256_file(native_path)},
-            "best_csv": {"path": str(best_path), "sha256": sha256_file(best_path)},
+        "program": {"path": str(SCRIPT_PATH), "sha256": sha256_file(SCRIPT_PATH)},
+        "dependencies": {
+            "generator_module": {
+                "path": str(GENERATOR_PATH),
+                "sha256": sha256_file(GENERATOR_PATH),
+            },
+            "clean_v28_common": {
+                "path": str(REPO_ROOT / "paper_clean_v28" / "clean_v28_common.py"),
+                "sha256": sha256_file(REPO_ROOT / "paper_clean_v28" / "clean_v28_common.py"),
+            },
+            "model_utils": {
+                "path": str(REPO_ROOT / "model_utils.py"),
+                "sha256": sha256_file(REPO_ROOT / "model_utils.py"),
+            },
+            "nmethyl_config": {
+                "path": str(REPO_ROOT / "nmethyl" / "utils" / "nmethyl_config.py"),
+                "sha256": sha256_file(REPO_ROOT / "nmethyl" / "utils" / "nmethyl_config.py"),
+            },
         },
+        "inputs": scoring_input_records(
+            candidate_path=candidate_path,
+            baseline_path=baseline_path,
+            model_path=model_path,
+            generation_manifest_path=generation_manifest_path,
+            audit_path=audit_path,
+            native_path=native_path,
+            best_path=best_path,
+            plan_path=plan_path,
+        ),
         "target_summary": summary_rows,
         "target_checkpoints": checkpoint_artifacts,
         "artifacts": {

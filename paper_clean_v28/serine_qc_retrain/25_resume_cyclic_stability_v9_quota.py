@@ -35,6 +35,7 @@ def load_engine():
 
 def main() -> None:
     engine = load_engine()
+    engine.ENTRYPOINT_PATH = SCRIPT_PATH
     engine.DEFAULT_PLAN = SCRIPT_PATH.with_name(
         "target_plan_cyclic_stability_v9_1700.json"
     )

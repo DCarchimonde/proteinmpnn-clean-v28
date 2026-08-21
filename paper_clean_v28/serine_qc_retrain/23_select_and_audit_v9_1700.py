@@ -56,6 +56,15 @@ CYCLIC_BASE_FLOOR_POLICY = (
     "per_target_bottom_1pct_current_pool_outlier_filter_"
     "not_independent_calibration_v9"
 )
+RMSD_RANKER_PROTOCOL = "rmsd_priority_ranker_v10_six_target_loto_v1"
+RMSD_SELECTION_OVERLAY = "rmsd_priority_first_with_evidence_aware_position_gate_v10"
+RMSD_VALIDATED_TOP_FRACTION = 0.25
+RMSD_DEVELOPMENT_SHA256 = (
+    "d754c905e00d03c18ce0610b740c9bd6da09ee0a9e9d5d7ce953dc73d86aad05"
+)
+V10_POSITION_POLICY_SHA256 = (
+    "28b41461138cd719dc0f8e0210e35071fbbb3c3ec7ad13a0f03bd12baff1744b"
+)
 KNOWN_OUTPUTS = (
     "1700_详细审计.csv",
     "1700_给尚哥_极简.csv",
@@ -652,6 +661,18 @@ def exclusion_keys(paths: Sequence[Path]) -> Tuple[set[Tuple[str, str]], set[Tup
 
 
 def quality_key(row: Mapping[str, Any]) -> Tuple[Any, ...]:
+    try:
+        rmsd_lt5 = float(row.get("_rmsd_lt5_score", "nan"))
+    except (TypeError, ValueError):
+        rmsd_lt5 = math.nan
+    if math.isfinite(rmsd_lt5):
+        return (
+            -rmsd_lt5,
+            -float(row["_base_score"]),
+            -float(row["_release_floor"]),
+            float(row["_representation_span"]),
+            str(row["candidate_id"]),
+        )
     return (
         -float(row["_base_score"]),
         -float(row["_release_floor"]),
@@ -677,8 +698,37 @@ def projected_site_share(
     return max(projected.values(), default=0) / denominator if denominator else 0.0
 
 
+def projected_dominant(
+    counts: Mapping[Any, int], values: Sequence[Any]
+) -> Tuple[Any | None, float]:
+    projected = Counter(counts)
+    projected.update(values)
+    denominator = sum(projected.values())
+    if not projected or denominator <= 0:
+        return None, 0.0
+    maximum = max(projected.values())
+    dominant = min(key for key, count in projected.items() if count == maximum)
+    return dominant, maximum / denominator
+
+
+def evidence_aware_position_pass(
+    counts: Mapping[int, int], supported_positions: Sequence[int]
+) -> bool:
+    if not counts:
+        return False
+    maximum = max(counts.values())
+    share = maximum / sum(counts.values())
+    dominant_positions = {position for position, count in counts.items() if count == maximum}
+    return share <= MAX_POSITION_SHARE or bool(
+        dominant_positions & {int(value) for value in supported_positions}
+    )
+
+
 def select_diverse(
-    rows: Sequence[Dict[str, Any]], quota: int, frontier_multiplier: int
+    rows: Sequence[Dict[str, Any]],
+    quota: int,
+    frontier_multiplier: int,
+    supported_positions: Sequence[int] = (),
 ) -> List[Dict[str, Any]]:
     ranked = deduplicate_cyclic(rows)
     # Historical selectors searched only the top ``quota * multiplier`` rows.
@@ -687,7 +737,19 @@ def select_diverse(
     # selection must consider the complete deterministic pool; the retained
     # argument is metadata/backward CLI compatibility only.
     del frontier_multiplier
-    frontier = ranked
+    rmsd_mode = bool(ranked) and all(
+        math.isfinite(float(row.get("_rmsd_lt5_score", "nan"))) for row in ranked
+    )
+    frontier = (
+        ranked[
+            : max(
+                quota,
+                int(math.ceil(len(ranked) * RMSD_VALIDATED_TOP_FRACTION)),
+            )
+        ]
+        if rmsd_mode
+        else ranked
+    )
     selected: List[Dict[str, Any]] = []
     site_counts: Counter[int] = Counter()
     primary_counts: Counter[int] = Counter()
@@ -697,6 +759,7 @@ def select_diverse(
     total_sites = 0
     remaining = list(frontier)
     rank_index = {id(row): index for index, row in enumerate(frontier)}
+    supported = {int(value) for value in supported_positions}
     while remaining and len(selected) < quota:
         def selection_balance_key(row: Mapping[str, Any]) -> Tuple[Any, ...]:
             sequence = str(row["design_seq"])
@@ -718,6 +781,42 @@ def select_diverse(
                 len(selected),
                 [int(row["release_min_argmax_position_1based"])],
             )
+            if rmsd_mode:
+                projected_position_maps = (
+                    (site_counts, positions),
+                    (primary_counts, [int(row["_primary_methyl_position"])]),
+                    (
+                        ranking_mean_argmax_counts,
+                        [int(row["ranking_mean_argmax_position_1based"])],
+                    ),
+                    (
+                        release_min_argmax_counts,
+                        [int(row["release_min_argmax_position_1based"])],
+                    ),
+                )
+                position_violations = []
+                for counts, new_values in projected_position_maps:
+                    dominant, share = projected_dominant(counts, new_values)
+                    position_violations.append(
+                        max(0.0, share - MAX_POSITION_SHARE)
+                        if dominant not in supported
+                        else 0.0
+                    )
+                residue_excess = max(0.0, projected_residues - MAX_POSITION_SHARE)
+                excesses = [*position_violations, residue_excess]
+                # Scientific priority is the frozen RMSD rank.  It is only
+                # overridden when needed to satisfy a non-exempt collapse gate.
+                return (
+                    sum(value > 0.0 for value in excesses),
+                    max(excesses, default=0.0),
+                    rank_index[id(row)],
+                    max(
+                        projected_sites,
+                        projected_residues,
+                        projected_mean_argmax,
+                        projected_min_argmax,
+                    ),
+                )
             return (
                 max(
                     projected_sites,
@@ -766,6 +865,7 @@ def target_summary(
     valid_pool: Sequence[Mapping[str, Any]],
     selected: Sequence[Mapping[str, Any]],
     quota: int,
+    supported_positions: Sequence[int] = (),
 ) -> Dict[str, Any]:
     sites: Counter[int] = Counter()
     residues: Counter[str] = Counter()
@@ -798,6 +898,38 @@ def target_summary(
         max(residues.values(), default=0) / total_sites if total_sites else 0.0
     )
     natural_sequences = [str(row["design_natural_seq"]) for row in selected]
+    position_checks = {
+        "all_methyl_sites": evidence_aware_position_pass(sites, supported_positions),
+        "primary_position": evidence_aware_position_pass(primary, supported_positions),
+        "ranking_mean_argmax": evidence_aware_position_pass(
+            ranking_mean_argmax, supported_positions
+        ),
+        "release_min_argmax": evidence_aware_position_pass(
+            release_min_argmax, supported_positions
+        ),
+    }
+    valid_rmsd_scores = [
+        float(row["_rmsd_lt5_score"])
+        for row in valid_pool
+        if math.isfinite(float(row.get("_rmsd_lt5_score", "nan")))
+    ]
+    selected_rmsd_scores = [
+        float(row["_rmsd_lt5_score"])
+        for row in selected
+        if math.isfinite(float(row.get("_rmsd_lt5_score", "nan")))
+    ]
+    rmsd_ranked_pool = (
+        sorted(valid_pool, key=quality_key) if selected_rmsd_scores else []
+    )
+    rmsd_validated_frontier_rows = (
+        int(math.ceil(len(rmsd_ranked_pool) * RMSD_VALIDATED_TOP_FRACTION))
+        if selected_rmsd_scores
+        else 0
+    )
+    rmsd_validated_frontier_ids = {
+        str(row["candidate_id"])
+        for row in rmsd_ranked_pool[:rmsd_validated_frontier_rows]
+    }
     pairwise_identities: List[float] = []
     for left_index, left in enumerate(natural_sequences):
         for right in natural_sequences[left_index + 1 :]:
@@ -835,11 +967,46 @@ def target_summary(
             bool(selected) and maximum_residue_share <= MAX_POSITION_SHARE
         ),
         "position_concentration_pass": (
+            bool(selected) and all(position_checks.values())
+        ),
+        "position_concentration_policy": (
+            "evidence_aware_historical_joint_lt5_support"
+            if supported_positions
+            else "strict_maximum_0.80_no_historical_exemption"
+        ),
+        "historically_supported_high_concentration_positions_1based": json.dumps(
+            sorted({int(value) for value in supported_positions})
+        ),
+        "position_concentration_component_checks": json.dumps(
+            position_checks, sort_keys=True
+        ),
+        "rmsd_priority_pool_score_mean": (
+            sum(valid_rmsd_scores) / len(valid_rmsd_scores)
+            if valid_rmsd_scores
+            else ""
+        ),
+        "rmsd_priority_selected_score_min": (
+            min(selected_rmsd_scores) if selected_rmsd_scores else ""
+        ),
+        "rmsd_priority_selected_score_mean": (
+            sum(selected_rmsd_scores) / len(selected_rmsd_scores)
+            if selected_rmsd_scores
+            else ""
+        ),
+        "rmsd_priority_selected_score_max": (
+            max(selected_rmsd_scores) if selected_rmsd_scores else ""
+        ),
+        "rmsd_priority_validated_top_fraction": (
+            RMSD_VALIDATED_TOP_FRACTION if selected_rmsd_scores else ""
+        ),
+        "rmsd_priority_validated_frontier_rows": rmsd_validated_frontier_rows,
+        "rmsd_priority_selected_all_within_validated_top_quartile": (
             bool(selected)
-            and maximum_site_share <= MAX_POSITION_SHARE
-            and maximum_primary_share <= MAX_POSITION_SHARE
-            and maximum_ranking_mean_argmax_share <= MAX_POSITION_SHARE
-            and maximum_release_min_argmax_share <= MAX_POSITION_SHARE
+            and bool(selected_rmsd_scores)
+            and all(
+                str(row["candidate_id"]) in rmsd_validated_frontier_ids
+                for row in selected
+            )
         ),
         "maximum_pairwise_natural_identity": (
             max(pairwise_identities) if pairwise_identities else 0.0
@@ -986,6 +1153,129 @@ def verify_release_views(
     }
 
 
+def load_rmsd_priority_overlay(
+    scored_csv_path: Path,
+    ranker_manifest_path: Path,
+    candidate_path: Path,
+) -> Tuple[Dict[Tuple[str, str, str], Dict[str, Any]], Dict[str, List[int]], Dict[str, bool]]:
+    """Load the optional V10 ranker through a path-specific hash contract."""
+
+    manifest = read_json(ranker_manifest_path)
+    rows = read_csv(scored_csv_path)
+    inputs = manifest.get("inputs", {})
+    artifacts = manifest.get("artifacts", {})
+    development = inputs.get("development_csv", {}) if isinstance(inputs, Mapping) else {}
+    candidates = inputs.get("candidate_csv", {}) if isinstance(inputs, Mapping) else {}
+    scored_artifact = (
+        artifacts.get("scored_candidates", {}) if isinstance(artifacts, Mapping) else {}
+    )
+    manifest_checks = manifest.get("quality_checks", {})
+    checks = {
+        "v10_rmsd_ranker_manifest_is_authorized_pass": (
+            manifest.get("quality_gate") == "PASS"
+            and manifest.get("release_status")
+            == "AUTHORIZED_FOR_PRESTRUCTURE_PRIORITY_SELECTION"
+            and manifest.get("protocol") == RMSD_RANKER_PROTOCOL
+            and isinstance(manifest_checks, Mapping)
+            and bool(manifest_checks)
+            and all(value is True for value in manifest_checks.values())
+        ),
+        "v10_rmsd_development_is_frozen_476_bytes": (
+            isinstance(development, Mapping)
+            and development.get("sha256") == RMSD_DEVELOPMENT_SHA256
+        ),
+        "v10_rmsd_ranker_is_bound_to_exact_base_candidate_bytes": (
+            isinstance(candidates, Mapping)
+            and candidates.get("sha256") == sha256_file(candidate_path)
+        ),
+        "v10_rmsd_scored_csv_matches_its_named_manifest_artifact": (
+            isinstance(scored_artifact, Mapping)
+            and scored_artifact.get("sha256") == sha256_file(scored_csv_path)
+        ),
+    }
+    overlay: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    row_errors = False
+    for row in rows:
+        key = (
+            str(row.get("target_name", "")).strip().upper(),
+            str(row.get("candidate_id", "")).strip(),
+            str(row.get("design_natural_seq", "")).strip().upper(),
+        )
+        try:
+            lt5 = float(row.get("rmsd_priority_score_joint_lt5", "nan"))
+            lt3 = float(
+                row.get("rmsd_priority_score_joint_lt3_descriptive", "nan")
+            )
+            features = parse_json_list(
+                row.get("rmsd_priority_feature_vector", ""),
+                "rmsd_priority_feature_vector",
+            )
+            feature_values = [float(value) for value in features]
+            valid = (
+                all(key)
+                and key not in overlay
+                and math.isfinite(lt5)
+                and math.isfinite(lt3)
+                and 0.0 <= lt5 <= 1.0
+                and 0.0 <= lt3 <= 1.0
+                and len(feature_values) == 16
+                and all(math.isfinite(value) for value in feature_values)
+                and str(row.get("rmsd_priority_protocol", ""))
+                == RMSD_RANKER_PROTOCOL
+            )
+        except (TypeError, ValueError):
+            valid = False
+            lt5 = lt3 = math.nan
+            feature_values = []
+        if not valid:
+            row_errors = True
+            continue
+        overlay[key] = {
+            "rmsd_priority_protocol": RMSD_RANKER_PROTOCOL,
+            "rmsd_priority_primary_endpoint": str(
+                row.get("rmsd_priority_primary_endpoint", "")
+            ),
+            "rmsd_priority_score_joint_lt5": lt5,
+            "rmsd_priority_score_joint_lt3_descriptive": lt3,
+            "rmsd_priority_rank_within_target": int(
+                row.get("rmsd_priority_rank_within_target", -1)
+            ),
+            "rmsd_priority_feature_vector": json.dumps(
+                feature_values, separators=(",", ":")
+            ),
+            "rmsd_priority_warning": str(row.get("rmsd_priority_warning", "")),
+            "_rmsd_lt5_score": lt5,
+            "_rmsd_lt3_score": lt3,
+        }
+    checks["v10_rmsd_scored_rows_are_unique_finite_and_protocol_exact"] = (
+        bool(overlay) and not row_errors and len(overlay) == len(rows)
+    )
+    support_payload = manifest.get("historical_site_support", {})
+    supported_positions: Dict[str, List[int]] = {}
+    if isinstance(support_payload, Mapping):
+        for target, evidence in support_payload.items():
+            if not isinstance(evidence, Mapping):
+                continue
+            try:
+                supported_positions[str(target).upper()] = sorted(
+                    {
+                        int(value)
+                        for value in evidence.get(
+                            "supported_high_concentration_positions_1based", []
+                        )
+                    }
+                )
+            except (TypeError, ValueError):
+                checks["v10_historical_position_support_is_well_formed"] = False
+                break
+    checks.setdefault(
+        "v10_historical_position_support_is_well_formed",
+        set(supported_positions) == {"1SFI", "3P8F", "3WNE", "3ZGC", "4K1E", "4KEL"}
+        and all(supported_positions.values()),
+    )
+    return overlay, supported_positions, checks
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--candidates", required=True)
@@ -995,6 +1285,8 @@ def main() -> None:
     parser.add_argument("--plan", default=str(DEFAULT_PLAN))
     parser.add_argument("--model", required=True)
     parser.add_argument("--exclusion-csv", action="append", default=[])
+    parser.add_argument("--rmsd-priority-csv", default="")
+    parser.add_argument("--rmsd-priority-manifest", default="")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--quota-per-target", type=int, default=QUOTA)
     parser.add_argument(
@@ -1020,6 +1312,19 @@ def main() -> None:
     plan_path = Path(args.plan).resolve()
     model_path = Path(args.model).resolve()
     exclusion_paths = [Path(value).resolve() for value in args.exclusion_csv]
+    if bool(args.rmsd_priority_csv) != bool(args.rmsd_priority_manifest):
+        raise ValueError(
+            "--rmsd-priority-csv and --rmsd-priority-manifest must be supplied together"
+        )
+    risk_csv_path = (
+        Path(args.rmsd_priority_csv).resolve() if args.rmsd_priority_csv else None
+    )
+    risk_manifest_path = (
+        Path(args.rmsd_priority_manifest).resolve()
+        if args.rmsd_priority_manifest
+        else None
+    )
+    rmsd_mode = risk_csv_path is not None
     out_dir = Path(args.out_dir).resolve()
     prepare_output(out_dir, args.overwrite)
 
@@ -1086,18 +1391,65 @@ def main() -> None:
         and required_exclusion_hashes <= exclusion_hashes
     )
 
+    risk_overlay: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    supported_positions_by_target: Dict[str, List[int]] = {}
+    if risk_csv_path is not None and risk_manifest_path is not None:
+        risk_overlay, supported_positions_by_target, risk_checks = (
+            load_rmsd_priority_overlay(
+                risk_csv_path, risk_manifest_path, candidates_path
+            )
+        )
+        upstream_checks.update(risk_checks)
+        upstream_checks["generation_used_frozen_v10_evidence_aware_position_policy"] = (
+            manifest.get("position_concentration_policy_sha256")
+            == V10_POSITION_POLICY_SHA256
+            and manifest.get("annotation_stability_audit", {}).get(
+                "concentration_gate_policy"
+            )
+            == "historical_joint_lt5_supported_position_concentration_v10"
+        )
+        generation_policy = manifest.get("annotation_stability_audit", {}).get(
+            "position_concentration_policy", {}
+        )
+        generation_support = (
+            generation_policy.get("supported_positions_1based_by_target", {})
+            if isinstance(generation_policy, Mapping)
+            else {}
+        )
+        normalized_generation_support = {
+            str(target).upper(): sorted(int(value) for value in values)
+            for target, values in generation_support.items()
+        }
+        upstream_checks["generation_and_ranker_position_support_are_identical"] = (
+            normalized_generation_support == supported_positions_by_target
+        )
+
     problems: List[Dict[str, Any]] = []
     valid_by_target: MutableMapping[str, List[Dict[str, Any]]] = defaultdict(list)
     observed_candidate_ids: set[str] = set()
     input_rows = read_csv(candidates_path)
     for row_number, source in enumerate(input_rows, start=2):
-        candidate, errors = validate_candidate(source, expected_targets)
+        source_with_overlay: Dict[str, Any] = dict(source)
+        if rmsd_mode:
+            risk_key = (
+                str(source.get("target_name", "")).strip().upper(),
+                str(source.get("candidate_id", "")).strip(),
+                str(source.get("design_natural_seq", "")).strip().upper(),
+            )
+            overlay = risk_overlay.get(risk_key)
+            if overlay is None:
+                source_with_overlay["_missing_rmsd_overlay"] = 1
+            else:
+                source_with_overlay.update(overlay)
+        candidate, errors = validate_candidate(source_with_overlay, expected_targets)
         target = str(source.get("target_name", "")).strip().upper()
         candidate_id = str(source.get("candidate_id", "")).strip()
         sequence = str(source.get("design_seq", "")).strip()
         if candidate_id in observed_candidate_ids:
             errors.append("duplicate_candidate_id")
         observed_candidate_ids.add(candidate_id)
+        if rmsd_mode and source_with_overlay.get("_missing_rmsd_overlay"):
+            errors.append("candidate_missing_from_v10_rmsd_priority_overlay")
         if candidate is not None:
             natural_key = (target, str(candidate["design_natural_seq"]))
             cyclic_key = (target, str(candidate["_natural_cyclic_key"]))
@@ -1143,15 +1495,20 @@ def main() -> None:
         ),
     )
     for target in target_selection_order:
-        pool = [
-            row
-            for row in valid_by_target.get(target, [])
-            if str(row["design_natural_seq"]) not in global_natural_keys
-            and str(row["_natural_cyclic_key"]) not in global_cyclic_keys
-        ]
+        pool = deduplicate_cyclic(
+            [
+                row
+                for row in valid_by_target.get(target, [])
+                if str(row["design_natural_seq"]) not in global_natural_keys
+                and str(row["_natural_cyclic_key"]) not in global_cyclic_keys
+            ]
+        )
         selection_pool_by_target[target] = pool
         selected = select_diverse(
-            pool, args.quota_per_target, args.diversity_frontier_multiplier
+            pool,
+            args.quota_per_target,
+            args.diversity_frontier_multiplier,
+            supported_positions_by_target.get(target, ()) if rmsd_mode else (),
         )
         selected_by_target[target] = selected
         global_natural_keys.update(str(row["design_natural_seq"]) for row in selected)
@@ -1163,17 +1520,27 @@ def main() -> None:
         selected = selected_by_target.get(target, [])
         summary = target_summary(
             target,
-            valid_by_target.get(target, []),
+            selection_pool_by_target.get(target, []),
             selected,
             args.quota_per_target,
+            supported_positions_by_target.get(target, ()) if rmsd_mode else (),
         )
         summary["pool_after_global_cross_target_dedup"] = len(
             selection_pool_by_target.get(target, [])
         )
+        summary["cyclic_unique_pool_used_for_rmsd_top_quartile"] = len(
+            selection_pool_by_target.get(target, [])
+        )
+        summary["valid_pool_before_global_cross_target_dedup"] = len(
+            valid_by_target.get(target, [])
+        )
         summaries.append(summary)
         for row in selected:
             enriched = clean_selected_row(row)
-            enriched["final_release_id"] = f"v9_{target.lower()}_{len(selected_rows) + 1:04d}"
+            release_prefix = "v10" if rmsd_mode else "v9"
+            enriched["final_release_id"] = (
+                f"{release_prefix}_{target.lower()}_{len(selected_rows) + 1:04d}"
+            )
             selected_rows.append(enriched)
 
     global_residues: Counter[str] = Counter()
@@ -1205,7 +1572,7 @@ def main() -> None:
             == len({str(row["design_natural_seq"]) for row in selected_rows})
             == len({canonical_rotation(str(row["design_natural_seq"])) for row in selected_rows})
         ),
-        "no_target_methyl_position_concentration_exceeds_80_percent": all(
+        "target_methyl_position_concentration_passes_frozen_policy": all(
             bool(row["position_concentration_pass"]) for row in summaries
         ),
         "no_target_methyl_residue_concentration_exceeds_80_percent": all(
@@ -1216,17 +1583,60 @@ def main() -> None:
         ),
         "external_exclusion_files_were_explicitly_loaded": len(exclusion_paths) >= 2,
     }
+    if rmsd_mode:
+        release_checks[
+            "every_target_retains_at_least_400_cyclic_unique_rows_after_global_dedup"
+        ] = all(
+            int(row["cyclic_unique_pool_used_for_rmsd_top_quartile"]) >= 400
+            for row in summaries
+        )
+        release_checks[
+            "selected_fraction_of_each_final_cyclic_unique_pool_is_at_most_25_percent"
+        ] = all(
+            int(row["selected"])
+            / int(row["cyclic_unique_pool_used_for_rmsd_top_quartile"])
+            <= RMSD_VALIDATED_TOP_FRACTION
+            for row in summaries
+            if int(row["cyclic_unique_pool_used_for_rmsd_top_quartile"]) > 0
+        ) and len(summaries) == len(targets)
+        release_checks[
+            "all_selected_rows_are_within_the_validated_top_quartile"
+        ] = all(
+            bool(row["rmsd_priority_selected_all_within_validated_top_quartile"])
+            for row in summaries
+        )
+        release_checks["every_base_candidate_has_exactly_one_v10_rmsd_score"] = (
+            len(risk_overlay) == len(input_rows)
+        )
+        release_checks["selected_rows_retain_finite_v10_rmsd_priority_scores"] = all(
+            math.isfinite(float(row.get("rmsd_priority_score_joint_lt5", "nan")))
+            and math.isfinite(
+                float(row.get("rmsd_priority_score_joint_lt3_descriptive", "nan"))
+            )
+            for row in selected_rows
+        )
     quality_gate = "PASS" if all(release_checks.values()) else "FAIL"
 
     summary_fields = list(summaries[0]) if summaries else ["target_name"]
-    atomic_write_csv(out_dir / "selection_summary_by_target.csv", summaries, summary_fields)
+    summary_path = out_dir / "selection_summary_by_target.csv"
+    problems_path = out_dir / "candidate_validation_problems.csv"
+    atomic_write_csv(summary_path, summaries, summary_fields)
     atomic_write_csv(
-        out_dir / "candidate_validation_problems.csv",
+        problems_path,
         problems,
         ["csv_row", "target_name", "candidate_id", "design_seq", "problems"],
     )
 
-    release_paths: Dict[str, Dict[str, Any]] = {}
+    release_paths: Dict[str, Dict[str, Any]] = {
+        "selection_summary_by_target": {
+            "path": str(summary_path),
+            "sha256": sha256_file(summary_path),
+        },
+        "candidate_validation_problems": {
+            "path": str(problems_path),
+            "sha256": sha256_file(problems_path),
+        },
+    }
     if quality_gate == "PASS":
         detailed_rows = sorted(
             selected_rows,
@@ -1294,6 +1704,8 @@ def main() -> None:
             else "BLOCKED_DO_NOT_SEND_TO_SHANGGE"
         ),
         "protocol": "independent_v9_cyclic_stability_17x100_release_audit_v1",
+        "selection_overlay": RMSD_SELECTION_OVERLAY if rmsd_mode else "none",
+        "rmsd_priority_is_prospective_prediction_not_observed_structure": rmsd_mode,
         "threshold": THRESHOLD,
         "temperature": TEMPERATURE,
         "quota_per_target": args.quota_per_target,
@@ -1307,6 +1719,7 @@ def main() -> None:
         "global_methyl_residue_counts": dict(sorted(global_residues.items())),
         "maximum_single_methyl_residue_share": maximum_residue_share,
         "target_summary": summaries,
+        "program": {"path": str(SCRIPT_PATH), "sha256": sha256_file(SCRIPT_PATH)},
         "inputs": {
             "candidates": {"path": str(candidates_path), "sha256": sha256_file(candidates_path)},
             "generation_manifest": {"path": str(manifest_path), "sha256": sha256_file(manifest_path)},
@@ -1321,6 +1734,20 @@ def main() -> None:
                 {"path": str(path), "sha256": sha256_file(path)}
                 for path in exclusion_paths
             ],
+            **(
+                {
+                    "rmsd_priority_csv": {
+                        "path": str(risk_csv_path),
+                        "sha256": sha256_file(risk_csv_path),
+                    },
+                    "rmsd_priority_manifest": {
+                        "path": str(risk_manifest_path),
+                        "sha256": sha256_file(risk_manifest_path),
+                    },
+                }
+                if risk_csv_path is not None and risk_manifest_path is not None
+                else {}
+            ),
         },
         "release_artifacts": release_paths,
     }

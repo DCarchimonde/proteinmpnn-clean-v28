@@ -20,6 +20,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 import platform
 import shutil
 import sys
@@ -29,6 +30,7 @@ from typing import Any, Dict, List, Mapping, MutableMapping, Sequence, Tuple
 
 
 SCRIPT_PATH = Path(__file__).resolve()
+ENTRYPOINT_PATH = SCRIPT_PATH
 REPO_ROOT = SCRIPT_PATH.parents[2]
 GENERATOR_PATH = (
     REPO_ROOT / "paper_clean_v28" / "rerun_t05" / "01_generate_t05_multiseed.py"
@@ -133,6 +135,188 @@ def sha256_file(path: Path) -> str:
 
 def false_checks(checks: Mapping[str, Any]) -> List[str]:
     return sorted(name for name, passed in checks.items() if not bool(passed))
+
+
+def topup_runtime_contract(
+    torch_module: Any,
+    numpy_module: Any,
+    device: Any,
+) -> Dict[str, Any]:
+    """Capture the numeric runtime that produced adaptive top-up rows."""
+    device_type = str(getattr(device, "type", str(device).split(":", 1)[0]))
+    cuda_active = device_type == "cuda"
+    cuda = getattr(torch_module, "cuda", None)
+    backend = getattr(torch_module, "backends", None)
+    cudnn = getattr(backend, "cudnn", None)
+    cuda_backend = getattr(backend, "cuda", None)
+    matmul_backend = getattr(cuda_backend, "matmul", None)
+    gpu: Dict[str, Any] | None = None
+    if cuda_active:
+        device_index = getattr(device, "index", None)
+        if device_index is None:
+            device_index = int(cuda.current_device())
+        properties = cuda.get_device_properties(device_index)
+        gpu = {
+            "index": int(device_index),
+            "name": str(cuda.get_device_name(device_index)),
+            "capability": [
+                int(value) for value in cuda.get_device_capability(device_index)
+            ],
+            "total_memory": int(getattr(properties, "total_memory", -1)),
+            "multi_processor_count": int(
+                getattr(properties, "multi_processor_count", -1)
+            ),
+            "uuid": str(getattr(properties, "uuid", "")),
+        }
+    deterministic_warn_only = None
+    warn_only_reader = getattr(
+        torch_module, "is_deterministic_algorithms_warn_only_enabled", None
+    )
+    if callable(warn_only_reader):
+        deterministic_warn_only = bool(warn_only_reader())
+    float32_precision_reader = getattr(torch_module, "get_float32_matmul_precision", None)
+    return {
+        "python_implementation": platform.python_implementation(),
+        "python_version": platform.python_version(),
+        "torch_version": str(torch_module.__version__),
+        "numpy_version": str(numpy_module.__version__),
+        "torch_cuda_version": str(getattr(torch_module.version, "cuda", None)),
+        "cudnn_version": (
+            int(cudnn.version())
+            if cudnn is not None and cudnn.version() is not None
+            else None
+        ),
+        "device": str(device),
+        "device_type": device_type,
+        "gpu": gpu,
+        "deterministic": {
+            "algorithms_enabled": bool(
+                torch_module.are_deterministic_algorithms_enabled()
+            ),
+            "algorithms_warn_only": deterministic_warn_only,
+            "cudnn_deterministic": bool(getattr(cudnn, "deterministic", False)),
+            "cudnn_benchmark": bool(getattr(cudnn, "benchmark", False)),
+            "cudnn_allow_tf32": bool(getattr(cudnn, "allow_tf32", False)),
+            "cuda_matmul_allow_tf32": bool(
+                getattr(matmul_backend, "allow_tf32", False)
+            ),
+            "float32_matmul_precision": (
+                str(float32_precision_reader())
+                if callable(float32_precision_reader)
+                else None
+            ),
+            "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+            "pythonhashseed": os.environ.get("PYTHONHASHSEED"),
+        },
+    }
+
+
+def topup_numerical_contract(
+    args: argparse.Namespace,
+    plan: Mapping[str, Any],
+    device: Any,
+) -> Dict[str, Any]:
+    return {
+        "protocol": str(plan["protocol"]),
+        "recovery_mode": RECOVERY_MODE,
+        "initial_stage": INITIAL_STAGE,
+        "topup_stage": TOPUP_STAGE,
+        "sampling_context": SAMPLING_CONTEXT,
+        "annotation_context": ANNOTATION_CONTEXT,
+        "temperature": float(plan["temperature"]),
+        "methyl_threshold": float(plan["methyl_threshold"]),
+        "batch_size": int(args.batch_size),
+        "draws_per_reserve_seed": int(args.draws_per_reserve_seed),
+        "max_topup_draws_per_target": int(args.max_topup_draws_per_target),
+        "check_interval_draws": int(args.check_interval_draws),
+        "quota_margin": int(args.quota_margin),
+        "reserve_seeds": [int(value) for value in args.reserve_seeds],
+        "initial_generation_seeds": [int(value) for value in plan["seeds"]],
+        "device_argument": str(args.device),
+        "resolved_device": str(device),
+        "allow_cpu": bool(args.allow_cpu),
+        "global_seed_before_topup": 0,
+        "effective_seed_policy": "reserve_seed_x_100000_plus_stable_target_offset",
+    }
+
+
+def validate_initial_generation_contract(
+    source_manifest: Mapping[str, Any],
+    current_runtime_contract: Mapping[str, Any],
+    current_topup_numerical_contract: Mapping[str, Any],
+) -> None:
+    """Require first top-up to use the initial generator's numeric environment."""
+    recorded_runtime = source_manifest.get("initial_generation_runtime_contract")
+    recorded_numerical = source_manifest.get(
+        "initial_generation_numerical_contract"
+    )
+    if not isinstance(recorded_runtime, Mapping) or not isinstance(
+        recorded_numerical, Mapping
+    ):
+        raise RuntimeError(
+            "initial generation lacks a pinned runtime/numerical contract; "
+            "rerun generation in a new output root"
+        )
+    if dict(recorded_runtime) != dict(current_runtime_contract):
+        raise RuntimeError(
+            "initial generation runtime differs from the top-up runtime; "
+            "rerun in one environment"
+        )
+    expected_initial_numerical = {
+        "protocol": current_topup_numerical_contract["protocol"],
+        "temperature": current_topup_numerical_contract["temperature"],
+        "methyl_threshold": current_topup_numerical_contract["methyl_threshold"],
+        "batch_size": current_topup_numerical_contract["batch_size"],
+        "device_argument": current_topup_numerical_contract["device_argument"],
+        "resolved_device": current_topup_numerical_contract["resolved_device"],
+        "allow_cpu": current_topup_numerical_contract["allow_cpu"],
+        "initial_seeds": current_topup_numerical_contract[
+            "initial_generation_seeds"
+        ],
+        "cyclic_representation_ensemble": True,
+        "sampling_context": current_topup_numerical_contract["sampling_context"],
+        "annotation_context": current_topup_numerical_contract[
+            "annotation_context"
+        ],
+        "effective_seed_policy": (
+            "base_seed_x_100000_plus_stable_target_offset"
+        ),
+    }
+    if dict(recorded_numerical) != expected_initial_numerical:
+        raise RuntimeError(
+            "initial generation batch or numerical parameters differ from top-up; "
+            "rerun in one contract"
+        )
+
+
+def validate_existing_topup_resume_contract(
+    source_manifest: Mapping[str, Any],
+    existing_topup_rows: Sequence[Mapping[str, Any]],
+    current_runtime_contract: Mapping[str, Any],
+    current_numerical_contract: Mapping[str, Any],
+) -> None:
+    """Never append to persisted top-up rows under a changed numeric contract."""
+    if not existing_topup_rows:
+        return
+    recorded_runtime = source_manifest.get("topup_runtime_contract")
+    recorded_numerical = source_manifest.get("topup_numerical_contract")
+    if not isinstance(recorded_runtime, Mapping) or not isinstance(
+        recorded_numerical, Mapping
+    ):
+        raise RuntimeError(
+            "existing adaptive top-up rows lack a pinned runtime/numerical contract; "
+            "use a new output root"
+        )
+    if dict(recorded_runtime) != dict(current_runtime_contract):
+        raise RuntimeError(
+            "adaptive top-up runtime changed before continuing existing rows; "
+            "use a new output root"
+        )
+    if dict(recorded_numerical) != dict(current_numerical_contract):
+        raise RuntimeError(
+            "adaptive top-up batch or numerical parameters changed before continuing "
+            "existing rows; use a new output root"
+        )
 
 
 def union_fields(rows: Sequence[Mapping[str, Any]]) -> List[str]:
@@ -422,10 +606,23 @@ def run(args: argparse.Namespace) -> None:
     native_path = Path(args.native_jsonl).resolve()
     old_path = Path(args.old_designs_csv).resolve()
     prior_path = Path(args.prior_designs_csv).resolve()
+    concentration_policy_path = (
+        Path(args.position_concentration_policy).resolve()
+        if args.position_concentration_policy
+        else None
+    )
+    concentration_policy = (
+        generator.read_json(concentration_policy_path)
+        if concentration_policy_path is not None
+        else None
+    )
     if source_run != out_dir:
         raise ValueError("V6 quota recovery is intentionally in-place; source and output differ")
     source_paths = {
         "all": source_run / "all_candidates.csv",
+        "unique": source_run / "unique_candidates.csv",
+        "eligible": source_run / "methylated_new_candidates.csv",
+        "summary": source_run / "generation_summary_by_target.csv",
         "manifest": source_run / "generation_manifest.json",
         "target_manifest": source_run / "target_manifest.csv",
     }
@@ -437,6 +634,7 @@ def run(args: argparse.Namespace) -> None:
         old_path,
         prior_path,
         *source_paths.values(),
+        *([concentration_policy_path] if concentration_policy_path is not None else []),
     ):
         if not required.is_file():
             raise FileNotFoundError(required)
@@ -444,6 +642,51 @@ def run(args: argparse.Namespace) -> None:
     plan = generator.read_json(plan_path)
     validated = generator.validate_plan(plan)
     source_manifest = generator.read_json(source_paths["manifest"])
+    source_artifacts = source_manifest.get("artifacts", {})
+    if not isinstance(source_artifacts, Mapping):
+        raise RuntimeError("source generation manifest has no named artifacts")
+    source_artifact_contract = {
+        "all_candidates": source_paths["all"],
+        "unique_candidates": source_paths["unique"],
+        "methylated_new_candidates": source_paths["eligible"],
+        "generation_summary_by_target": source_paths["summary"],
+        "target_manifest": source_paths["target_manifest"],
+    }
+    for label, path in source_artifact_contract.items():
+        record = source_artifacts.get(label, {})
+        if not (
+            isinstance(record, Mapping)
+            and Path(str(record.get("path", ""))).resolve() == path.resolve()
+            and str(record.get("sha256", "")) == sha256_file(path)
+        ):
+            raise RuntimeError(
+                f"source generation artifact is not hash-bound or changed: {label}"
+            )
+    source_program = source_manifest.get("program", {})
+    if not (
+        isinstance(source_program, Mapping)
+        and Path(str(source_program.get("path", ""))).resolve()
+        == GENERATOR_PATH.resolve()
+        and str(source_program.get("sha256", "")) == sha256_file(GENERATOR_PATH)
+    ):
+        raise RuntimeError("source generation program bytes changed before top-up")
+    if str(source_manifest.get("recovery_mode", "")) == RECOVERY_MODE:
+        prior_entrypoint = source_manifest.get("topup_program", {})
+        prior_engine = source_manifest.get("topup_engine", {})
+        if not (
+            isinstance(prior_entrypoint, Mapping)
+            and Path(str(prior_entrypoint.get("path", ""))).resolve()
+            == ENTRYPOINT_PATH.resolve()
+            and str(prior_entrypoint.get("sha256", ""))
+            == sha256_file(ENTRYPOINT_PATH)
+            and isinstance(prior_engine, Mapping)
+            and Path(str(prior_engine.get("path", ""))).resolve()
+            == SCRIPT_PATH.resolve()
+            and str(prior_engine.get("sha256", "")) == sha256_file(SCRIPT_PATH)
+        ):
+            raise RuntimeError(
+                "previous adaptive top-up program bytes changed; use a new output root"
+            )
     source_rows = generator.read_csv(source_paths["all"])
     model_sha256 = sha256_file(model_path)
     metadata = checkpoint_metadata(torch, model_path)
@@ -490,6 +733,26 @@ def run(args: argparse.Namespace) -> None:
         torch.cuda.manual_seed_all(0)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    current_topup_runtime_contract = topup_runtime_contract(torch, np, device)
+    current_topup_numerical_contract = topup_numerical_contract(
+        args, plan, device
+    )
+    existing_topup_rows = [
+        row
+        for row in source_rows
+        if str(row.get("source_recovery_stage", "")) == TOPUP_STAGE
+    ]
+    validate_initial_generation_contract(
+        source_manifest,
+        current_topup_runtime_contract,
+        current_topup_numerical_contract,
+    )
+    validate_existing_topup_resume_contract(
+        source_manifest,
+        existing_topup_rows,
+        current_topup_runtime_contract,
+        current_topup_numerical_contract,
+    )
 
     target_manifest = generator.read_csv(source_paths["target_manifest"])
     selected_chains = {
@@ -518,6 +781,7 @@ def run(args: argparse.Namespace) -> None:
     source_annotation_audit = generator.audit_annotation_stability(
         source_rows,
         source_eligible_rows,
+        concentration_policy,
     )
     if str(source_annotation_audit.get("quality_gate", "")) != "PASS":
         raise RuntimeError(
@@ -608,9 +872,6 @@ def run(args: argparse.Namespace) -> None:
     print(f"Loading promoted V6 checkpoint: {model_path}", flush=True)
     model = load_v28_model(str(model_path), device)
     model.eval()
-    existing_topup_rows = [
-        row for row in raw_rows if str(row.get("source_recovery_stage", "")) == TOPUP_STAGE
-    ]
     topup_rows_by_target: Counter[str] = Counter(
         str(row["target_name"]).upper() for row in existing_topup_rows
     )
@@ -880,7 +1141,9 @@ def run(args: argparse.Namespace) -> None:
             }
         )
 
-    annotation_audit = generator.audit_annotation_stability(raw_rows, eligible_rows)
+    annotation_audit = generator.audit_annotation_stability(
+        raw_rows, eligible_rows, concentration_policy
+    )
     targets_below_quota = [
         target
         for target in validated["target_names"]
@@ -889,6 +1152,8 @@ def run(args: argparse.Namespace) -> None:
     stage_counts = Counter(str(row.get("source_recovery_stage", "")) for row in raw_rows)
     quality_checks = {
         **dict(annotation_audit["quality_checks"]),
+        "initial_generation_runtime_and_batch_contract_matches": True,
+        "existing_topup_runtime_and_numerical_contract_matches": True,
         "source_v6_has_no_unapproved_failures": bool(
             source_validation["source_false_checks_allowed"]
         ),
@@ -966,6 +1231,8 @@ def run(args: argparse.Namespace) -> None:
             "python_version": platform.python_version(),
             "torch_version": str(torch.__version__),
             "numpy_version": str(np.__version__),
+            "topup_runtime_contract": current_topup_runtime_contract,
+            "topup_numerical_contract": current_topup_numerical_contract,
             "source_v6_generation_manifest_sha256_before_resume": previous_manifest_sha256,
             "source_v6_all_candidates_sha256_before_resume": previous_all_sha256,
             "source_v6_backup_dir": str(backup_dir),
@@ -1028,6 +1295,67 @@ def run(args: argparse.Namespace) -> None:
             "native_permeability_controls": 0,
         }
     )
+    manifest["topup_program"] = {
+        "path": str(ENTRYPOINT_PATH),
+        "sha256": sha256_file(ENTRYPOINT_PATH),
+    }
+    manifest["topup_engine"] = {
+        "path": str(SCRIPT_PATH),
+        "sha256": sha256_file(SCRIPT_PATH),
+    }
+    manifest["inputs"] = {
+        "plan": {
+            "path": str(plan_path),
+            "sha256": sha256_file(plan_path),
+        },
+        "model": {"path": str(model_path), "sha256": model_sha256},
+        "representation_audit": {
+            "path": str(audit_path),
+            "sha256": sha256_file(audit_path),
+        },
+        "native_jsonl": {
+            "path": str(native_path),
+            "sha256": sha256_file(native_path),
+        },
+        "historical_csv": {
+            "path": str(old_path),
+            "sha256": sha256_file(old_path),
+        },
+        "prior_csv": {
+            "path": str(prior_path),
+            "sha256": sha256_file(prior_path),
+        },
+        "position_concentration_policy": (
+            {
+                "path": str(concentration_policy_path),
+                "sha256": sha256_file(concentration_policy_path),
+            }
+            if concentration_policy_path is not None
+            else None
+        ),
+    }
+    manifest["artifacts"] = {
+        "all_candidates": {
+            "path": str(out_dir / "all_candidates.csv"),
+            "sha256": sha256_file(out_dir / "all_candidates.csv"),
+        },
+        "unique_candidates": {
+            "path": str(out_dir / "unique_candidates.csv"),
+            "sha256": sha256_file(out_dir / "unique_candidates.csv"),
+        },
+        "methylated_new_candidates": {
+            "path": str(out_dir / "methylated_new_candidates.csv"),
+            "sha256": sha256_file(out_dir / "methylated_new_candidates.csv"),
+        },
+        "generation_summary_by_target": {
+            "path": str(out_dir / "generation_summary_by_target.csv"),
+            "sha256": sha256_file(out_dir / "generation_summary_by_target.csv"),
+        },
+        "target_manifest": {
+            "path": str(out_dir / "target_manifest.csv"),
+            "sha256": sha256_file(out_dir / "target_manifest.csv"),
+        },
+    }
     generator.atomic_write_json(out_dir / "generation_manifest.json", manifest)
 
     print("\n===== V6 QUOTA RESUME COMPLETE =====", flush=True)
@@ -1055,6 +1383,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--native-jsonl", default=str(DEFAULT_NATIVE))
     parser.add_argument("--old-designs-csv", default=str(DEFAULT_OLD))
     parser.add_argument("--prior-designs-csv", default=str(DEFAULT_PRIOR))
+    parser.add_argument("--position-concentration-policy")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--draws-per-reserve-seed", type=int, default=1_000)
     parser.add_argument("--max-topup-draws-per-target", type=int, default=12_000)

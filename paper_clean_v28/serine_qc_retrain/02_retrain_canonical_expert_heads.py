@@ -2219,6 +2219,44 @@ def main() -> None:
         "output_checkpoint": str(checkpoint_path) if quality_gate == "PASS" else None,
         "candidate_checkpoint": str(checkpoint_artifact_path),
         "checkpoint_artifact_sha256": file_sha256(checkpoint_artifact_path),
+        "program": {
+            "path": str(SCRIPT_PATH),
+            "sha256": file_sha256(SCRIPT_PATH),
+        },
+        "dependencies": {
+            "clean_v28_common": {
+                "path": str(REPO_ROOT / "paper_clean_v28" / "clean_v28_common.py"),
+                "sha256": file_sha256(REPO_ROOT / "paper_clean_v28" / "clean_v28_common.py"),
+            },
+            "model_utils": {
+                "path": str(REPO_ROOT / "model_utils.py"),
+                "sha256": file_sha256(REPO_ROOT / "model_utils.py"),
+            },
+            "nmethyl_config": {
+                "path": str(REPO_ROOT / "nmethyl" / "utils" / "nmethyl_config.py"),
+                "sha256": file_sha256(REPO_ROOT / "nmethyl" / "utils" / "nmethyl_config.py"),
+            },
+        },
+        "inputs": {
+            "parent_checkpoint": {
+                "path": str(model_path),
+                "sha256": file_sha256(model_path),
+            },
+            "train_jsonl": {
+                "path": str(train_path),
+                "sha256": file_sha256(train_path),
+            },
+            "test_jsonl": {
+                "path": str(test_path),
+                "sha256": file_sha256(test_path),
+            },
+        },
+        "artifacts": {
+            "promoted_checkpoint" if quality_gate == "PASS" else "blocked_candidate": {
+                "path": str(checkpoint_artifact_path),
+                "sha256": file_sha256(checkpoint_artifact_path),
+            }
+        },
         "expert_scope": args.expert_scope,
         "active_expert_tokens": [
             NATURAL_AA_ALPHABET[index] for index in active_indices
