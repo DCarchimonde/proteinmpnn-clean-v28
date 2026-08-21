@@ -1,0 +1,13 @@
+﻿metric,available_n_of_6,status,paper_interpretation
+global complex CA RMSD,6,available,primary structure metric
+best-forward cyclic peptide CA RMSD,6,available,primary structure metric
+fixed-order cyclic peptide CA RMSD,6,available,sensitivity analysis only
+methylation-site CA/backbone RMSD,6,available,legacy receptor-fit and peptide-fit fields retained
+highfold_ca_bfactor_mean (selected source workbook),6,available,"exact HighFold source column; confidence proxy, not energy; not interchangeable with candidate-audit PDB CA B-factor"
+permeability prediction,6,available,"predicted, not experimental"
+naturalized PyRosetta fixed-pose energy,6,available,not a native-delta stability result
+peptide pLDDT/pTM/ipTM/PAE,0,missing,all six values absent
+receptor/interface confidence,0,missing,all six values absent
+within-target TM diversity,0,not estimable,one selected structure per target
+energy success/stability vs native,0,not estimable,native reference energy unavailable in same fixed-pose workflow
+binding-site recovery,0,not computed,no validated binding-site definition in previous workflow

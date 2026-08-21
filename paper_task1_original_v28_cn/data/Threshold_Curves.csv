@@ -1,0 +1,23 @@
+﻿Threshold sensitivity,,,,,,,,,,,,,,,,,,
+Original checkpoint evaluated on corrected held-out labels across confidence thresholds.,,,,,,,,,,,,,,,,,,
+phase,task,scope,ground_truth,auc,threshold,accuracy,precision,recall,f1,false_positive_rate,pred_methyl_rate,tp,tn,fp,fn,positions,methyl_positives,natural_negatives
+pre_original_checkpoint,known_natural_sequence,overall,Ser-provenance-corrected held-out labels,0.9002907442,0.3,0.8857142857,0.6926406926,0.6130268199,0.6504065041,0.057073955,0.1534883721,160,1173,71,101,1505,261,1244
+pre_original_checkpoint,known_natural_sequence,overall,Ser-provenance-corrected held-out labels,0.9002907442,0.4,0.8750830565,0.6713615023,0.5478927203,0.6033755274,0.0562700965,0.1415282392,143,1174,70,118,1505,261,1244
+pre_original_checkpoint,known_natural_sequence,overall,Ser-provenance-corrected held-out labels,0.9002907442,0.5,0.86910299,0.66,0.5057471264,0.5726681128,0.0546623794,0.1328903654,132,1176,68,129,1505,261,1244
+pre_original_checkpoint,known_natural_sequence,overall,Ser-provenance-corrected held-out labels,0.9002907442,0.6,0.8617940199,0.6402116402,0.4636015326,0.5377777778,0.0546623794,0.1255813953,121,1176,68,140,1505,261,1244
+pre_original_checkpoint,known_natural_sequence,overall,Ser-provenance-corrected held-out labels,0.9002907442,0.7,0.8558139535,0.6235955056,0.4252873563,0.5056947608,0.0538585209,0.1182724252,111,1177,67,150,1505,261,1244
+pre_original_checkpoint,known_natural_sequence,overall,Ser-provenance-corrected held-out labels,0.9002907442,0.8,0.8438538206,0.58125,0.3563218391,0.4418052257,0.0538585209,0.1063122924,93,1177,67,168,1505,261,1244
+pre_original_checkpoint,known_natural_sequence,overall,Ser-provenance-corrected held-out labels,0.9002907442,0.9,0.8325581395,0.5333333333,0.275862069,0.3636363636,0.0506430868,0.0897009967,72,1181,63,189,1505,261,1244
+pre_original_checkpoint,known_natural_sequence,overall,Ser-provenance-corrected held-out labels,0.9002907442,0.95,0.8172757475,0.4351851852,0.1800766284,0.2547425474,0.0490353698,0.0717607973,47,1183,61,214,1505,261,1244
+pre_original_checkpoint,known_natural_sequence,overall,Ser-provenance-corrected held-out labels,0.9002907442,0.98,0.8,0.2222222222,0.061302682,0.0960960961,0.0450160772,0.0478405316,16,1188,56,245,1505,261,1244
+pre_original_checkpoint,known_natural_sequence,overall,Ser-provenance-corrected held-out labels,0.9002907442,0.99,0.803986711,0.1458333333,0.0268199234,0.0453074434,0.0329581994,0.0318936877,7,1203,41,254,1505,261,1244
+pre_original_checkpoint,end_to_end,overall,Ser-provenance-corrected held-out labels,0.9081660938,0.3,0.9136212625,0.9018404908,0.5632183908,0.6933962264,0.0128617363,0.1083056478,147,1228,16,114,1505,261,1244
+pre_original_checkpoint,end_to_end,overall,Ser-provenance-corrected held-out labels,0.9081660938,0.4,0.903654485,0.9027777778,0.4980842912,0.6419753086,0.0112540193,0.0956810631,130,1230,14,131,1505,261,1244
+pre_original_checkpoint,end_to_end,overall,Ser-provenance-corrected held-out labels,0.9081660938,0.5,0.8996677741,0.8985507246,0.4750957854,0.6215538847,0.0112540193,0.0916943522,124,1230,14,137,1505,261,1244
+pre_original_checkpoint,end_to_end,overall,Ser-provenance-corrected held-out labels,0.9081660938,0.6,0.8910299003,0.888,0.4252873563,0.5751295337,0.0112540193,0.0830564784,111,1230,14,150,1505,261,1244
+pre_original_checkpoint,end_to_end,overall,Ser-provenance-corrected held-out labels,0.9081660938,0.7,0.8837209302,0.8771929825,0.3831417625,0.5333333333,0.0112540193,0.0757475083,100,1230,14,161,1505,261,1244
+pre_original_checkpoint,end_to_end,overall,Ser-provenance-corrected held-out labels,0.9081660938,0.8,0.8750830565,0.8686868687,0.3295019157,0.4777777778,0.0104501608,0.0657807309,86,1231,13,175,1505,261,1244
+pre_original_checkpoint,end_to_end,overall,Ser-provenance-corrected held-out labels,0.9081660938,0.9,0.8644518272,0.8607594937,0.2605363985,0.4,0.0088424437,0.0524916944,68,1233,11,193,1505,261,1244
+pre_original_checkpoint,end_to_end,overall,Ser-provenance-corrected held-out labels,0.9081660938,0.95,0.8504983389,0.8461538462,0.1685823755,0.2811501597,0.0064308682,0.034551495,44,1236,8,217,1505,261,1244
+pre_original_checkpoint,end_to_end,overall,Ser-provenance-corrected held-out labels,0.9081660938,0.98,0.8305647841,0.6666666667,0.0459770115,0.0860215054,0.0048231511,0.0119601329,12,1238,6,249,1505,261,1244
+pre_original_checkpoint,end_to_end,overall,Ser-provenance-corrected held-out labels,0.9081660938,0.99,0.8245847176,0.2857142857,0.0076628352,0.0149253731,0.0040192926,0.0046511628,2,1239,5,259,1505,261,1244

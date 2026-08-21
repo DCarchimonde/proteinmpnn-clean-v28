@@ -1,0 +1,149 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{fontspec}
+\setmainfont{NotoSansSC-Task1-Subset.ttf}[
+  Path=fonts/,
+  BoldFont=NotoSansSC-Task1-Subset.ttf,
+  BoldFeatures={FakeBold=2},
+  ItalicFont=NotoSansSC-Task1-Subset.ttf,
+  ItalicFeatures={FakeSlant=0.18},
+  BoldItalicFont=NotoSansSC-Task1-Subset.ttf,
+  BoldItalicFeatures={FakeBold=2,FakeSlant=0.18}
+]
+\setsansfont{NotoSansSC-Task1-Subset.ttf}[Path=fonts/,BoldFont=NotoSansSC-Task1-Subset.ttf,BoldFeatures={FakeBold=2}]
+\setmonofont{NotoSansSC-Task1-Subset.ttf}[Path=fonts/,Scale=MatchLowercase]
+\XeTeXlinebreaklocale "zh"
+\XeTeXlinebreakskip=0pt plus 1pt
+\usepackage[a4paper,top=22mm,bottom=22mm,left=21mm,right=21mm,headheight=15pt]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{makecell}
+\usepackage{threeparttable}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{pdflscape}
+\usepackage{adjustbox}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[most]{tcolorbox}
+\usepackage{fancyhdr}
+\usepackage{lastpage}
+\usepackage{hyperref}
+\usepackage[nameinlink,noabbrev]{cleveref}
+
+\definecolor{DeepBlue}{HTML}{0B5A7A}
+\definecolor{Teal}{HTML}{008B78}
+\definecolor{Amber}{HTML}{D98300}
+\definecolor{SoftBlue}{HTML}{EAF4F8}
+\definecolor{SoftAmber}{HTML}{FFF4DE}
+\definecolor{SoftRed}{HTML}{FDECEC}
+\definecolor{Muted}{HTML}{555555}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=DeepBlue,
+  citecolor=Teal,
+  urlcolor=DeepBlue,
+  pdftitle={原始 Frankenstein-v28 N-甲基化扩展 ProteinMPNN 的单体与复合物评估},
+  pdfauthor={项目组（内部中文审阅稿）}
+}
+\urlstyle{tt}
+
+\captionsetup{font=small,labelfont=bf,labelsep=quad}
+\setlist{nosep,leftmargin=2em}
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0.15em}
+\setlength{\emergencystretch}{1em}
+\renewcommand{\arraystretch}{1.18}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\newcolumntype{C}[1]{>{\centering\arraybackslash}p{#1}}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcommand{\seq}[1]{\texttt{#1}}
+\newcommand{\NA}{\textemdash}
+\newcommand{\angstrom}{\text{\AA}}
+\newcommand{\taskone}{Task~1}
+\newcommand{\checkpointsha}{\texttt{bab7b8a0\allowbreak{}10114fc5\allowbreak{}2c749fab\allowbreak{}1914d9d8\allowbreak{}ae561ddc\allowbreak{}a45d6d7a\allowbreak{}0fbec3f9\allowbreak{}f5ac5b2e}}
+\newcommand{\checkpointshort}{\texttt{bab7b8a0\ldots f5ac5b2e}}
+
+\renewcommand{\contentsname}{目录}
+\renewcommand{\listfigurename}{图目录}
+\renewcommand{\listtablename}{表目录}
+\renewcommand{\figurename}{图}
+\renewcommand{\tablename}{表}
+\renewcommand{\refname}{参考文献}
+
+\crefname{figure}{图}{图}
+\crefname{table}{表}{表}
+\crefname{section}{节}{节}
+\crefname{appendix}{附录}{附录}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{原始 Frankenstein-v28：Task 1 中文论文稿}
+\fancyhead[R]{\small 2026-08-21}
+\fancyfoot[C]{第 \thepage\ 页，共 \pageref{LastPage} 页}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\title{\bfseries\LARGE 原始 Frankenstein-v28 N-甲基化扩展 ProteinMPNN 的单体与复合物评估\\[0.45em]
+\large Ser 来源修正、六个非 3AV 复合物的预设分析与 17 靶点探索性证据}
+\author{项目组（作者与单位信息待补）}
+\date{中文内部审阅稿 v1.0｜2026年8月21日}
+
+\begin{document}
+
+\begin{titlepage}
+  \centering
+  \vspace*{22mm}
+  {\color{DeepBlue}\bfseries\LARGE 原始 Frankenstein-v28 N-甲基化扩展 ProteinMPNN 的单体与复合物评估\par}
+  \vspace{4mm}
+  {\Large Ser 来源修正、六个非 3AV 复合物的预设分析与 17 靶点探索性证据\par}
+  \vspace{12mm}
+  {\large 项目组（作者与单位信息待补）\par}
+  \vspace{3mm}
+  {\large 中文内部审阅稿 v1.0｜2026年8月21日\par}
+  \vfill
+  \begin{tcolorbox}[width=0.92\textwidth,colback=SoftBlue,colframe=DeepBlue,boxrule=0.8pt,arc=2mm]
+    \textbf{冻结对象：}未经后续 V7/V8/V9 修改的原始 \path{frankenstein_v28.pt}。\\
+    \textbf{SHA-256：}\checkpointsha\\
+    \textbf{仓库基线：}\path{DCarchimonde/proteinmpnn-clean-v28@c9718e2a}（完整提交见源清单）。\\
+    \textbf{稿件性质：}Task 1 的完整中文解释稿；所有可报告结果、不可报告指标、历史错误口径和数据缺口均在同一文档中列明。
+  \end{tcolorbox}
+  \vspace{6mm}
+  {\small 本稿不把预测置信度称为能量，不把肽自对齐 RMSD 称为结合姿态，不把 oracle best-of-N 结果称为无偏生成性能。\par}
+\end{titlepage}
+
+\input{sections/00_abstract}
+
+\clearpage
+\tableofcontents
+\clearpage
+\listoffigures
+\listoftables
+\clearpage
+
+\input{sections/01_introduction}
+\input{sections/02_methods}
+\input{sections/03_results_monomer}
+\input{sections/04_results_six_complexes}
+\input{sections/05_results_all17}
+\input{sections/06_discussion}
+\input{sections/07_conclusion}
+
+\clearpage
+\appendix
+\input{sections/A_metric_matrix}
+\input{sections/B_historical_audit}
+\input{sections/C_pass_list}
+\input{sections/D_reproducibility}
+
+\clearpage
+\bibliographystyle{unsrt}
+\bibliography{references}
+
+\end{document}

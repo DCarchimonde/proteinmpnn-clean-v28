@@ -1,0 +1,52 @@
+\section{联合RMSD低于5~\AA{}的101条候选清单}
+\label{app:pass-list}
+
+表~\ref{tab:pass101}逐条列出六个非3AV复合物中同时满足全复合物CA RMSD
+$<5~\angstrom$且最佳正向循环肽CA RMSD $<5~\angstrom$的101条候选。
+这些候选均来自正文定义的476条保留设计，并沿用“一次全复合物叠合、完整末链
+CA配对、最佳正向循环移位、不反向、不进行肽链二次拟合”的联合RMSD口径。
+“类别”列进一步标出其中16条联合$<3~\angstrom$候选；其余85条位于
+$[3,5)~\angstrom$类别。序列大小写保持原始输出，小写残基表示严格$p>0.6$
+规则保存的预测甲基化标记，甲基化位点使用1基编号。
+
+可复核的机器可读文件同时随稿提供：本表101条的完整记录位于
+\path{data/Pass_LT5_101.csv}，其中16条联合$<3~\angstrom$候选另存于
+\path{data/Pass_LT3_16.csv}；包含通过与未通过候选、各审计门控字段及两种
+RMSD的完整476条分析表位于\path{data/Candidates_476.csv}。因此，本附录是便于
+人工阅读的通过清单，完整统计复算应以476条CSV为准。
+
+\begin{landscape}
+\begingroup
+\small
+\setlength{\tabcolsep}{4pt}
+\setlength\LTleft{0pt}
+\setlength\LTright{0pt}
+\captionof{table}{六个非 3AV 复合物中联合 RMSD 低于 5~\AA{} 的 101 条候选}
+\label{tab:pass101}
+\begin{longtable}{C{10mm} C{18mm} L{48mm} L{36mm} C{27mm} C{30mm} C{24mm}}
+  \toprule
+  编号 & 靶点 & 设计序列（小写为甲基化） & 甲基化位点 &
+  \makecell{全复合物CA\\RMSD（\AA）} &
+  \makecell{循环肽CA\\RMSD（\AA）} & 类别 \\
+  \midrule
+  \endfirsthead
+
+  \multicolumn{7}{l}{\footnotesize 表~\ref{tab:pass101}（续）}\\
+  \toprule
+  编号 & 靶点 & 设计序列（小写为甲基化） & 甲基化位点 &
+  \makecell{全复合物CA\\RMSD（\AA）} &
+  \makecell{循环肽CA\\RMSD（\AA）} & 类别 \\
+  \midrule
+  \endhead
+
+  \midrule
+  \multicolumn{7}{r}{\footnotesize 续下页}\\
+  \endfoot
+
+  \bottomrule
+  \endlastfoot
+
+  \input{tables/pass_lt5_rows.tex}
+\end{longtable}
+\endgroup
+\end{landscape}

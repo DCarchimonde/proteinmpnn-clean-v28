@@ -1,0 +1,6 @@
+temperature,n_designs,n_designs_ok,n_methyl_positions,n_nonmethyl_positions,n_methyl_ca_pairs,n_nonmethyl_ca_pairs,pooled_methyl_ca_rmsd_after_receptor_fit,pooled_nonmethyl_ca_rmsd_after_receptor_fit,pooled_methyl_backbone_rmsd_after_receptor_fit,pooled_nonmethyl_backbone_rmsd_after_receptor_fit,pooled_methyl_ca_rmsd_after_peptide_self_fit,pooled_nonmethyl_ca_rmsd_after_peptide_self_fit,mean_design_methyl_ca_rmsd_after_receptor_fit,median_design_methyl_ca_rmsd_after_receptor_fit,mean_design_nonmethyl_ca_rmsd_after_receptor_fit,median_design_nonmethyl_ca_rmsd_after_receptor_fit
+0.01,17,17,42,115,42,115,24.500304,35.088673,24.479778,35.056088,2.536927,2.413653,29.613654,40.369744,30.831119,42.279392
+0.1,17,17,33,124,33,124,21.751871,37.030284,21.864731,36.976803,3.560454,2.764336,26.297699,40.369744,33.228822,43.08953
+0.2,17,17,35,122,35,122,21.42058,33.866886,21.363961,33.82777,3.677184,3.350208,22.248983,12.066109,29.527015,41.808536
+0.3,17,17,28,129,28,129,16.685352,34.69301,16.744052,34.633741,3.347975,2.957506,21.027423,10.44248,30.201606,40.06382
+0.5,17,17,21,136,21,136,8.87807,30.262567,8.621555,30.214043,3.349708,3.028526,7.78685,8.261265,26.131736,27.425232

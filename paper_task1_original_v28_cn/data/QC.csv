@@ -1,0 +1,18 @@
+﻿Hard audit checks,,
+Every check must be TRUE before the workbook is released.,,
+check,pass,observed
+checkpoint_sha256_matches_canonical,1,bab7b8a010114fc52c749fab1914d9d8ae561ddca45d6d7a0fbec3f9f5ac5b2e
+six_targets_exact,1,"1SFI,3P8F,3WNE,3ZGC,4K1E,4KEL"
+primary_t05_rows_excluding_checkpoint_duplicate,1,544
+methylated_primary_rows,1,476
+rmsd_exact_join_coverage,1,476/476
+canonical_primary_fasta_key_unique,1,max multiplicity=1
+legacy_4kel_checkpoint_duplicate_recognized,1,"{1: 376, 2: 100}"
+all_rows_have_saved_lowercase_methyl_mark,1,476/476
+all_rmsd_status_ok,1,476/476
+all_decoded_pdb_sequences_match_exactly,1,476/476
+all_complete_final_chain_ca_pairing,1,476/476
+joint_lt3_count,1,16
+joint_lt5_count,1,101
+strict_representatives_six_targets,1,6
+3wne_metadata_chain_mismatch_acknowledged,1,25/27 metadata C vs deterministic final chain D

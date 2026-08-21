@@ -1,0 +1,64 @@
+\section{可复现性、文件索引与使用方法}
+\label{app:reproducibility}
+
+\subsection{本稿如何生成}
+
+本稿采用“复用已生成文件、不重新跑上游模型”的冻结策略。素材脚本只完成确定性的文件复制、CSV 导出、历史截图计数重构和汇总图生成；不会载入检查点，也不会调用结构预测、通透性模型或 PyRosetta。脚本入口见 \path{scripts/prepare_paper_assets.py}。论文中的每项数值必须回到 \path{data/}、\path{supplementary/} 或源清单。
+
+\begin{table}[H]
+\centering
+\caption{交付目录索引。}
+\label{tab:file-index}
+\begin{tabularx}{\textwidth}{L{39mm}Y}
+\toprule
+路径 & 内容 \\
+\midrule
+\path{main.tex}, \path{main.pdf} & 中文 LaTeX 源稿与已编译 PDF \\
+\path{sections/} & 正文和附录各章节 \\
+\path{figures/} & 6 组论文图，提供 PDF/PNG/SVG \\
+\path{data/} & 主表 CSV、476 条审计、101/16 条通过名单及探索性结果 \\
+\path{tables/} & 101 条联合 RMSD $<5$~\AA{} 候选的 LaTeX 表格行 \\
+\path{supplementary/} & 两个 Excel 工作簿、历史阈值截图与指标提纲截图 \\
+\path{fonts/} & 中文子集字体、原版权声明、修改记录及 SIL OFL 1.1 许可证 \\
+\path{SOURCE_MANIFEST.json} & 上游关键文件路径、字节数和 SHA-256 \\
+\path{scripts/} & 素材整理脚本与751个 PDB 来源审计脚本 \\
+\path{requirements-assets.txt} & 更新论文素材所需的固定 Python 依赖版本 \\
+\path{build.ps1}, \path{build.sh} & Windows PowerShell 与 Linux/macOS 构建入口 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{冻结标识与检查项}
+
+\begin{itemize}
+  \item 模型文件：\path{frankenstein_v28.pt}；
+  \item 模型 SHA-256（完整值）：\\
+  \texttt{bab7b8a010114fc52c749fab1914d9d8}\\
+  \texttt{ae561ddca45d6d7a0fbec3f9f5ac5b2e}；
+  \item 仓库：\path{DCarchimonde/proteinmpnn-clean-v28}；
+  \item 基线提交：\texttt{c9718e2a\allowbreak{}433a51f1\allowbreak{}87606676\allowbreak{}dfedd11e\allowbreak{}eb6fc8a5}；
+  \item 论文分支：\path{paper/task1-original-v28-cn-2026-08-21}；
+  \item 单体主分母：151 条、1505 位点、261 阳性、1244 阴性；
+  \item 六复合物主分母：544 条原始，476 条甲基保留，476 条 RMSD 成功匹配；
+  \item 17 靶点 best85：85/85 结构映射；置信度 COMMENT 字段仅 37/85；
+  \item 所有概率门均为严格 $>0.6$，所有 RMSD 门均为严格 $<d$；
+  \item 101 条 $<5$~\AA 与 16 条 $<3$~\AA 名单均可由 \path{Candidates_476.csv} 重新筛选得到。
+\end{itemize}
+
+\subsection{本地编译}
+
+仓库已经提交编译后的 \path{main.pdf}，仅阅读不需要安装 LaTeX。若要改稿重编译，在论文目录执行：
+
+\begin{verbatim}
+# Windows PowerShell
+.\build.ps1
+
+# Linux/macOS
+bash build.sh
+\end{verbatim}
+
+构建脚本使用 XeLaTeX、BibTeX、XeLaTeX 两遍，以解析中文、目录、交叉引用与文献。中文正文使用仓库内随稿提供的子集字体，不依赖系统安装 \path{ctex} 或中文字体。若上游数据有意更新，应先运行 \texttt{python }\path{scripts/prepare_paper_assets.py}，随后重编译；维护者工作区中的上游文件不存在时，该脚本复用随稿的冻结副本。任何更新都应同时修改版本、日期与 \path{SOURCE_MANIFEST.json}。重新扫描751个原始 PDB 则需另行检出源清单中冻结的历史仓库提交。
+
+\subsection{解释规则}
+
+复核本稿时应始终保留以下边界：条件通过率不等于原始端到端产率；肽自拟合 RMSD 不等于结合姿态；B-factor/pLDDT 不等于能量；fixed-pose Rosetta 分数不等于结合自由能；oracle best-of-N 不等于盲生成性能；未计算和不可定义不等于零。这些规则也是后续 V8/V9 比较必须沿用的共同基线。

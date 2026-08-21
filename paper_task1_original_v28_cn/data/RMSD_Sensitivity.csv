@@ -1,0 +1,31 @@
+﻿Cyclic representation sensitivity,,,,,,,
+Best-forward cyclic shift is primary; fixed order is a sensitivity analysis of arbitrary cyclic origin.,,,,,,,
+target_name,representation,threshold_A,n,cyclic_pass_n,cyclic_pass_rate,joint_pass_n,joint_pass_rate
+1SFI,best_forward_cyclic_shift,3,100,1,0.01,1,0.01
+1SFI,best_forward_cyclic_shift,5,100,19,0.19,19,0.19
+1SFI,fixed_order,3,100,0,0,0,0
+1SFI,fixed_order,5,100,5,0.05,5,0.05
+3P8F,best_forward_cyclic_shift,3,100,2,0.02,2,0.02
+3P8F,best_forward_cyclic_shift,5,100,20,0.2,20,0.2
+3P8F,fixed_order,3,100,0,0,0,0
+3P8F,fixed_order,5,100,10,0.1,10,0.1
+3WNE,best_forward_cyclic_shift,3,27,3,0.1111111111,3,0.1111111111
+3WNE,best_forward_cyclic_shift,5,27,5,0.1851851852,5,0.1851851852
+3WNE,fixed_order,3,27,0,0,0,0
+3WNE,fixed_order,5,27,3,0.1111111111,3,0.1111111111
+3ZGC,best_forward_cyclic_shift,3,49,2,0.0408163265,2,0.0408163265
+3ZGC,best_forward_cyclic_shift,5,49,23,0.4693877551,23,0.4693877551
+3ZGC,fixed_order,3,49,0,0,0,0
+3ZGC,fixed_order,5,49,6,0.1224489796,6,0.1224489796
+4K1E,best_forward_cyclic_shift,3,100,6,0.06,6,0.06
+4K1E,best_forward_cyclic_shift,5,100,24,0.24,24,0.24
+4K1E,fixed_order,3,100,2,0.02,2,0.02
+4K1E,fixed_order,5,100,8,0.08,8,0.08
+4KEL,best_forward_cyclic_shift,3,100,2,0.02,2,0.02
+4KEL,best_forward_cyclic_shift,5,100,10,0.1,10,0.1
+4KEL,fixed_order,3,100,0,0,0,0
+4KEL,fixed_order,5,100,1,0.01,1,0.01
+OVERALL,best_forward_cyclic_shift,3,476,16,0.0336134454,16,0.0336134454
+OVERALL,best_forward_cyclic_shift,5,476,101,0.2121848739,101,0.2121848739
+OVERALL,fixed_order,3,476,2,0.0042016807,2,0.0042016807
+OVERALL,fixed_order,5,476,33,0.0693277311,33,0.0693277311

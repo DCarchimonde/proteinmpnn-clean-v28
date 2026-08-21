@@ -1,0 +1,277 @@
+\section{尚哥指标清单的证据可用性矩阵}
+\label{app:metric-matrix}
+
+本附录逐项对应尚哥提供的模型、数据和指标提纲。全文涉及的五层分母严格分开：
+\begin{enumerate}
+  \item \textbf{单体：}Ser 来源修正留出集，151条、1505个真实位点，正文阈值严格 $p>0.6$；
+  \item \textbf{六复合物主分析：}六个非 3AV 靶点、$T=0.5$、544条原始序列和476条甲基化保留候选；
+  \item \textbf{天然17靶点：}预先选定的全部短肽链，共251个天然位点；
+  \item \textbf{17靶点全温度生成池：}五个温度共4015条原始记录、3443条温度内唯一序列；
+  \item \textbf{best85 探索集：}17个靶点、五个温度、按天然序列恢复率选择的85个 oracle 代表。
+\end{enumerate}
+
+状态含义如下：\textbf{可报告}表示定义、分母和来源均已冻结；\textbf{探索性}表示数值存在，但受 oracle 选择、预测模型或非实验代理限制；\textbf{不可定义}表示真值类别缺失，数学上不能计算；\textbf{未计算}表示没有合格的成对数据或冻结定义。任何“不可定义/未计算”均不等于数值0。
+
+\subsection{模型、数据与序列指标}
+
+\begin{landscape}
+\begingroup
+\small
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.22}
+\begin{longtable}{L{27mm}L{46mm}L{50mm}L{48mm}L{43mm}}
+\caption{模型、数据与序列指标的队列级可用性。}\label{tab:metric-matrix-sequence}\\
+\toprule
+清单项目 & 单体 & 六复合物主分析 & \makecell{17靶点探索\\（天然/生成/best85）} & 状态与原因 \\
+\midrule
+\endfirsthead
+\multicolumn{5}{l}{\small\itshape 表\thetable（续）}\\
+\toprule
+清单项目 & 单体 & 六复合物主分析 & \makecell{17靶点探索\\（天然/生成/best85）} & 状态与原因 \\
+\midrule
+\endhead
+\midrule
+\multicolumn{5}{r}{\small 接下页}\\
+\endfoot
+\bottomrule
+\endlastfoot
+
+基于甲基化单体的微调
+& 冻结检查点可评价；历史审计记录 train/test 为600/151，但无原始训练全过程日志、随机种子曲线和相对于初始化模型的配对增益
+& 使用同一冻结检查点生成/评分，不构成新的训练证据
+& 天然集、全温度池和 best85 均使用同一冻结检查点；oracle 选择不能反推微调增益
+& \textbf{部分可报告}：可写模型和检查点，不可编造“微调提高了多少” \\
+
+甲基化分类器
+& known-sequence 与 end-to-end 均有261阳性/1244阴性真值
+& 75个天然位点全为阴性；476条生成序列无实验甲基真值
+& 天然251位点全为阴性；全温度池和85条代表只有模型小写标记，无实验甲基真值
+& 单体\textbf{可报告}；复合物生成序列只能报告标记/保留率 \\
+
+Baker 33 个真结构单体
+& 未找到；751/751 个原始 PDB 均标记为 Rosetta 理论模型，没有可核验的 Baker 实验结构子集
+& 不适用
+& 不适用
+& \textbf{与冻结数据不符}：不得把规划数字写成已完成数据 \\
+
+Rosetta 400+300 个单体
+& 实际为406个 Rosetta-2023 与345个 Rosetta-2025 理论模型，合计751；训练/测试为600/151
+& 不适用
+& 不适用
+& \textbf{可报告实际构成}：规划的400+300数字不采用 \\
+
+17 个真结构复合物
+& 不适用
+& 从17个靶点中预设选取六个非3AV靶点
+& 天然17靶点用于序列评价；best85为85/85结构匹配
+& \textbf{可报告}，但六靶点与 best85 的队列和 RMSD 定义不同 \\
+
+RAA（天然化氨基酸恢复）
+& $242/1505=16.08\%$
+& 天然六复合物七条选定肽链为 $29/75=38.67\%$；不得与476条生成候选的回收字段混为同一测试
+& 天然17靶点为$53/251=21.12\%$；全温度池按温度的平均RAA为1.49--4.42\%；best85的 recovery 是 oracle 选择标准
+& 单体、天然六复合物和天然17靶点\textbf{可报告}；生成池为描述性，best85有\textbf{选择偏倚} \\
+
+AUC
+& known-sequence 0.9003；end-to-end 0.9082
+& 天然75位点阳性数为0，AUC不可定义；生成476条无实验真值
+& 天然251位点无阳性，AUC不可定义；生成池与best85无实验甲基真值
+& 仅单体\textbf{可报告} \\
+
+Accuracy（严格 $p>0.6$）
+& known $1297/1505=86.18\%$；end-to-end $1341/1505=89.10\%$
+& 天然阴性集 known $71/75=94.67\%$；end-to-end $73/75=97.33\%$，实质为 $1-\mathrm{FPR}$；生成476条不可计算
+& 天然17靶点 known $232/251=92.43\%$、end-to-end $242/251=96.41\%$，实质为$1-\mathrm{FPR}$；生成池与best85不能计算
+& 单体\textbf{可报告}；两个天然复合物阴性集仅作误报审计 \\
+
+Precision / Recall / F1
+& known 64.02\%/46.36\%/53.78\%；end-to-end 88.80\%/42.53\%/57.51\%
+& 天然位点无阳性，三项不可定义；生成候选无真值
+& 天然251位点无阳性，三项不可定义；生成池与best85无实验真值
+& 仅单体\textbf{可报告} \\
+
+RMC
+& 二分类甲基召回 $111/261=42.53\%$；端到端真实甲基残基身份完全恢复 $20/261=7.66\%$；全部位点联合 token 恢复 $224/1505=14.88\%$
+& 同理；因无阳性，不能把RMC写成0
+& 天然251位点无阳性，不能把RMC写成0；生成池与best85无真值
+& \textbf{术语歧义}：必须同时写明身份要求与分母 \\
+
+FPR / 预测阳性率
+& known FPR 5.47\%、预测阳性率12.56\%；end-to-end 1.13\%、8.31\%
+& 天然阴性集 known $4/75=5.33\%$；end-to-end $2/75=2.67\%$
+& 天然17靶点 known FPR $19/251=7.57\%$；end-to-end预测阳性率$9/251=3.59\%$；生成池可统计小写率但不能称FPR
+& 单体及两个天然阴性集\textbf{可报告} \\
+
+联合扩展 token 恢复
+& 基础类别与甲基状态同时正确：$224/1505=14.88\%$
+& 未形成可复核的75位点联合交叉表；生成候选无扩展 token 真值
+& 天然17靶点未形成联合交叉表；生成池与best85无扩展 token 真值
+& 仅单体\textbf{可报告}；不能用 RAA 与 Accuracy 相乘替代 \\
+
+甲基化保留率/有效生成概率
+& 不适用；这是生成队列指标
+& $476/544=87.50\%$ 含至少一个严格 $p>0.6$ 的已保存小写标记；联合 $<3$/$<5$ 原始产率为 $16/544=2.94\%$、$101/544=18.57\%$
+& 全温度池有4015条记录，但未定义与主队列相同的端到端结构成功门；best85固定为85个oracle代表
+& 六复合物\textbf{主结果可报告} \\
+
+旧标签/旧 padding 阈值截图
+& 不进入正文；旧标签含62个Ser来源错误，旧截图分母随 batch size 改变
+& 不适用
+& 不适用
+& \textbf{仅历史审计}：不可与本表正文指标并列 \\
+
+\end{longtable}
+\endgroup
+\end{landscape}
+
+\subsection{结构、能量、多样性与通透性指标}
+
+\begin{landscape}
+\begingroup
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.20}
+\begin{longtable}{L{29mm}L{43mm}L{51mm}L{52mm}L{40mm}}
+\caption{结构与下游指标的队列级可用性。}\label{tab:metric-matrix-structure}\\
+\toprule
+清单项目 & 单体 & 六复合物主分析 & \makecell{17靶点探索\\（天然/生成/best85）} & 状态与原因 \\
+\midrule
+\endfirsthead
+\multicolumn{5}{l}{\small\itshape 表\thetable（续）}\\
+\toprule
+清单项目 & 单体 & 六复合物主分析 & \makecell{17靶点探索\\（天然/生成/best85）} & 状态与原因 \\
+\midrule
+\endhead
+\midrule
+\multicolumn{5}{r}{\small 接下页}\\
+\endfoot
+\bottomrule
+\endlastfoot
+
+RMSD\_CA
+& 无端到端单体设计结构--参考结构配对
+& 476/476有一次全复合物对齐后的全局 CA 与末链 best-forward 环肽 CA RMSD；总体中位数[IQR]分别为1.022[0.692--1.534]和6.738[5.261--8.129]~\AA
+& 受体 CA 拟合后肽 CA mean/median=29.93/40.06~\AA；肽自对齐=2.65/2.53~\AA
+& 六复合物与 best85 均\textbf{可报告}，但定义不同，禁止合并 \\
+
+RMSD\_Backbone
+& 未计算
+& 476条主队列未计算完整 backbone RMSD；只有选择后的旧代表字段，不能替代全队列
+& N/CA/C：受体拟合后 mean/median=29.83/39.96~\AA；肽自对齐=2.34/2.11~\AA，85/85
+& best85\textbf{可报告}；六主队列\textbf{未计算} \\
+
+RMSD\_All
+& 未计算
+& 未计算
+& 未计算
+& \textbf{缺失}：需要非标准/甲基残基的可靠全原子映射 \\
+
+\makecell[l]{RMSD\_CA\\Methylation}
+& 未计算
+& 六个按肽 RMSD 选择的代表有旧位点字段，但不是476条主队列的无偏汇总
+& 159个甲基标记位点与626个非甲基位点：受体拟合 pooled CA=20.43/34.18~\AA；肽自拟合=3.28/2.93~\AA
+& best85\textbf{描述性}；分组非随机，不能推断甲基化因果效应 \\
+
+\makecell[l]{RMSD\_Backbone\\Methylation}
+& 未计算
+& 仅选择后的旧代表字段；主队列未汇总
+& N/CA/C 位点结果按温度可用，85/85；无显式甲基原子
+& best85\textbf{描述性} \\
+
+\makecell[l]{RMSD\_All\\Methylation}
+& 未计算
+& 未计算
+& 未计算
+& \textbf{缺失}：没有显式 N-甲基全原子对应关系 \\
+
+pLDDT
+& 无单体设计结构结果
+& 六个选择后代表仅有 \path{highfold_ca_bfactor_mean}，不能改名为 COMMENT global pLDDT
+& COMMENT global pLDDT 37/85（mean 71.07）；CA B-factor代理85/85（mean87.55），二者分开报告
+& best85\textbf{部分可用}；缺失不得填0 \\
+
+ipLDDT
+& 未定义/未计算
+& 未定义/未计算
+& 没有名为 ipLDDT 的冻结字段；最近的字段是 peptide-chain pLDDT，37/85（mean46.53）
+& \textbf{术语未定义}：若指界面/肽链pLDDT，须按真实字段改名 \\
+
+pTM
+& 未计算
+& 六个选择后代表缺失
+& peptide-chain pTM 37/85（mean0.146）
+& best85\textbf{仅部分可用} \\
+
+ipTM
+& 未计算
+& 六个选择后代表缺失
+& peptide--receptor ipTM 37/85（mean0.461）
+& best85\textbf{仅部分可用} \\
+
+pAE / PAE
+& 未计算
+& 六个选择后代表缺失
+& peptide-chain PAE mean3.64、inter-PAE mean18.05、iPAE mean12.14，均37/85
+& best85\textbf{仅部分可用}；不能由PDB坐标补造 \\
+
+BSR（binding-site ratio）
+& 未定义/未计算
+& 未定义/未计算
+& 未定义/未计算
+& \textbf{缺失}：须先冻结接触原子、距离阈值以及 precision/recall 方向 \\
+
+Success：肽能量低于天然
+& 无设计/天然同流程能量对
+& 六代表只有设计 fixed-pose 分数，无同流程天然肽基线
+& 只有设计 fixed-pose 分数，无同流程天然肽基线
+& \textbf{不可计算}；界面分数 $<0$ 不能替代“低于天然” \\
+
+Stability：复合物能量低于天然
+& 无设计/天然同流程能量对
+& 无同流程天然复合物能量
+& 无同流程天然复合物能量
+& \textbf{不可计算} \\
+
+Designability：RMSD $<2$~\AA
+& 无结构对
+& 按 Task 1 联合定义为 $2/476=0.42\%$；以全部544条为分母为 $2/544=0.37\%$
+& 受体框架肽 CA RMSD $<2$ 为 $0/85$
+& \textbf{可由现有RMSD计算}；须连同定义和分母报告 \\
+
+预设 RMSD $<3$/$<5$~\AA
+& 不适用
+& 保留后联合通过 $16/476=3.36\%$、$101/476=21.22\%$；原始产率2.94\%、18.57\%
+& 旧受体框架肽 CA $<5$ 为 $3/85=3.53\%$，$<3$ 为 $0/85$
+& \textbf{可报告}，但两队列定义不同 \\
+
+Diversity：$1-\mathrm{TM}$
+& 未计算
+& 每靶点只取一个选择后代表，靶内多样性不可估计
+& 17靶点内170/170对；mean/median $1-\mathrm{TM}=0.660/0.691$
+& best85\textbf{探索性}：肽自对齐内部形状且受oracle选择影响 \\
+
+膜通透性
+& 无单体结果
+& 六个按肽 RMSD 选择的代表6/6有预测值；属于选择条件化展示，不代表476条总体
+& best85为85/85有预测值，其中82条严格温度匹配、3条相同序列跨温度回填；总体 median $1.84\times10^{-8}$，无实验标签
+& \textbf{探索性预测}：不能声称实验透膜性提高 \\
+
+Rosetta 能量/分数
+& 无单体结果
+& 六个选择后代表有自然化 fixed-pose 界面分数；仅作条件化示例
+& 85/85；complex score/residue median1.7995 REU，cross-interface median110.07 REU，$<0$ 为6/85
+& \textbf{探索性}：非自由能、非亲和力、非相对天然稳定性 \\
+
+单体结构结果总体状态
+& 与本文阈值0.60一致的设计结构和成对结果表缺失；旧阈值任务清单不能用于本文
+& 不适用
+& 复合物结果不得移植到单体
+& \textbf{明确缺失}：单体结构指标均不填数 \\
+
+\end{longtable}
+\endgroup
+\end{landscape}
+
+\subsection{矩阵所引用的冻结数据资产}
+
+上述数值来自随稿提供的单体逐位主表与标准化阈值曲线、476条候选总表、六复合物主表以及 best85 的结构、甲基位点、多样性、通透性和 fixed-pose 能量 CSV。机器可读文件统一位于 \path{data/}，文件索引、关键哈希与上游逻辑来源见 \path{SOURCE_MANIFEST.json}。旧终端截图仅保留在补充材料中，用于说明 padding 与历史标签错误；其数值不参与正文、摘要或本矩阵的主结果。

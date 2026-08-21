@@ -1,0 +1,10 @@
+﻿metric,unit,n,mean,median,interpretation
+Peptide CA RMSD after receptor fit,Å,85,29.929716470588236,40.0638,binding-pose metric; old best85 definition
+Peptide backbone RMSD after receptor fit,Å,85,29.83465176470589,39.9596,binding-pose metric; old best85 definition
+Peptide CA RMSD after peptide self-fit,Å,85,2.6470317647058823,2.5298,internal shape only
+Peptide backbone RMSD after peptide self-fit,Å,85,2.342235294117647,2.1053,internal shape only
+Symmetric TM-score,unitless,170,0.34028656197180096,0.30935145724654667,170 within-target temperature pairs
+Diversity (1-TM),unitless,170,0.659713438028199,0.6906485427534533,oracle best85; internal-shape diversity
+Permeability prediction,model unit,85,0.12469758822184222,1.8383303768132464e-08,prediction without experimental labels
+Complex score per residue,REU,85,2.074738028140506,1.79949632488551,naturalized fixed pose
+Cross-interface score,REU,85,259.96813567755044,110.07272937151208,not binding free energy

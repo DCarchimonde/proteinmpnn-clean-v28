@@ -1,0 +1,7 @@
+﻿target_name,design_seq,methyl_positions_1based,global_CA_RMSD_A,best_forward_peptide_CA_RMSD_A,permeability_pred,fixed_pose_interface_energy_REU,highfold_ca_bfactor_mean,selection_scope
+1SFI,RCCrGNCGQCQFGG,4,0.536454,2.818333,0.4537699819,31.7724301109,93.4926694915,target-wise oracle minimum; selection-conditioned
+3P8F,CrrrGrQGKGrRGC,"2,3,4,6,11",0.30011,2.075042,7.568795181e-35,-25.7273414997,91.56876,target-wise oracle minimum; selection-conditioned
+3WNE,GrKWNC,2,0.933407,1.458877,0.0864483789,0.7262509849,90.026677116,target-wise oracle minimum; selection-conditioned
+3ZGC,rEGGQNR,1,0.972879,2.075724,1.044e-07,15.9489900603,89.9065495208,target-wise oracle minimum; selection-conditioned
+4K1E,rcrrrQCrQGNCDR,"1,2,3,4,5,8",0.899695,1.916051,6.141272082e-32,434.2355088381,89.0355411255,target-wise oracle minimum; selection-conditioned
+4KEL,RcrrGNCrQGFCDR,"2,3,4,8",0.6545,2.379375,0.0021353066,416.7736547897,91.4910729614,target-wise oracle minimum; selection-conditioned

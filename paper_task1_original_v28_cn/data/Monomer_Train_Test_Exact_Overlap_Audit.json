@@ -1,0 +1,13 @@
+{
+  "source_repo": "DCarchimonde/ProteinMPNN",
+  "source_commit": "28dff152d83623dfb322480413b7dc889f8537a4",
+  "train_records": 600,
+  "test_records": 151,
+  "exact_name_overlap_count": 0,
+  "exact_name_overlap": [],
+  "train_unique_naturalized_sequences": 600,
+  "test_unique_naturalized_sequences": 151,
+  "exact_naturalized_sequence_overlap_count": 0,
+  "exact_naturalized_sequence_overlap": [],
+  "scope_limit": "Exact name and exact naturalized-sequence audit only; no homology clustering was performed."
+}

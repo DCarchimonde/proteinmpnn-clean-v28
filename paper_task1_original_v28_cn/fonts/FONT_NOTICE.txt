@@ -1,0 +1,22 @@
+Bundled derivative font: Task1 CJK Subset Regular
+
+Copyright notice preserved from the source font binary:
+(c) 2014-2021 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source'.
+
+License: SIL Open Font License, Version 1.1. The full license text is
+included in this directory as OFL.txt.
+
+Source family: Noto Sans SC
+Source version recorded in the binary: 2.004-H2
+Unicode-subset source repository:
+https://github.com/jfcherng/Noto-Sans-SC-CSS
+Official Noto CJK upstream:
+https://github.com/notofonts/noto-cjk
+
+Modifications made for this paper on 2026-08-21:
+- merged the required WOFF2 Unicode-range subsets;
+- retained only glyphs needed by the LaTeX manuscript;
+- converted the merged subset to TTF;
+- normalized the weight metadata to Regular (400); and
+- renamed the family and PostScript names to "Task1 CJK Subset" so the
+  derivative does not use a Reserved Font Name.
