@@ -182,12 +182,30 @@ ensure_v10_regression_dependencies() {
   fi
 
   echo "V10 dependency bootstrap: pandas is missing; installing $PANDAS_SPEC"
-  "$PYTHON_BIN" -m pip install \
-    --disable-pip-version-check \
-    --no-input \
-    "$PANDAS_SPEC"
+  local index_url
+  for index_url in \
+    "${V10_PANDAS_INDEX_URL:-https://pypi.org/simple}" \
+    "https://pypi.tuna.tsinghua.edu.cn/simple" \
+    "https://mirrors.aliyun.com/pypi/simple"; do
+    echo "V10 dependency bootstrap: trying HTTPS index $index_url"
+    if "$PYTHON_BIN" -m pip install \
+      --disable-pip-version-check \
+      --no-input \
+      --only-binary=:all: \
+      --retries 1 \
+      --timeout 20 \
+      --index-url "$index_url" \
+      "$PANDAS_SPEC"; then
+      if "$PYTHON_BIN" -c 'import pandas' >/dev/null 2>&1; then
+        echo "V10 dependency bootstrap: pandas import PASS"
+        return
+      fi
+    fi
+  done
 
-  "$PYTHON_BIN" -c 'import pandas' >/dev/null
+  echo "WARNING: pandas remains unavailable after all HTTPS indexes." >&2
+  echo "WARNING: only the four optional Windows structure-postprocessing test modules will be skipped." >&2
+  echo "WARNING: the AutoDL V10 training/generation/monomer-sequence runtime does not import pandas." >&2
 }
 
 final_handoff_passes() {
@@ -331,15 +349,20 @@ ensure_v10_regression_dependencies
 "$PYTHON_BIN" - <<'PY'
 import json
 import sys
-import pandas
 import torch
+try:
+    import pandas
+except ModuleNotFoundError:
+    pandas_version = "unavailable_optional_windows_dependency"
+else:
+    pandas_version = pandas.__version__
 if sys.version_info < (3, 10):
     raise SystemExit("ERROR: Python >=3.10 is required")
 if not torch.cuda.is_available():
     raise SystemExit("ERROR: CUDA PyTorch is required for V10 retraining/replay")
 print(json.dumps({
     "python": sys.version.split()[0],
-    "pandas": pandas.__version__,
+    "pandas": pandas_version,
     "torch": torch.__version__,
     "cuda": torch.version.cuda,
     "gpu": torch.cuda.get_device_name(0),

@@ -13,6 +13,13 @@ from nmethyl.utils.nmethyl_config import (
     NMETHYL_RESIDUE_MAP,
 )
 
+try:
+    import pandas  # noqa: F401
+except ModuleNotFoundError as exc:
+    raise unittest.SkipTest(
+        "optional Windows structure-postprocessing test requires pandas"
+    ) from exc
+
 
 ROOT = Path(__file__).resolve().parents[1]
 AUDIT_PATH = ROOT / "paper_clean_v28" / "structure_metrics" / "22_audit_monomer_v10_pdb_reuse.py"

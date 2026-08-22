@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import csv
 import hashlib
 import importlib.util
@@ -31,6 +32,26 @@ PLAN = (
 )
 RUNNER = ROOT / "run_v10_rmsd_aware_1700_and_monomer.sh"
 REQUIREMENTS = ROOT / "requirements_minimal.txt"
+OPTIONAL_WINDOWS_PANDAS_TESTS = (
+    ROOT / "tests" / "test_methylation_first_screen.py",
+    ROOT / "tests" / "test_monomer_v10_windows_pdb_reuse.py",
+    ROOT / "tests" / "test_temperature05_best17_and_monomer_pipeline.py",
+    ROOT / "tests" / "test_temperature05_best17_pipeline.py",
+)
+AUTODL_V10_RUNTIME_PROGRAMS = (
+    ROOT / "paper_clean_v28" / "serine_qc_retrain" / "02_retrain_canonical_expert_heads.py",
+    ROOT / "paper_clean_v28" / "serine_qc_retrain" / "07_audit_cyclic_representation_equivariance.py",
+    ROOT / "paper_clean_v28" / "rerun_t05" / "01_generate_t05_multiseed.py",
+    ROOT / "paper_clean_v28" / "serine_qc_retrain" / "25_resume_cyclic_stability_v9_quota.py",
+    ROOT / "paper_clean_v28" / "serine_qc_retrain" / "24_score_uniform_cyclic_base_v9.py",
+    ROOT / "paper_clean_v28" / "serine_qc_retrain" / "23_select_and_audit_v9_1700.py",
+    ROOT / "paper_clean_v28" / "serine_qc_retrain" / "26_independent_replay_and_package_v9_1700.py",
+    ROOT / "paper_clean_v28" / "serine_qc_retrain" / "27_calibrate_and_apply_rmsd_ranker_v10.py",
+    ROOT / "paper_clean_v28" / "serine_qc_retrain" / "28_finalize_monomer_v10.py",
+    ROOT / "paper_clean_v28" / "serine_qc_retrain" / "29_independent_rmsd_priority_replay_v10.py",
+    ROOT / "paper_clean_v28" / "serine_qc_retrain" / "30_build_v10_prestructure_report.py",
+    ROOT / "paper_clean_v28" / "01_eval_clean_model.py",
+)
 GENERATOR = ROOT / "paper_clean_v28" / "rerun_t05" / "01_generate_t05_multiseed.py"
 TOPUP_ENGINE = (
     ROOT
@@ -97,7 +118,54 @@ class V10AutoDLDependencyBootstrapTests(unittest.TestCase):
         self.assertLess(cuda_probe, regression)
         self.assertIn('PANDAS_SPEC="${V10_PANDAS_SPEC:-pandas==2.2.3}"', runner)
         self.assertIn('"$PYTHON_BIN" -m pip install', runner)
-        self.assertIn('"pandas": pandas.__version__', runner)
+        self.assertIn("https://pypi.org/simple", runner)
+        self.assertIn("https://pypi.tuna.tsinghua.edu.cn/simple", runner)
+        self.assertIn("https://mirrors.aliyun.com/pypi/simple", runner)
+        self.assertIn('"pandas": pandas_version', runner)
+
+    def test_only_windows_postprocessing_modules_skip_when_pandas_is_absent(self):
+        self.assertEqual(len(OPTIONAL_WINDOWS_PANDAS_TESTS), 4)
+        for path in OPTIONAL_WINDOWS_PANDAS_TESTS:
+            source = path.read_text(encoding="utf-8")
+            self.assertIn("except ModuleNotFoundError as exc:", source)
+            self.assertIn(
+                "optional Windows structure-postprocessing test requires pandas",
+                source,
+            )
+
+        pandas_test_modules = set()
+        for path in (ROOT / "tests").glob("test_*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            roots = {
+                alias.name.split(".")[0]
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Import)
+                for alias in node.names
+            }
+            roots.update(
+                node.module.split(".")[0]
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ImportFrom) and node.module
+            )
+            if "pandas" in roots:
+                pandas_test_modules.add(path)
+        self.assertEqual(pandas_test_modules, set(OPTIONAL_WINDOWS_PANDAS_TESTS))
+
+    def test_autodl_runtime_programs_do_not_depend_directly_on_pandas(self):
+        for path in AUTODL_V10_RUNTIME_PROGRAMS:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            roots = {
+                alias.name.split(".")[0]
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Import)
+                for alias in node.names
+            }
+            roots.update(
+                node.module.split(".")[0]
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ImportFrom) and node.module
+            )
+            self.assertNotIn("pandas", roots, str(path))
 
 
 class FeatureContractTests(unittest.TestCase):
