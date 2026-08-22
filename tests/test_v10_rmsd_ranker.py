@@ -30,6 +30,7 @@ PLAN = (
     / "target_plan_v10_rmsd_priority_1700.json"
 )
 RUNNER = ROOT / "run_v10_rmsd_aware_1700_and_monomer.sh"
+REQUIREMENTS = ROOT / "requirements_minimal.txt"
 GENERATOR = ROOT / "paper_clean_v28" / "rerun_t05" / "01_generate_t05_multiseed.py"
 TOPUP_ENGINE = (
     ROOT
@@ -76,6 +77,27 @@ class V10FrozenPlanTests(unittest.TestCase):
         self.assertIn('"target_manifest": source_paths["target_manifest"]', topup_source)
         self.assertIn('source_manifest.get("topup_program", {})', topup_source)
         self.assertIn('source_manifest.get("topup_engine", {})', topup_source)
+
+
+class V10AutoDLDependencyBootstrapTests(unittest.TestCase):
+    def test_pandas_is_declared_at_the_locally_regression_tested_version(self):
+        requirements = {
+            line.strip()
+            for line in REQUIREMENTS.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+        self.assertIn("pandas==2.2.3", requirements)
+
+    def test_pandas_bootstrap_precedes_cuda_probe_and_full_regression(self):
+        runner = RUNNER.read_text(encoding="utf-8")
+        bootstrap_call = runner.index("ensure_v10_regression_dependencies\n")
+        cuda_probe = runner.index("if not torch.cuda.is_available():")
+        regression = runner.index('echo "[1/10] Full code regression"')
+        self.assertLess(bootstrap_call, cuda_probe)
+        self.assertLess(cuda_probe, regression)
+        self.assertIn('PANDAS_SPEC="${V10_PANDAS_SPEC:-pandas==2.2.3}"', runner)
+        self.assertIn('"$PYTHON_BIN" -m pip install', runner)
+        self.assertIn('"pandas": pandas.__version__', runner)
 
 
 class FeatureContractTests(unittest.TestCase):

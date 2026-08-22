@@ -15,6 +15,7 @@ PRIOR_CSV="${V10_PRIOR_CSV:-$REPO_ROOT/v9_inputs/methylated_new_candidates.csv}"
 RMSD_DEVELOPMENT_CSV="${V10_RMSD_DEVELOPMENT_CSV:-$REPO_ROOT/v10_inputs/six_non3av_t05_joint_rmsd_476.csv}"
 ORIGINAL_MONOMER_CORRECTED_CSV="${V10_ORIGINAL_MONOMER_CSV:-$REPO_ROOT/v10_inputs/monomer_corrected_1505_original_v28.csv}"
 POSITION_CONCENTRATION_POLICY="${V10_POSITION_POLICY:-$REPO_ROOT/v10_inputs/evidence_aware_position_concentration_policy.json}"
+PANDAS_SPEC="${V10_PANDAS_SPEC:-pandas==2.2.3}"
 
 TRAINER="$REPO_ROOT/paper_clean_v28/serine_qc_retrain/02_retrain_canonical_expert_heads.py"
 AUDITOR="$REPO_ROOT/paper_clean_v28/serine_qc_retrain/07_audit_cyclic_representation_equivariance.py"
@@ -175,6 +176,20 @@ print("Frozen V10 input SHA-256 contract: PASS")
 PY
 }
 
+ensure_v10_regression_dependencies() {
+  if "$PYTHON_BIN" -c 'import pandas' >/dev/null 2>&1; then
+    return
+  fi
+
+  echo "V10 dependency bootstrap: pandas is missing; installing $PANDAS_SPEC"
+  "$PYTHON_BIN" -m pip install \
+    --disable-pip-version-check \
+    --no-input \
+    "$PANDAS_SPEC"
+
+  "$PYTHON_BIN" -c 'import pandas' >/dev/null
+}
+
 final_handoff_passes() {
   manifest_passes "$FINAL_MANIFEST" \
     "$REPLAYER" "$SELECTION_MANIFEST" "$MODEL" "$AUDIT_JSON" "$BASE_MANIFEST" \
@@ -311,10 +326,12 @@ for required in \
   }
 done
 verify_frozen_inputs
+ensure_v10_regression_dependencies
 
 "$PYTHON_BIN" - <<'PY'
 import json
 import sys
+import pandas
 import torch
 if sys.version_info < (3, 10):
     raise SystemExit("ERROR: Python >=3.10 is required")
@@ -322,6 +339,7 @@ if not torch.cuda.is_available():
     raise SystemExit("ERROR: CUDA PyTorch is required for V10 retraining/replay")
 print(json.dumps({
     "python": sys.version.split()[0],
+    "pandas": pandas.__version__,
     "torch": torch.__version__,
     "cuda": torch.version.cuda,
     "gpu": torch.cuda.get_device_name(0),
