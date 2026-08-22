@@ -32,6 +32,24 @@ THRESHOLD = 0.6
 SENSITIVITY_THRESHOLDS = (0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 0.98, 0.99)
 NATURAL_AA = "ACDEFGHIKLMNPQRSTVWY"
 PROTOCOL = "corrected_monomer_cyclic_stability_and_base_freeze_audit_v10"
+V11_PROTOCOL = "corrected_monomer_cyclic_native_and_base_noninferiority_audit_v11"
+V11_EXPERT_PROTOCOL = (
+    "canonical_clean_v28_all_expert_heads_cyclic_native_relative_positions_v11"
+)
+V11_AUDIT_PROTOCOL = "cyclic_native_relative_positions_heldout_gate_v11"
+V11_AUTHORIZATION = (
+    "CYCLIC_NATIVE_V11_VALIDATED_FOR_RMSD_PRIORITY_REGENERATION"
+)
+V11_MODEL_ARCHITECTURE_PROTOCOL = (
+    "proteinmpnn_boundary_marginalized_cyclic_relative_positions_v11"
+)
+V11_POSITIONAL_STATE_KEYS = {
+    "features.embeddings.linear.weight",
+    "features.embeddings.linear.bias",
+}
+V11_MAXIMUM_BASE_ACCURACY_DROP = 0.02
+V11_MAXIMUM_BASE_CE_INCREASE = 0.05
+V11_MAXIMUM_EQUIVARIANCE_SPAN = 1e-5
 KNOWN_OUTPUTS = (
     "monomer_v10_metrics.csv",
     "monomer_v10_threshold_curves.csv",
@@ -75,6 +93,110 @@ def nested_hash(payload: Mapping[str, Any], section: str, label: str) -> str:
     if not isinstance(record, Mapping):
         return ""
     return str(record.get("sha256", ""))
+
+
+def finite_at_most(value: Any, maximum: float) -> bool:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return math.isfinite(number) and number <= float(maximum)
+
+
+def v11_training_manifest_checks(
+    payload: Mapping[str, Any], model_sha256: str
+) -> Dict[str, bool]:
+    """Validate V11's promoted model without importing or trusting Torch."""
+
+    quality_checks = payload.get("quality_checks", {})
+    expected_state = set(payload.get("expected_changed_state_keys", []))
+    changed_state = set(payload.get("changed_state_keys", []))
+    changed_non_expert = set(payload.get("changed_non_expert_keys", []))
+    validation = payload.get("base_sequence_noninferiority_validation", {})
+    legacy = validation.get("legacy_parent", {}) if isinstance(validation, Mapping) else {}
+    cyclic_parent = (
+        validation.get("cyclic_native_parent_before_adaptation", {})
+        if isinstance(validation, Mapping)
+        else {}
+    )
+    selected = validation.get("selected_v11", {}) if isinstance(validation, Mapping) else {}
+    selection = payload.get("training", {}).get("selection", {})
+    try:
+        maximum_ce_increase = float(payload["maximum_base_cross_entropy_increase"])
+        maximum_accuracy_drop = float(payload["maximum_base_accuracy_drop"])
+        maximum_span = float(payload["maximum_equivariance_span_tolerance"])
+        selected_ce = float(selected["cross_entropy"])
+        selected_accuracy = float(selected["accuracy"])
+        legacy_ce = float(legacy["cross_entropy"])
+        legacy_accuracy = float(legacy["accuracy"])
+        cyclic_parent_ce = float(cyclic_parent["cross_entropy"])
+        cyclic_parent_accuracy = float(cyclic_parent["accuracy"])
+        training_span = float(
+            selection["best_epoch_maximum_training_representation_span"]
+        )
+        numeric_contract = all(
+            math.isfinite(value)
+            for value in (
+                maximum_ce_increase,
+                maximum_accuracy_drop,
+                maximum_span,
+                selected_ce,
+                selected_accuracy,
+                legacy_ce,
+                legacy_accuracy,
+                cyclic_parent_ce,
+                cyclic_parent_accuracy,
+                training_span,
+            )
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        maximum_ce_increase = maximum_accuracy_drop = maximum_span = math.inf
+        selected_ce = selected_accuracy = math.nan
+        legacy_ce = legacy_accuracy = math.nan
+        cyclic_parent_ce = cyclic_parent_accuracy = math.nan
+        training_span = math.inf
+        numeric_contract = False
+
+    return {
+        "v11_training_manifest_is_a_complete_pass": (
+            payload.get("quality_gate") == "PASS"
+            and payload.get("checkpoint_ready_for_generation") is True
+            and isinstance(quality_checks, Mapping)
+            and bool(quality_checks)
+            and all(value is True for value in quality_checks.values())
+        ),
+        "v11_training_manifest_is_bound_to_exact_promoted_model": (
+            str(payload.get("checkpoint_artifact_sha256", "")) == model_sha256
+            and nested_hash(payload, "artifacts", "promoted_checkpoint")
+            == model_sha256
+        ),
+        "v11_training_manifest_declares_cyclic_native_architecture": (
+            payload.get("protocol") == V11_EXPERT_PROTOCOL
+            and payload.get("model_architecture_protocol")
+            == V11_MODEL_ARCHITECTURE_PROTOCOL
+            and payload.get("cyclic_relative_positions") is True
+        ),
+        "v11_training_manifest_changed_exactly_experts_and_positional_projection": (
+            expected_state == changed_state
+            and len(changed_state) == 42
+            and V11_POSITIONAL_STATE_KEYS <= changed_state
+            and changed_non_expert == V11_POSITIONAL_STATE_KEYS
+        ),
+        "v11_training_manifest_base_noninferiority_is_numerically_replayed": (
+            numeric_contract
+            and 0.0 <= maximum_ce_increase <= V11_MAXIMUM_BASE_CE_INCREASE
+            and 0.0 <= maximum_accuracy_drop <= V11_MAXIMUM_BASE_ACCURACY_DROP
+            and selected_ce <= legacy_ce + maximum_ce_increase
+            and selected_ce <= cyclic_parent_ce + maximum_ce_increase
+            and selected_accuracy + maximum_accuracy_drop >= legacy_accuracy
+            and selected_accuracy + maximum_accuracy_drop >= cyclic_parent_accuracy
+        ),
+        "v11_training_manifest_equivariance_span_is_numerically_replayed": (
+            numeric_contract
+            and 0.0 < maximum_span <= V11_MAXIMUM_EQUIVARIANCE_SPAN
+            and training_span <= maximum_span
+        ),
+    }
 
 
 def union_fields(rows: Sequence[Mapping[str, Any]]) -> List[str]:
@@ -277,11 +399,14 @@ def paired_cluster_bootstrap(
     }
 
 
-def prepare_output(out_dir: Path, overwrite: bool) -> None:
+def prepare_output(
+    out_dir: Path, overwrite: bool, release_protocol: str = "v10"
+) -> None:
     existing = [out_dir / name for name in KNOWN_OUTPUTS if (out_dir / name).exists()]
     if existing and not overwrite:
         raise FileExistsError(
-            "V10 monomer output exists; use a new directory or --overwrite: "
+            f"{release_protocol.upper()} monomer output exists; "
+            "use a new directory or --overwrite: "
             + ", ".join(str(path) for path in existing)
         )
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -302,6 +427,15 @@ def main() -> None:
     parser.add_argument("--original-v28-corrected-csv", default=str(DEFAULT_ORIGINAL))
     parser.add_argument("--v10-model", required=True)
     parser.add_argument("--parent-model", required=True)
+    parser.add_argument(
+        "--release-protocol", choices=("v10", "v11"), default="v10"
+    )
+    parser.add_argument("--model-training-manifest")
+    parser.add_argument(
+        "--maximum-monomer-base-accuracy-drop",
+        type=float,
+        default=V11_MAXIMUM_BASE_ACCURACY_DROP,
+    )
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
@@ -316,8 +450,23 @@ def main() -> None:
     original_path = Path(args.original_v28_corrected_csv).resolve()
     v10_model_path = Path(args.v10_model).resolve()
     parent_model_path = Path(args.parent_model).resolve()
+    training_manifest_path = (
+        Path(args.model_training_manifest).resolve()
+        if args.model_training_manifest
+        else None
+    )
+    if args.release_protocol == "v11" and training_manifest_path is None:
+        parser.error("--model-training-manifest is required for --release-protocol v11")
+    if not (
+        math.isfinite(args.maximum_monomer_base_accuracy_drop)
+        and 0.0 <= args.maximum_monomer_base_accuracy_drop
+        <= V11_MAXIMUM_BASE_ACCURACY_DROP
+    ):
+        parser.error(
+            "--maximum-monomer-base-accuracy-drop must be within [0, 0.02]"
+        )
     out_dir = Path(args.out_dir).resolve()
-    prepare_output(out_dir, args.overwrite)
+    prepare_output(out_dir, args.overwrite, args.release_protocol)
 
     original_rows = read_csv(original_path)
     v10_all = read_csv(v10_position_path)
@@ -335,6 +484,12 @@ def main() -> None:
     audit = read_json(cyclic_audit_path)
     eval_manifest = read_json(v10_eval_manifest_path)
     parent_eval_manifest = read_json(parent_eval_manifest_path)
+    training_manifest = (
+        read_json(training_manifest_path)
+        if training_manifest_path is not None
+        else {}
+    )
+    is_v11 = args.release_protocol == "v11"
 
     def original_key(row: Mapping[str, Any]) -> Tuple[str, str, int]:
         return (
@@ -522,10 +677,32 @@ def main() -> None:
         ),
     }
 
+    if is_v11:
+        checks[
+            "v11_cyclic_audit_protocol_architecture_and_authorization_are_exact"
+        ] = (
+            audit.get("protocol") == V11_AUDIT_PROTOCOL
+            and audit.get("release_authorization") == V11_AUTHORIZATION
+            and audit.get("model_expert_qc_protocol") == V11_EXPERT_PROTOCOL
+            and audit.get("model_architecture_protocol")
+            == V11_MODEL_ARCHITECTURE_PROTOCOL
+            and audit.get("cyclic_relative_positions") is True
+            and finite_at_most(
+                audit.get("maximum_equivariance_span_tolerance"),
+                V11_MAXIMUM_EQUIVARIANCE_SPAN,
+            )
+        )
+        checks.update(
+            v11_training_manifest_checks(
+                training_manifest, sha256_file(v10_model_path)
+            )
+        )
+
     if not all(checks.values()):
         failed = [name for name, passed in checks.items() if not passed]
         raise RuntimeError(
-            "V10 monomer input/provenance gate failed before metric computation: "
+            f"{args.release_protocol.upper()} monomer input/provenance gate failed "
+            "before metric computation: "
             + ", ".join(failed)
         )
 
@@ -642,15 +819,51 @@ def main() -> None:
             }
         )
 
+    selected_base_correct = sum(
+        row["v10_pred_base_token"] == row["true_base_token"]
+        for row in comparison_rows
+    )
+    parent_base_correct = sum(
+        row["deterministic_parent_pred_base_token"] == row["true_base_token"]
+        for row in comparison_rows
+    )
+    base_prediction_match_count = sum(
+        int(row["base_prediction_unchanged"]) for row in comparison_rows
+    )
+    selected_base_recovery = (
+        selected_base_correct / len(comparison_rows)
+        if comparison_rows
+        else math.nan
+    )
+    parent_base_recovery = (
+        parent_base_correct / len(comparison_rows)
+        if comparison_rows
+        else math.nan
+    )
+
     checks["all_corrected_ground_truth_labels_match_cyclic_audit"] = bool(comparison_rows) and all(
         int(row["is_methyl_true_corrected"])
         == int(cyclic_index[(row["sample_name"], int(row["position_in_model"]))]["is_methyl_true"])
         for row in comparison_rows
     )
-    checks["base_head_predictions_match_deterministic_parent_for_all_1505_positions"] = (
-        len(comparison_rows) == EXPECTED_POSITIONS
-        and all(int(row["base_prediction_unchanged"]) == 1 for row in comparison_rows)
-    )
+    if is_v11:
+        checks[
+            "v11_deterministic_monomer_base_recovery_is_noninferior_to_parent_within_0_02"
+        ] = (
+            len(comparison_rows) == EXPECTED_POSITIONS
+            and math.isfinite(selected_base_recovery)
+            and math.isfinite(parent_base_recovery)
+            and selected_base_recovery
+            + float(args.maximum_monomer_base_accuracy_drop)
+            >= parent_base_recovery
+        )
+    else:
+        checks[
+            "base_head_predictions_match_deterministic_parent_for_all_1505_positions"
+        ] = (
+            len(comparison_rows) == EXPECTED_POSITIONS
+            and base_prediction_match_count == EXPECTED_POSITIONS
+        )
     checks["deterministic_parent_and_v10_ground_truth_tokens_match"] = (
         len(comparison_rows) == EXPECTED_POSITIONS
         and all(
@@ -681,15 +894,7 @@ def main() -> None:
     e2e_scores = [float(row["v10_e2e_representation_min"]) for row in comparison_rows]
     known_metrics = classification_metrics(labels, known_scores) if labels else {}
     e2e_metrics = classification_metrics(labels, e2e_scores) if labels else {}
-    base_recovery = (
-        sum(
-            row["v10_pred_base_token"] == row["true_base_token"]
-            for row in comparison_rows
-        )
-        / len(comparison_rows)
-        if comparison_rows
-        else math.nan
-    )
+    base_recovery = selected_base_recovery
     extended_recovery = (
         sum(int(row["v10_end_to_end_extended_token_correct"]) for row in comparison_rows)
         / len(comparison_rows)
@@ -1069,14 +1274,22 @@ def main() -> None:
         and len(read_csv(native_control_out)) == EXPECTED_NATIVE_COMPLEX_POSITIONS
     )
     quality_gate = "PASS" if all(checks.values()) else "FAIL"
+    release_name = args.release_protocol.upper()
     report = {
         "quality_gate": quality_gate,
         "release_status": (
-            "MONOMER_SEQUENCE_AUDIT_PASS_WINDOWS_STRUCTURE_RECALCULATION_PENDING"
+            f"MONOMER_{release_name}_SEQUENCE_AUDIT_PASS_"
+            "WINDOWS_STRUCTURE_RECALCULATION_PENDING"
             if quality_gate == "PASS"
-            else "BLOCKED_MONOMER_V10_AUDIT_FAILED"
+            else f"BLOCKED_MONOMER_{release_name}_AUDIT_FAILED"
         ),
-        "protocol": PROTOCOL,
+        "protocol": V11_PROTOCOL if is_v11 else PROTOCOL,
+        "release_protocol": args.release_protocol,
+        "artifact_schema_compatibility": (
+            "legacy_monomer_v10_csv_names_retained_for_windows_consumers"
+            if is_v11
+            else "native_v10"
+        ),
         "data_source": (
             "751 company-generated Rosetta theoretical monomers; corrected split "
             "600 train / 151 internal development audit"
@@ -1089,6 +1302,21 @@ def main() -> None:
         "position_count": len(comparison_rows),
         "corrected_positive_count": sum(labels),
         "base_recovery": base_recovery,
+        "deterministic_parent_base_recovery": parent_base_recovery,
+        "selected_minus_parent_base_recovery": (
+            selected_base_recovery - parent_base_recovery
+        ),
+        "maximum_monomer_base_accuracy_drop": (
+            float(args.maximum_monomer_base_accuracy_drop) if is_v11 else 0.0
+        ),
+        "base_prediction_match_count_vs_deterministic_parent": (
+            base_prediction_match_count
+        ),
+        "base_prediction_match_rate_vs_deterministic_parent": (
+            base_prediction_match_count / len(comparison_rows)
+            if comparison_rows
+            else math.nan
+        ),
         "end_to_end_extended_token_recovery": extended_recovery,
         "end_to_end_exact_methylated_residue_recovery_count": exact_methyl_count,
         "end_to_end_exact_methylated_residue_recovery_rate": exact_methyl_rate,
@@ -1121,6 +1349,18 @@ def main() -> None:
             "original_v28_corrected_csv": {"path": str(original_path), "sha256": sha256_file(original_path)},
             "v10_model": {"path": str(v10_model_path), "sha256": sha256_file(v10_model_path)},
             "parent_model": {"path": str(parent_model_path), "sha256": sha256_file(parent_model_path)},
+            "model_training_manifest": {
+                "path": (
+                    str(training_manifest_path)
+                    if training_manifest_path is not None
+                    else None
+                ),
+                "sha256": (
+                    sha256_file(training_manifest_path)
+                    if training_manifest_path is not None
+                    else None
+                ),
+            },
         },
         "program": {"path": str(SCRIPT_PATH), "sha256": sha256_file(SCRIPT_PATH)},
         "dependencies": {
@@ -1159,12 +1399,22 @@ def main() -> None:
         },
     }
     atomic_write_json(out_dir / "monomer_v10_manifest.json", report)
-    print("===== V10 MONOMER AUDIT =====", flush=True)
+    print(f"===== {release_name} MONOMER AUDIT =====", flush=True)
     print(f"Positions: {len(comparison_rows)}; monomers: {len(design_rows)}", flush=True)
+    if is_v11:
+        print(
+            "Base recovery: "
+            f"parent={parent_base_recovery:.4%}, "
+            f"V11={selected_base_recovery:.4%}, "
+            f"delta={selected_base_recovery - parent_base_recovery:+.4%}",
+            flush=True,
+        )
     print(f"Quality gate: {quality_gate}", flush=True)
     if quality_gate != "PASS":
         failed = [name for name, passed in checks.items() if not passed]
-        raise RuntimeError("V10 monomer audit failed: " + ", ".join(failed))
+        raise RuntimeError(
+            f"{release_name} monomer audit failed: " + ", ".join(failed)
+        )
 
 
 if __name__ == "__main__":

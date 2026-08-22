@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import importlib.util
 import subprocess
 import sys
 import textwrap
@@ -22,6 +23,21 @@ AUDITOR = TRAINER.with_name("07_audit_cyclic_representation_equivariance.py")
 RUNNER = ROOT / "run_v11_cyclic_native_1700_and_monomer.sh"
 TOPUP = TRAINER.with_name("31_resume_cyclic_native_v11_quota.py")
 PLAN = TRAINER.with_name("target_plan_v11_cyclic_native_rmsd_priority_1700.json")
+MONOMER_FINALIZER = TRAINER.with_name("28_finalize_monomer_v10.py")
+
+
+def load_monomer_finalizer():
+    module_dir = str(MONOMER_FINALIZER.parent)
+    if module_dir not in sys.path:
+        sys.path.insert(0, module_dir)
+    spec = importlib.util.spec_from_file_location(
+        "monomer_v11_finalizer_contract", MONOMER_FINALIZER
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Could not load monomer finalizer")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 TORCH_PROGRAM = textwrap.dedent(
@@ -167,6 +183,10 @@ class V11SourceContractTests(unittest.TestCase):
         self.assertIn("--maximum-base-ce-increase", runner)
         self.assertIn("--maximum-base-accuracy-drop", runner)
         self.assertIn("--required-expert-protocol", runner)
+        self.assertIn("--release-protocol v11", runner)
+        self.assertIn("--model-training-manifest", runner)
+        self.assertIn("monomer_final_v11", runner)
+        self.assertIn("monomer_eval_passes", runner)
         self.assertNotIn("V10_OUTPUT_ROOT", runner)
         self.assertIn(
             "canonical_clean_v28_all_expert_heads_cyclic_native_relative_positions_v11",
@@ -179,6 +199,99 @@ class V11SourceContractTests(unittest.TestCase):
         )
         plan_sha256 = hashlib.sha256(PLAN.read_bytes()).hexdigest()
         self.assertIn(plan_sha256, runner)
+
+    def test_v11_monomer_finalizer_replaces_only_the_obsolete_v10_gate(self):
+        source = MONOMER_FINALIZER.read_text(encoding="utf-8")
+        self.assertIn(
+            "corrected_monomer_cyclic_native_and_base_noninferiority_audit_v11",
+            source,
+        )
+        self.assertIn("v11_training_manifest_checks", source)
+        self.assertIn(
+            "v11_deterministic_monomer_base_recovery_is_noninferior_to_parent_within_0_02",
+            source,
+        )
+        self.assertIn(
+            "base_head_predictions_match_deterministic_parent_for_all_1505_positions",
+            source,
+        )
+
+
+class V11MonomerManifestContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.finalizer = load_monomer_finalizer()
+
+    @staticmethod
+    def valid_manifest():
+        changed = [
+            f"experts.{index}.{suffix}"
+            for index in range(20)
+            for suffix in ("weight", "bias")
+        ] + [
+            "features.embeddings.linear.bias",
+            "features.embeddings.linear.weight",
+        ]
+        return {
+            "quality_gate": "PASS",
+            "checkpoint_ready_for_generation": True,
+            "checkpoint_artifact_sha256": "a" * 64,
+            "protocol": (
+                "canonical_clean_v28_all_expert_heads_"
+                "cyclic_native_relative_positions_v11"
+            ),
+            "model_architecture_protocol": (
+                "proteinmpnn_boundary_marginalized_"
+                "cyclic_relative_positions_v11"
+            ),
+            "cyclic_relative_positions": True,
+            "maximum_base_cross_entropy_increase": 0.05,
+            "maximum_base_accuracy_drop": 0.02,
+            "maximum_equivariance_span_tolerance": 1e-5,
+            "expected_changed_state_keys": changed,
+            "changed_state_keys": changed,
+            "changed_non_expert_keys": [
+                "features.embeddings.linear.bias",
+                "features.embeddings.linear.weight",
+            ],
+            "base_sequence_noninferiority_validation": {
+                "legacy_parent": {"cross_entropy": 2.33, "accuracy": 0.306},
+                "cyclic_native_parent_before_adaptation": {
+                    "cross_entropy": 2.29,
+                    "accuracy": 0.312,
+                },
+                "selected_v11": {"cross_entropy": 2.28, "accuracy": 0.313},
+            },
+            "training": {
+                "selection": {
+                    "best_epoch_maximum_training_representation_span": 0.0
+                }
+            },
+            "quality_checks": {"all_release_checks": True},
+            "artifacts": {"promoted_checkpoint": {"sha256": "a" * 64}},
+        }
+
+    def test_valid_v11_training_manifest_replays_all_scientific_gates(self):
+        checks = self.finalizer.v11_training_manifest_checks(
+            self.valid_manifest(), "a" * 64
+        )
+        self.assertTrue(all(checks.values()), checks)
+
+    def test_v11_training_manifest_rejects_base_regression_or_wrong_model(self):
+        payload = self.valid_manifest()
+        payload["base_sequence_noninferiority_validation"]["selected_v11"] = {
+            "cross_entropy": 3.0,
+            "accuracy": 0.1,
+        }
+        checks = self.finalizer.v11_training_manifest_checks(payload, "b" * 64)
+        self.assertFalse(
+            checks[
+                "v11_training_manifest_base_noninferiority_is_numerically_replayed"
+            ]
+        )
+        self.assertFalse(
+            checks["v11_training_manifest_is_bound_to_exact_promoted_model"]
+        )
 
 
 class V11TorchEquivarianceTests(unittest.TestCase):

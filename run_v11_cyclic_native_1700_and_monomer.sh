@@ -52,7 +52,7 @@ V11_FINAL_DIR="$OUTPUT_ROOT/final_v10_handoff"
 V11_FINAL_MANIFEST="$V11_FINAL_DIR/v10_1700_final_manifest.json"
 MONOMER_EVAL_DIR="$OUTPUT_ROOT/monomer_sequence_eval"
 PARENT_MONOMER_EVAL_DIR="$OUTPUT_ROOT/monomer_parent_sequence_eval"
-MONOMER_DIR="$OUTPUT_ROOT/monomer_final"
+MONOMER_DIR="$OUTPUT_ROOT/monomer_final_v11"
 MONOMER_MANIFEST="$MONOMER_DIR/monomer_v10_manifest.json"
 REPORT_DIR="$OUTPUT_ROOT/prestructure_report"
 REPORT_MANIFEST="$REPORT_DIR/v10_prestructure_report_manifest.json"
@@ -285,7 +285,7 @@ PY
 
 monomer_handoff_passes() {
   manifest_passes "$MONOMER_MANIFEST" \
-    "$MONOMER_FINALIZER" "$MONOMER_EVALUATOR" "$MODEL" "$PARENT_MODEL" "$AUDIT_JSON" \
+    "$MONOMER_FINALIZER" "$MONOMER_EVALUATOR" "$MODEL" "$PARENT_MODEL" "$MODEL_MANIFEST" "$AUDIT_JSON" \
     "$MONOMER_EVAL_DIR/eval_manifest.json" \
     "$MONOMER_EVAL_DIR/position_predictions.csv" \
     "$PARENT_MONOMER_EVAL_DIR/eval_manifest.json" \
@@ -313,6 +313,17 @@ def count(path):
         return sum(1 for _row in csv.DictReader(handle))
 raise SystemExit(0 if count(sys.argv[1]) == 1505 and count(sys.argv[2]) == 151 else 1)
 PY
+}
+
+monomer_eval_passes() {
+  local eval_dir="$1"
+  local eval_model="$2"
+  manifest_passes "$eval_dir/eval_manifest.json" \
+    "$MONOMER_EVALUATOR" "$eval_model" "$TEST_JSONL" \
+    "$eval_dir/summary.json" \
+    "$eval_dir/position_predictions.csv" \
+    "$eval_dir/sample_manifest.csv" \
+    "$eval_dir/threshold_metrics.csv"
 }
 
 require_empty_stage() {
@@ -434,28 +445,38 @@ fi
 if [[ -f "$MONOMER_MANIFEST" ]] && monomer_handoff_passes; then
   echo "[4/10] Reusing hash-pinned PASS V11 monomer sequence audit"
 else
-  require_empty_stage "$MONOMER_EVAL_DIR" "V11 monomer evaluation stage"
-  require_empty_stage "$PARENT_MONOMER_EVAL_DIR" "parent monomer evaluation stage"
+  if monomer_eval_passes "$PARENT_MONOMER_EVAL_DIR" "$PARENT_MODEL"; then
+    echo "[4/10] Reusing hash-pinned deterministic parent monomer evaluation"
+  else
+    require_empty_stage "$PARENT_MONOMER_EVAL_DIR" "parent monomer evaluation stage"
+    echo "[4/10] Computing deterministic parent 151-monomer metrics"
+    "$PYTHON_BIN" "$MONOMER_EVALUATOR" \
+      --model_path "$PARENT_MODEL" \
+      --data_jsonl "$TEST_JSONL" \
+      --mode monomer \
+      --eval_chains masked \
+      --batch_size "${V11_MONOMER_BATCH_SIZE:-16}" \
+      --seed 0 \
+      --thresholds 0.6 \
+      --out_dir "$PARENT_MONOMER_EVAL_DIR"
+  fi
+  if monomer_eval_passes "$MONOMER_EVAL_DIR" "$MODEL"; then
+    echo "[4/10] Reusing hash-pinned V11 monomer evaluation"
+  else
+    require_empty_stage "$MONOMER_EVAL_DIR" "V11 monomer evaluation stage"
+    echo "[4/10] Computing V11 151-monomer metrics"
+    "$PYTHON_BIN" "$MONOMER_EVALUATOR" \
+      --model_path "$MODEL" \
+      --data_jsonl "$TEST_JSONL" \
+      --mode monomer \
+      --eval_chains masked \
+      --batch_size "${V11_MONOMER_BATCH_SIZE:-16}" \
+      --seed 0 \
+      --thresholds 0.6 \
+      --out_dir "$MONOMER_EVAL_DIR"
+  fi
   require_empty_stage "$MONOMER_DIR" "V11 monomer finalization stage"
-  echo "[4/10] Recomputing deterministic parent and V11 151-monomer metrics"
-  "$PYTHON_BIN" "$MONOMER_EVALUATOR" \
-    --model_path "$PARENT_MODEL" \
-    --data_jsonl "$TEST_JSONL" \
-    --mode monomer \
-    --eval_chains masked \
-    --batch_size "${V11_MONOMER_BATCH_SIZE:-16}" \
-    --seed 0 \
-    --thresholds 0.6 \
-    --out_dir "$PARENT_MONOMER_EVAL_DIR"
-  "$PYTHON_BIN" "$MONOMER_EVALUATOR" \
-    --model_path "$MODEL" \
-    --data_jsonl "$TEST_JSONL" \
-    --mode monomer \
-    --eval_chains masked \
-    --batch_size "${V11_MONOMER_BATCH_SIZE:-16}" \
-    --seed 0 \
-    --thresholds 0.6 \
-    --out_dir "$MONOMER_EVAL_DIR"
+  echo "[4/10] Finalizing V11 monomer audit with architecture-aware base non-inferiority"
   "$PYTHON_BIN" "$MONOMER_FINALIZER" \
     --v10-position-csv "$MONOMER_EVAL_DIR/position_predictions.csv" \
     --v10-eval-manifest "$MONOMER_EVAL_DIR/eval_manifest.json" \
@@ -467,6 +488,9 @@ else
     --original-v28-corrected-csv "$ORIGINAL_MONOMER_CORRECTED_CSV" \
     --v10-model "$MODEL" \
     --parent-model "$PARENT_MODEL" \
+    --release-protocol v11 \
+    --model-training-manifest "$MODEL_MANIFEST" \
+    --maximum-monomer-base-accuracy-drop "${V11_MAXIMUM_BASE_ACCURACY_DROP:-0.02}" \
     --out-dir "$MONOMER_DIR"
 fi
 monomer_handoff_passes || {
@@ -687,7 +711,7 @@ tar -czf "$archive_tmp" -C "$OUTPUT_ROOT" \
   final_v10_handoff \
   monomer_sequence_eval \
   monomer_parent_sequence_eval \
-  monomer_final \
+  monomer_final_v11 \
   prestructure_report
 mv -f "$archive_tmp" "$TRANSFER_ARCHIVE"
 sha256sum "$TRANSFER_ARCHIVE" > "$TRANSFER_ARCHIVE.sha256"
