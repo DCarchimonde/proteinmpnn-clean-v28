@@ -378,10 +378,10 @@ fi
 
 if [[ -f "$MODEL" ]] && manifest_passes "$MODEL_MANIFEST" \
   "$TRAINER" "$PARENT_MODEL" "$TRAIN_JSONL" "$TEST_JSONL" "$MODEL"; then
-  echo "[2/10] Reusing promoted, manifest-PASS cyclic-stable checkpoint"
+  echo "[2/10] Reusing promoted, manifest-PASS V11 cyclic-native checkpoint"
 else
-  require_empty_stage "$MODEL_DIR" "V9 model stage"
-  echo "[2/10] Retraining all expert heads from canonical frankenstein_v28.pt"
+  require_empty_stage "$MODEL_DIR" "V11 cyclic-native model stage"
+  echo "[2/10] Jointly adapting cyclic positional embeddings and all expert heads from canonical frankenstein_v28.pt"
   "$PYTHON_BIN" "$TRAINER" \
     --model-path "$PARENT_MODEL" \
     --train-jsonl "$TRAIN_JSONL" \
@@ -415,7 +415,7 @@ if [[ -f "$AUDIT_JSON" ]] && manifest_passes "$AUDIT_JSON" \
   "$AUDIT_DIR/native_target_representation_summary.csv"; then
   echo "[3/10] Reusing hash-pinned PASS representation audit"
 else
-  require_empty_stage "$AUDIT_DIR" "V9 held-out audit stage"
+  require_empty_stage "$AUDIT_DIR" "V11 cyclic-native held-out audit stage"
   echo "[3/10] Auditing 151 monomers and all 17 native targets over the full cyclic grid"
   "$PYTHON_BIN" "$AUDITOR" \
     --model-path "$MODEL" \
@@ -475,7 +475,7 @@ monomer_handoff_passes || {
 }
 
 if [[ ! -f "$GENERATION_MANIFEST" ]]; then
-  require_empty_stage "$GENERATION_DIR" "V9 generation stage"
+  require_empty_stage "$GENERATION_DIR" "V11 generation stage"
   echo "[5/10] Generating the initial 42,500 T=0.5 draws"
   set +e
   "$PYTHON_BIN" "$GENERATOR" \
@@ -546,7 +546,7 @@ manifest_passes "$GENERATION_MANIFEST" \
   "$GENERATION_DIR/methylated_new_candidates.csv" \
   "$GENERATION_DIR/unique_candidates.csv" \
   "$GENERATION_DIR/generation_summary_by_target.csv" || {
-  echo "ERROR: V9 generation/top-up manifest is not PASS" >&2
+  echo "ERROR: V11 generation/top-up manifest is not PASS" >&2
   exit 1
 }
 
