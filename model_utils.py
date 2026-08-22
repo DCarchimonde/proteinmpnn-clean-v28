@@ -51,6 +51,37 @@ class PositionalEncodings(nn.Module):
         E = self.linear(d_onehot.float())
         return E
 
+    def forward_cyclic(self, directed_offset, cycle_length):
+        """Boundary-marginalized positional encoding for a cyclic chain.
+
+        A directed cyclic separation ``d`` has linear offset ``d`` for
+        ``L-d`` possible choices of the artificial chain start and ``d-L`` for
+        the remaining ``d`` choices.  Averaging those two existing learned
+        embeddings analytically removes the arbitrary cut without adding new
+        checkpoint tensors or inventing an untrained positional vocabulary.
+        """
+
+        if directed_offset.shape != cycle_length.shape:
+            raise ValueError("directed_offset and cycle_length shapes must match")
+        safe_length = cycle_length.long().clamp_min(1)
+        directed = torch.remainder(directed_offset.long(), safe_length)
+        positive_offset = directed
+        negative_offset = torch.where(
+            directed == 0,
+            torch.zeros_like(directed),
+            directed - safe_length,
+        )
+        negative_weight = directed.to(dtype=torch.float32) / safe_length.to(
+            dtype=torch.float32
+        )
+        same_chain = torch.ones_like(directed, dtype=torch.long)
+        positive_embedding = self.forward(positive_offset, same_chain)
+        negative_embedding = self.forward(negative_offset, same_chain)
+        return (
+            (1.0 - negative_weight.unsqueeze(-1)) * positive_embedding
+            + negative_weight.unsqueeze(-1) * negative_embedding
+        )
+
 # =============================================================================
 # 2. 核心特征模块 (Protein Features)
 # =============================================================================
@@ -97,7 +128,38 @@ class ProteinFeatures(nn.Module):
         RBF_A_B = self._rbf(D_A_B_neighbors)
         return RBF_A_B
 
-    def forward(self, X, mask, residue_idx, chain_labels):
+    @staticmethod
+    def _cyclic_pair_offsets(mask, chain_labels, cyclic_mask):
+        """Return cut-invariant directed offsets for selected cyclic chains."""
+
+        if cyclic_mask.shape != mask.shape:
+            raise ValueError("cyclic_mask shape must match mask")
+        cyclic = (cyclic_mask > 0.0) & (mask > 0.0)
+        length = int(mask.shape[1])
+        tensor_positions = torch.arange(length, device=mask.device)
+        preceding = tensor_positions.view(1, 1, -1) <= tensor_positions.view(
+            1, -1, 1
+        )
+        same_chain = chain_labels[:, :, None] == chain_labels[:, None, :]
+        rank = (
+            cyclic[:, None, :] & same_chain & preceding
+        ).long().sum(dim=-1) - 1
+        chain_length = (cyclic[:, None, :] & same_chain).long().sum(dim=-1)
+        pair_is_cyclic = (
+            cyclic[:, :, None] & cyclic[:, None, :] & same_chain
+        )
+        safe_length = chain_length.clamp_min(1)
+        directed_offset = torch.remainder(
+            rank[:, :, None] - rank[:, None, :],
+            safe_length[:, :, None],
+        )
+        return (
+            directed_offset,
+            safe_length[:, :, None].expand_as(directed_offset),
+            pair_is_cyclic,
+        )
+
+    def forward(self, X, mask, residue_idx, chain_labels, cyclic_mask=None):
         if self.training and self.augment_eps > 0:
             X = X + self.augment_eps * torch.randn_like(X)
         
@@ -146,6 +208,30 @@ class ProteinFeatures(nn.Module):
         d_chains = ((chain_labels[:, :, None] - chain_labels[:,None,:])==0).long()
         E_chains = gather_edges(d_chains[:,:,:,None], E_idx)[:,:,:,0]
         E_positional = self.embeddings(offset.long(), E_chains)
+        if cyclic_mask is not None:
+            (
+                cyclic_offset_all,
+                cyclic_length_all,
+                cyclic_pair_all,
+            ) = self._cyclic_pair_offsets(mask, chain_labels, cyclic_mask)
+            cyclic_offset = gather_edges(
+                cyclic_offset_all[:, :, :, None], E_idx
+            )[:, :, :, 0]
+            cyclic_length = gather_edges(
+                cyclic_length_all[:, :, :, None], E_idx
+            )[:, :, :, 0]
+            cyclic_pair = gather_edges(
+                cyclic_pair_all[:, :, :, None].long(), E_idx
+            )[:, :, :, 0].bool()
+            cyclic_positional = self.embeddings.forward_cyclic(
+                cyclic_offset,
+                cyclic_length,
+            )
+            E_positional = torch.where(
+                cyclic_pair.unsqueeze(-1),
+                cyclic_positional,
+                E_positional,
+            )
         E = torch.cat((E_positional, RBF_all), -1)
         E = self.edge_embedding(E)
         E = self.norm_edges(E)

@@ -66,8 +66,15 @@ EXPERT_PROTOCOL = (
     "canonical_clean_v28_all_expert_heads_corrected_labels_"
     "cyclic_stability_worst_start_v9"
 )
+V11_EXPERT_PROTOCOL = (
+    "canonical_clean_v28_all_expert_heads_cyclic_native_relative_positions_v11"
+)
 AUDIT_PROTOCOL = "cyclic_stability_worst_start_heldout_gate_v9"
 AUDIT_AUTHORIZATION = "CYCLIC_STABILITY_V9_VALIDATED_FOR_UNIFORM_REGENERATION"
+V11_AUDIT_PROTOCOL = "cyclic_native_relative_positions_heldout_gate_v11"
+V11_AUDIT_AUTHORIZATION = (
+    "CYCLIC_NATIVE_V11_VALIDATED_FOR_RMSD_PRIORITY_REGENERATION"
+)
 ANNOTATION_MODE = (
     "peptide_only_all_cyclic_starts_and_decoder_orders_mapped_to_physical_residues"
 )
@@ -423,6 +430,8 @@ def validate_upstream_hash_contract(
     ]
     scorer_inputs = scorer.get("inputs", {})
     selector_inputs = selector.get("inputs", {})
+    audit_expert_protocol = str(audit.get("model_expert_qc_protocol", ""))
+    audit_is_v11 = audit_expert_protocol == V11_EXPERT_PROTOCOL
     return {
         "selector_manifest_is_authorized_pass": (
             selector.get("quality_gate") == "PASS"
@@ -499,8 +508,15 @@ def validate_upstream_hash_contract(
         ),
         "heldout_audit_authorizes_exact_model_and_plan": (
             audit.get("quality_gate") == "PASS"
-            and audit.get("protocol") == AUDIT_PROTOCOL
-            and audit.get("release_authorization") == AUDIT_AUTHORIZATION
+            and audit.get("protocol")
+            == (V11_AUDIT_PROTOCOL if audit_is_v11 else AUDIT_PROTOCOL)
+            and audit.get("release_authorization")
+            == (
+                V11_AUDIT_AUTHORIZATION
+                if audit_is_v11
+                else AUDIT_AUTHORIZATION
+            )
+            and audit_expert_protocol in {EXPERT_PROTOCOL, V11_EXPERT_PROTOCOL}
             and audit.get("model_sha256") == model_hash
             and audit.get("plan_sha256") == plan_hash
             and audit.get("annotation_mode") == ANNOTATION_MODE
@@ -1143,17 +1159,31 @@ def main() -> None:
         else {}
     )
     del checkpoint
+    checkpoint_protocol = str(metadata.get("protocol", ""))
+    checkpoint_is_v11 = checkpoint_protocol == V11_EXPERT_PROTOCOL
     checkpoint_check = (
-        metadata.get("protocol") == EXPERT_PROTOCOL
+        checkpoint_protocol in {EXPERT_PROTOCOL, V11_EXPERT_PROTOCOL}
+        and checkpoint_protocol
+        == str(audit.get("model_expert_qc_protocol", ""))
         and float(metadata.get("worst_start_bce_weight", 0.0)) > 0.0
         and float(metadata.get("representation_consistency_weight", 0.0)) > 0.0
         and bool(metadata.get("full_physical_start_by_full_decoder_order_grid"))
         and float(metadata.get("training_ensemble_temperature", -1.0)) == TEMPERATURE
         and "full_physical_start_x_full_decoder_order_grid"
         in str(metadata.get("training_objective", ""))
+        and (
+            not checkpoint_is_v11
+            or (
+                bool(metadata.get("cyclic_relative_positions"))
+                and float(metadata.get("base_sequence_loss_weight", 0.0)) > 0.0
+                and float(metadata.get("positional_anchor_weight", 0.0)) > 0.0
+            )
+        )
     )
     if not checkpoint_check:
-        raise RuntimeError("Replay checkpoint is not a promoted V9 full-grid checkpoint")
+        raise RuntimeError(
+            "Replay checkpoint is not an authorized V9/V11 full-grid checkpoint"
+        )
 
     generator = load_module("v9_replay_generator", GENERATOR_PATH)
     scorer_module = load_module("v9_replay_exact_cyclic_base", SCORER_PATH)

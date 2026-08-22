@@ -42,6 +42,12 @@ from nmethyl.utils.nmethyl_config import (
 X_TOKEN = "X"
 X_INDEX = EXTENDED_AA_TO_INDEX[X_TOKEN]
 N_NATURAL = len(NATURAL_AA_ALPHABET)
+V11_MODEL_ARCHITECTURE_PROTOCOL = (
+    "proteinmpnn_boundary_marginalized_cyclic_relative_positions_v11"
+)
+V11_CYCLIC_OFFSET_POLICY = (
+    "same_designed_chain_directed_offset_marginalized_over_all_linear_cuts"
+)
 
 METHYL_ABS_TO_NAT = {
     int(m_rel) + N_NATURAL: int(n_idx)
@@ -514,7 +520,13 @@ def peptide_only_annotation_tensors(
 class RobustHierarchicalProteinMPNN(ProteinMPNN):
     """与 v28 / frankenstein_v28.pt 对齐的模型结构。"""
 
-    def __init__(self, hidden_dim: int = 128, augment_eps: float = 0.0, **kwargs):
+    def __init__(
+        self,
+        hidden_dim: int = 128,
+        augment_eps: float = 0.0,
+        cyclic_relative_positions: bool = False,
+        **kwargs,
+    ):
         super().__init__(
             num_letters=21,
             hidden_dim=hidden_dim,
@@ -533,6 +545,12 @@ class RobustHierarchicalProteinMPNN(ProteinMPNN):
         self.experts = nn.ModuleList([
             nn.Linear(hidden_dim, 1) for _ in range(len(NATURAL_AA_ALPHABET))
         ])
+        self.cyclic_relative_positions = bool(cyclic_relative_positions)
+
+    def set_cyclic_relative_positions(self, enabled: bool) -> None:
+        """Enable the V11 cyclic-native feature path without changing weights."""
+
+        self.cyclic_relative_positions = bool(enabled)
 
     def forward(
         self,
@@ -544,7 +562,16 @@ class RobustHierarchicalProteinMPNN(ProteinMPNN):
         chain_encoding_all,
         decoding_order=None,
     ):
-        E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all)
+        cyclic_mask = (
+            chain_M * mask if self.cyclic_relative_positions else None
+        )
+        E, E_idx = self.features(
+            X,
+            mask,
+            residue_idx,
+            chain_encoding_all,
+            cyclic_mask=cyclic_mask,
+        )
         h_V = torch.zeros((E.shape[0], E.shape[1], E.shape[-1]), device=E.device)
         h_E = self.W_e(E)
 
@@ -604,11 +631,31 @@ class RobustHierarchicalProteinMPNN(ProteinMPNN):
 
 def load_v28_model(model_path: str, device: torch.device) -> RobustHierarchicalProteinMPNN:
     """严格加载 frankenstein_v28.pt。不做切片，不做防弹加载。"""
-    model = RobustHierarchicalProteinMPNN(augment_eps=0.0).to(device)
     # Workflow callers hash-pin these local checkpoints, which also carry
     # non-tensor provenance metadata.  Keep full-payload loading explicit and
     # avoid PyTorch's warning about the future default changing.
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    architecture_metadata = (
+        dict(checkpoint.get("model_architecture_metadata", {}))
+        if isinstance(checkpoint, dict)
+        else {}
+    )
+    cyclic_relative_positions = bool(
+        architecture_metadata.get("cyclic_relative_positions", False)
+    )
+    if cyclic_relative_positions and (
+        str(architecture_metadata.get("protocol", ""))
+        != V11_MODEL_ARCHITECTURE_PROTOCOL
+        or str(architecture_metadata.get("cyclic_offset_policy", ""))
+        != V11_CYCLIC_OFFSET_POLICY
+    ):
+        raise RuntimeError(
+            "V11 cyclic-relative checkpoint metadata is incomplete or unsupported"
+        )
+    model = RobustHierarchicalProteinMPNN(
+        augment_eps=0.0,
+        cyclic_relative_positions=cyclic_relative_positions,
+    ).to(device)
     state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing or unexpected:

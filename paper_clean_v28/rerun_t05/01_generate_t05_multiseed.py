@@ -73,9 +73,19 @@ REQUIRED_CYCLIC_REPRESENTATION_EXPERT_PROTOCOL = (
     "canonical_clean_v28_all_expert_heads_corrected_labels_"
     "cyclic_stability_worst_start_v9"
 )
+V11_CYCLIC_NATIVE_EXPERT_PROTOCOL = (
+    "canonical_clean_v28_all_expert_heads_cyclic_native_relative_positions_v11"
+)
 REQUIRED_CYCLIC_REPRESENTATION_TRAINING_POLICY = (
     "all_physical_cyclic_starts_jointly_rotate_sequence_labels_and_"
     "backbone_coordinates_with_residue_index_reset"
+)
+V11_CYCLIC_NATIVE_TRAINING_POLICY = (
+    "boundary_marginalized_cyclic_relative_positions_with_all_physical_starts_"
+    "retained_as_an_explicit_equivariance_verification_grid"
+)
+V11_MODEL_ARCHITECTURE_PROTOCOL = (
+    "proteinmpnn_boundary_marginalized_cyclic_relative_positions_v11"
 )
 REQUIRED_CYCLIC_REPRESENTATION_ORDER_POLICY = (
     "complete_physical_cyclic_start_x_complete_L_decoder_order_grid_"
@@ -97,6 +107,16 @@ PEPTIDE_ONLY_ANNOTATION_CONTEXT = (
 REPRESENTATION_AUDIT_PROTOCOL = "cyclic_stability_worst_start_heldout_gate_v9"
 REPRESENTATION_AUDIT_AUTHORIZATION = (
     "CYCLIC_STABILITY_V9_VALIDATED_FOR_UNIFORM_REGENERATION"
+)
+V11_REPRESENTATION_AUDIT_PROTOCOL = (
+    "cyclic_native_relative_positions_heldout_gate_v11"
+)
+V11_REPRESENTATION_AUDIT_AUTHORIZATION = (
+    "CYCLIC_NATIVE_V11_VALIDATED_FOR_RMSD_PRIORITY_REGENERATION"
+)
+CYCLIC_ENSEMBLE_PLAN_PREFIXES = (
+    "temperature_0.5_cyclic_stability_worst_start_v9_",
+    "temperature_0.5_cyclic_native_relative_positions_v11_",
 )
 SAMPLING_CONTEXT_POLICY = "native_complex_longest_receptor_visible"
 DEFAULT_OUT = (
@@ -377,9 +397,7 @@ def validate_plan(plan: Mapping[str, Any], seeds_override: Sequence[int] | None 
 
     expected_raw = len(seeds) * sum(int(item["sequences_per_seed"]) for item in targets)
     expected_handoff = sum(int(item["structure_quota"]) for item in targets)
-    if str(plan.get("protocol", "")).startswith(
-        "temperature_0.5_cyclic_stability_worst_start_v9_"
-    ):
+    if str(plan.get("protocol", "")).startswith(CYCLIC_ENSEMBLE_PLAN_PREFIXES):
         v9_contract = {
             "sampling_context_policy": SAMPLING_CONTEXT_POLICY,
             "annotation_context_policy": PEPTIDE_ONLY_ANNOTATION_CONTEXT,
@@ -1577,14 +1595,20 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
     is_v9_cyclic_stability_plan = protocol_name.startswith(
         "temperature_0.5_cyclic_stability_worst_start_v9_"
     )
-    if is_v9_cyclic_stability_plan and not args.cyclic_representation_ensemble:
+    is_v11_cyclic_native_plan = protocol_name.startswith(
+        "temperature_0.5_cyclic_native_relative_positions_v11_"
+    )
+    is_full_cyclic_ensemble_plan = (
+        is_v9_cyclic_stability_plan or is_v11_cyclic_native_plan
+    )
+    if is_full_cyclic_ensemble_plan and not args.cyclic_representation_ensemble:
         raise RuntimeError(
-            "A V9 cyclic-stability plan requires "
+            "A V9/V11 full-cyclic plan requires "
             "--cyclic-representation-ensemble; decoder-only annotation is forbidden"
         )
     requires_expert_qc = (
         "all_expert_qc" in str(plan.get("protocol", ""))
-        or is_v9_cyclic_stability_plan
+        or is_full_cyclic_ensemble_plan
         or bool(args.cyclic_representation_ensemble)
     )
     if requires_expert_qc:
@@ -1594,6 +1618,8 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
                 "for hard duplicate exclusion"
             )
     checkpoint_metadata: Dict[str, Any] = {}
+    observed_protocol = ""
+    checkpoint_is_v11 = False
     if requires_expert_qc:
         checkpoint_payload = torch.load(model_path, map_location="cpu")
         if isinstance(checkpoint_payload, Mapping):
@@ -1602,9 +1628,15 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
             )
         observed_protocol = str(checkpoint_metadata.get("protocol", ""))
         if args.cyclic_representation_ensemble:
+            checkpoint_is_v11 = (
+                observed_protocol == V11_CYCLIC_NATIVE_EXPERT_PROTOCOL
+            )
             metadata_is_complete = (
                 observed_protocol
-                == REQUIRED_CYCLIC_REPRESENTATION_EXPERT_PROTOCOL
+                in {
+                    REQUIRED_CYCLIC_REPRESENTATION_EXPERT_PROTOCOL,
+                    V11_CYCLIC_NATIVE_EXPERT_PROTOCOL,
+                }
                 and int(checkpoint_metadata.get("minimum_order_coverage_epochs", 0))
                 >= 30
                 and bool(
@@ -1615,7 +1647,11 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
                         "training_cyclic_representation_policy", ""
                     )
                 )
-                == REQUIRED_CYCLIC_REPRESENTATION_TRAINING_POLICY
+                == (
+                    V11_CYCLIC_NATIVE_TRAINING_POLICY
+                    if checkpoint_is_v11
+                    else REQUIRED_CYCLIC_REPRESENTATION_TRAINING_POLICY
+                )
                 and str(
                     checkpoint_metadata.get("training_decoding_order_policy", "")
                 )
@@ -1645,8 +1681,55 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
                 == 0.5
                 and "full_physical_start_x_full_decoder_order_grid"
                 in str(checkpoint_metadata.get("training_objective", ""))
+                and (
+                    not checkpoint_is_v11
+                    or (
+                        bool(checkpoint_metadata.get("cyclic_relative_positions"))
+                        and str(
+                            checkpoint_metadata.get(
+                                "model_architecture_protocol", ""
+                            )
+                        )
+                        == V11_MODEL_ARCHITECTURE_PROTOCOL
+                        and float(
+                            checkpoint_metadata.get(
+                                "base_sequence_loss_weight", 0.0
+                            )
+                        )
+                        > 0.0
+                        and float(
+                            checkpoint_metadata.get(
+                                "positional_anchor_weight", 0.0
+                            )
+                        )
+                        > 0.0
+                        and float(
+                            checkpoint_metadata.get(
+                                "maximum_equivariance_span_tolerance", -1.0
+                            )
+                        )
+                        > 0.0
+                        and float(
+                            checkpoint_metadata.get(
+                                "maximum_equivariance_span_tolerance", -1.0
+                            )
+                        )
+                        <= 1e-5
+                        and float(
+                            checkpoint_metadata.get(
+                                "best_epoch_maximum_training_representation_span",
+                                float("inf"),
+                            )
+                        )
+                        <= 1e-5
+                    )
+                )
             )
-            expected_protocol = REQUIRED_CYCLIC_REPRESENTATION_EXPERT_PROTOCOL
+            expected_protocol = (
+                V11_CYCLIC_NATIVE_EXPERT_PROTOCOL
+                if checkpoint_is_v11
+                else REQUIRED_CYCLIC_REPRESENTATION_EXPERT_PROTOCOL
+            )
         else:
             metadata_is_complete = (
                 observed_protocol == REQUIRED_ORDER_BALANCED_EXPERT_PROTOCOL
@@ -1687,7 +1770,7 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
         representation_audit = read_json(representation_audit_path)
         audit_quality_checks = representation_audit.get("quality_checks", {})
         v9_audit_contract = (
-            not is_v9_cyclic_stability_plan
+            not is_full_cyclic_ensemble_plan
             or (
                 isinstance(audit_quality_checks, Mapping)
                 and bool(audit_quality_checks)
@@ -1706,9 +1789,19 @@ def run_generation(args: argparse.Namespace, plan: Dict[str, Any], validated: Di
             str(representation_audit.get("quality_gate", "")) == "PASS"
             and v9_audit_contract
             and str(representation_audit.get("protocol", ""))
-            == REPRESENTATION_AUDIT_PROTOCOL
+            == (
+                V11_REPRESENTATION_AUDIT_PROTOCOL
+                if checkpoint_is_v11
+                else REPRESENTATION_AUDIT_PROTOCOL
+            )
             and str(representation_audit.get("release_authorization", ""))
-            == REPRESENTATION_AUDIT_AUTHORIZATION
+            == (
+                V11_REPRESENTATION_AUDIT_AUTHORIZATION
+                if checkpoint_is_v11
+                else REPRESENTATION_AUDIT_AUTHORIZATION
+            )
+            and str(representation_audit.get("model_expert_qc_protocol", ""))
+            == observed_protocol
             and str(representation_audit.get("model_sha256", "")) == model_sha256
             and str(representation_audit.get("plan_sha256", ""))
             == sha256_file(Path(args.plan).resolve())

@@ -43,8 +43,15 @@ EXPERT_PROTOCOL = (
     "canonical_clean_v28_all_expert_heads_corrected_labels_"
     "cyclic_stability_worst_start_v9"
 )
+V11_EXPERT_PROTOCOL = (
+    "canonical_clean_v28_all_expert_heads_cyclic_native_relative_positions_v11"
+)
 AUDIT_PROTOCOL = "cyclic_stability_worst_start_heldout_gate_v9"
 AUDIT_AUTHORIZATION = "CYCLIC_STABILITY_V9_VALIDATED_FOR_UNIFORM_REGENERATION"
+V11_AUDIT_PROTOCOL = "cyclic_native_relative_positions_heldout_gate_v11"
+V11_AUDIT_AUTHORIZATION = (
+    "CYCLIC_NATIVE_V11_VALIDATED_FOR_RMSD_PRIORITY_REGENERATION"
+)
 SCORE_PROTOCOL = "receptor_visible_all_physical_starts_all_decoder_orders_exact_v9"
 FLOOR_POLICY = (
     "per_target_bottom_1pct_current_pool_outlier_filter_"
@@ -635,19 +642,33 @@ def main() -> None:
         else {}
     )
     del checkpoint
+    model_expert_protocol = str(metadata.get("protocol", ""))
+    model_is_v11 = model_expert_protocol == V11_EXPERT_PROTOCOL
     upstream_checks = {
         "checkpoint_is_promoted_v9": (
-            metadata.get("protocol") == EXPERT_PROTOCOL
+            model_expert_protocol in {EXPERT_PROTOCOL, V11_EXPERT_PROTOCOL}
             and float(metadata.get("worst_start_bce_weight", 0.0)) > 0.0
             and float(metadata.get("representation_consistency_weight", 0.0)) > 0.0
             and bool(metadata.get("full_physical_start_by_full_decoder_order_grid"))
             and float(metadata.get("training_ensemble_temperature", -1.0)) == 0.5
             and "full_physical_start_x_full_decoder_order_grid"
             in str(metadata.get("training_objective", ""))
+            and (
+                not model_is_v11
+                or (
+                    bool(metadata.get("cyclic_relative_positions"))
+                    and float(metadata.get("base_sequence_loss_weight", 0.0))
+                    > 0.0
+                )
+            )
         ),
         "generation_manifest_pass": generation_manifest.get("quality_gate") == "PASS",
         "generation_model_hash_matches": generation_manifest.get("model_sha256") == model_sha256,
         "generation_protocol_matches_plan": generation_manifest.get("protocol") == plan.get("protocol"),
+        "generation_expert_protocol_matches_checkpoint": (
+            generation_manifest.get("model_expert_qc_protocol")
+            == model_expert_protocol
+        ),
         "candidate_pool_matches_generation_methylated_bytes": (
             generation_manifest.get("methylated_new_candidates_csv_sha256")
             == sha256_file(candidate_path)
@@ -658,8 +679,15 @@ def main() -> None:
         ),
         "heldout_audit_is_authorized": (
             audit.get("quality_gate") == "PASS"
-            and audit.get("protocol") == AUDIT_PROTOCOL
-            and audit.get("release_authorization") == AUDIT_AUTHORIZATION
+            and audit.get("protocol")
+            == (V11_AUDIT_PROTOCOL if model_is_v11 else AUDIT_PROTOCOL)
+            and audit.get("release_authorization")
+            == (
+                V11_AUDIT_AUTHORIZATION
+                if model_is_v11
+                else AUDIT_AUTHORIZATION
+            )
+            and audit.get("model_expert_qc_protocol") == model_expert_protocol
             and audit.get("model_sha256") == model_sha256
             and audit.get("plan_sha256") == plan_sha256
         ),

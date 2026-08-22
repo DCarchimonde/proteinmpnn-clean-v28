@@ -42,6 +42,8 @@ from paper_clean_v28.clean_v28_common import (  # noqa: E402
     EXTENDED_AA_ALPHABET,
     NATURAL_AA_ALPHABET,
     N_NATURAL,
+    V11_CYCLIC_OFFSET_POLICY,
+    V11_MODEL_ARCHITECTURE_PROTOCOL,
     X_INDEX,
     cyclic_known_sequence_methyl_probabilities,
     cyclic_representation_known_sequence_methyl_probabilities,
@@ -83,16 +85,23 @@ REQUIRED_EXPERT_PROTOCOL = (
     "canonical_clean_v28_all_expert_heads_corrected_labels_"
     "cyclic_stability_worst_start_v9"
 )
+V11_EXPERT_PROTOCOL = (
+    "canonical_clean_v28_all_expert_heads_cyclic_native_relative_positions_v11"
+)
 SERINE_ONLY_EXPERT_PROTOCOL = (
     "canonical_clean_v28_serine_only_corrected_labels_"
     "cyclic_stability_worst_start_v9"
 )
 V6_AUDIT_PROTOCOL = "cyclic_stability_worst_start_heldout_gate_v9"
+V11_AUDIT_PROTOCOL = "cyclic_native_relative_positions_heldout_gate_v11"
 V7_AUDIT_PROTOCOL = (
     "cyclic_stability_worst_start_heldout_gate_v9_serine_only"
 )
 V6_AUTHORIZATION = (
     "CYCLIC_STABILITY_V9_VALIDATED_FOR_UNIFORM_REGENERATION"
+)
+V11_AUTHORIZATION = (
+    "CYCLIC_NATIVE_V11_VALIDATED_FOR_RMSD_PRIORITY_REGENERATION"
 )
 V7_AUTHORIZATION = (
     "SERINE_ONLY_CYCLIC_STABILITY_V9_VALIDATED_FOR_REANNOTATION"
@@ -101,6 +110,11 @@ REQUIRED_TRAINING_REPRESENTATION_POLICY = (
     "all_physical_cyclic_starts_jointly_rotate_sequence_labels_and_"
     "backbone_coordinates_with_residue_index_reset"
 )
+V11_TRAINING_REPRESENTATION_POLICY = (
+    "boundary_marginalized_cyclic_relative_positions_with_all_physical_starts_"
+    "retained_as_an_explicit_equivariance_verification_grid"
+)
+V11_MAXIMUM_EQUIVARIANCE_SPAN = 1e-5
 REQUIRED_TRAINING_ORDER_POLICY = (
     "complete_physical_cyclic_start_x_complete_L_decoder_order_grid_"
     "differentiably_meaned_per_start_then_mapped_to_physical_labels"
@@ -817,6 +831,15 @@ def audit_native_targets(
                         else 0.0
                     ),
                     "maximum_ensemble_recompute_difference": maximum_recompute_difference,
+                    "maximum_known_sequence_representation_span": float(
+                        ensemble["representation_span"][0, :length].max().item()
+                    ),
+                    "maximum_end_to_end_representation_span": float(
+                        end_to_end_ensemble["representation_span"]
+                        [0, :length]
+                        .max()
+                        .item()
+                    ),
                     "ensemble_probability_vector": json.dumps(
                         [round(float(value), 8) for value in reported]
                     ),
@@ -874,13 +897,55 @@ def checkpoint_metadata(
         if isinstance(payload, Mapping)
         else {}
     )
+    architecture = (
+        dict(payload.get("model_architecture_metadata", {}))
+        if isinstance(payload, Mapping)
+        else {}
+    )
     del payload
+    is_v11 = required_protocol == V11_EXPERT_PROTOCOL
+    v11_base_noninferiority = True
+    if is_v11:
+        legacy_base = metadata.get("legacy_parent_base_validation", {})
+        cyclic_parent_base = metadata.get(
+            "cyclic_native_parent_base_validation", {}
+        )
+        selected_base = metadata.get("selected_base_validation", {})
+        try:
+            maximum_ce_increase = float(
+                metadata["maximum_base_cross_entropy_increase"]
+            )
+            maximum_accuracy_drop = float(metadata["maximum_base_accuracy_drop"])
+            v11_base_noninferiority = (
+                math.isfinite(maximum_ce_increase)
+                and math.isfinite(maximum_accuracy_drop)
+                and 0.0 <= maximum_ce_increase <= 0.05
+                and 0.0 <= maximum_accuracy_drop <= 0.02
+                and isinstance(legacy_base, Mapping)
+                and isinstance(cyclic_parent_base, Mapping)
+                and isinstance(selected_base, Mapping)
+                and float(selected_base["cross_entropy"])
+                <= float(legacy_base["cross_entropy"]) + maximum_ce_increase
+                and float(selected_base["cross_entropy"])
+                <= float(cyclic_parent_base["cross_entropy"])
+                + maximum_ce_increase
+                and float(selected_base["accuracy"]) + maximum_accuracy_drop
+                >= float(legacy_base["accuracy"])
+                and float(selected_base["accuracy"]) + maximum_accuracy_drop
+                >= float(cyclic_parent_base["accuracy"])
+            )
+        except (KeyError, TypeError, ValueError, OverflowError):
+            v11_base_noninferiority = False
     if not (
         str(metadata.get("protocol", "")) == required_protocol
         and int(metadata.get("minimum_order_coverage_epochs", 0)) >= 30
         and bool(metadata.get("cyclic_representation_augmentation"))
         and str(metadata.get("training_cyclic_representation_policy", ""))
-        == REQUIRED_TRAINING_REPRESENTATION_POLICY
+        == (
+            V11_TRAINING_REPRESENTATION_POLICY
+            if is_v11
+            else REQUIRED_TRAINING_REPRESENTATION_POLICY
+        )
         and str(metadata.get("training_decoding_order_policy", ""))
         == REQUIRED_TRAINING_ORDER_POLICY
         and str(metadata.get("deployment_annotation_policy", ""))
@@ -891,10 +956,48 @@ def checkpoint_metadata(
         and float(metadata.get("training_ensemble_temperature", -1.0)) == 0.5
         and "full_physical_start_x_full_decoder_order_grid"
         in str(metadata.get("training_objective", ""))
+        and (
+            not is_v11
+            or (
+                bool(metadata.get("cyclic_relative_positions"))
+                and str(metadata.get("model_architecture_protocol", ""))
+                == V11_MODEL_ARCHITECTURE_PROTOCOL
+                and str(metadata.get("cyclic_offset_policy", ""))
+                == V11_CYCLIC_OFFSET_POLICY
+                and float(metadata.get("base_sequence_loss_weight", 0.0)) > 0.0
+                and float(metadata.get("positional_anchor_weight", 0.0)) > 0.0
+                and float(
+                    metadata.get("maximum_equivariance_span_tolerance", -1.0)
+                )
+                > 0.0
+                and float(
+                    metadata.get("maximum_equivariance_span_tolerance", -1.0)
+                )
+                <= V11_MAXIMUM_EQUIVARIANCE_SPAN
+                and float(
+                    metadata.get(
+                        "best_epoch_maximum_training_representation_span",
+                        float("inf"),
+                    )
+                )
+                <= V11_MAXIMUM_EQUIVARIANCE_SPAN
+                and set(metadata.get("trained_cyclic_positional_state_keys", []))
+                == {
+                    "features.embeddings.linear.weight",
+                    "features.embeddings.linear.bias",
+                }
+                and bool(architecture.get("cyclic_relative_positions"))
+                and str(architecture.get("protocol", ""))
+                == V11_MODEL_ARCHITECTURE_PROTOCOL
+                and str(architecture.get("cyclic_offset_policy", ""))
+                == V11_CYCLIC_OFFSET_POLICY
+                and v11_base_noninferiority
+            )
+        )
     ):
         raise RuntimeError(
             "Representation audit requires the requested promoted checkpoint "
-            "trained with all physical cyclic starts"
+            "with its complete cyclic training and architecture contract"
         )
     if required_protocol == SERINE_ONLY_EXPERT_PROTOCOL and not (
         str(metadata.get("expert_scope", "")) == "serine-only"
@@ -903,6 +1006,7 @@ def checkpoint_metadata(
         raise RuntimeError(
             "V7 representation audit requires an exactly Ser-only checkpoint"
         )
+    metadata["model_architecture_metadata"] = architecture
     return metadata
 
 
@@ -953,9 +1057,11 @@ def run(args: argparse.Namespace) -> None:
     if required_protocol not in {
         REQUIRED_EXPERT_PROTOCOL,
         SERINE_ONLY_EXPERT_PROTOCOL,
+        V11_EXPERT_PROTOCOL,
     }:
         raise ValueError("Unsupported expert protocol for representation audit")
     serine_only = required_protocol == SERINE_ONLY_EXPERT_PROTOCOL
+    cyclic_native_v11 = required_protocol == V11_EXPERT_PROTOCOL
     metadata = checkpoint_metadata(model_path, required_protocol)
     plan = read_json(plan_path)
     targets = [str(row["target_name"]).upper() for row in plan["targets"]]
@@ -1055,6 +1161,21 @@ def run(args: argparse.Namespace) -> None:
             )
             == 0
         ),
+        "v11_heldout_known_sequence_maximum_span_le_1e_5": (
+            not cyclic_native_v11
+            or float(
+                representation_summary["maximum_probability_representation_span"]
+            )
+            <= V11_MAXIMUM_EQUIVARIANCE_SPAN
+        ),
+        "v11_heldout_end_to_end_maximum_span_le_1e_5": (
+            not cyclic_native_v11
+            or float(
+                representation_summary["end_to_end_representation_ensemble"]
+                ["maximum_probability_representation_span"]
+            )
+            <= V11_MAXIMUM_EQUIVARIANCE_SPAN
+        ),
         "every_native_target_hard_call_is_stable_across_cyclic_starts": all(
             int(row["raw_all_representations_same_physical_annotation"]) == 1
             for row in native_summary
@@ -1067,6 +1188,22 @@ def run(args: argparse.Namespace) -> None:
             )
             == 1
             for row in native_summary
+        ),
+        "v11_every_native_known_sequence_maximum_span_le_1e_5": (
+            not cyclic_native_v11
+            or all(
+                float(row["maximum_known_sequence_representation_span"])
+                <= V11_MAXIMUM_EQUIVARIANCE_SPAN
+                for row in native_summary
+            )
+        ),
+        "v11_every_native_end_to_end_maximum_span_le_1e_5": (
+            not cyclic_native_v11
+            or all(
+                float(row["maximum_end_to_end_representation_span"])
+                <= V11_MAXIMUM_EQUIVARIANCE_SPAN
+                for row in native_summary
+            )
         ),
         "mapped_ensemble_recomputes_from_raw_rotations": all(
             float(row["maximum_ensemble_recompute_difference"]) <= 1e-6
@@ -1090,7 +1227,11 @@ def run(args: argparse.Namespace) -> None:
     }
     quality_gate = "PASS" if all(quality_checks.values()) else "FAIL"
     authorization = (
-        (V7_AUTHORIZATION if serine_only else V6_AUTHORIZATION)
+        (
+            V7_AUTHORIZATION
+            if serine_only
+            else (V11_AUTHORIZATION if cyclic_native_v11 else V6_AUTHORIZATION)
+        )
         if quality_gate == "PASS"
         else "BLOCKED_DO_NOT_REANNOTATE_OR_RELEASE"
     )
@@ -1113,15 +1254,31 @@ def run(args: argparse.Namespace) -> None:
     report = {
         "quality_gate": quality_gate,
         "release_authorization": authorization,
-        "protocol": V7_AUDIT_PROTOCOL if serine_only else V6_AUDIT_PROTOCOL,
+        "protocol": (
+            V7_AUDIT_PROTOCOL
+            if serine_only
+            else (V11_AUDIT_PROTOCOL if cyclic_native_v11 else V6_AUDIT_PROTOCOL)
+        ),
         "scientific_scope": (
-            "Outer ensemble jointly rotates sequence and N/CA/C/O coordinates, resets "
-            "linear residue indices, maps probabilities back to physical residues, and "
-            "uses the mean only for ranking while the all-start minimum controls release. "
-            "This repairs the training/deployment cyclic-grid mismatch and is paired "
-            "with a checkpoint trained on every cyclic start. It does not prove that "
-            "the trained heads eliminated target-level methyl-site concentration; "
-            "candidate generation and final selection enforce that separately."
+            (
+                "V11 removes the artificial peptide cut inside the model by analytically "
+                "marginalizing learned relative-position embeddings over every cyclic "
+                "start. The outer all-start x all-order grid remains an independent "
+                "numerical proof: both known-sequence and end-to-end probability spans "
+                "must be <=1e-5 on 1,505 held-out positions and all 17 native targets. "
+                "This does not prove post-structure RMSD; later generation, exact base, "
+                "RMSD-priority, and returned-structure audits remain mandatory."
+                if cyclic_native_v11
+                else
+                "Outer ensemble jointly rotates sequence and N/CA/C/O coordinates, "
+                "resets linear residue indices, maps probabilities back to physical "
+                "residues, and uses the mean only for ranking while the all-start "
+                "minimum controls release. This repairs the training/deployment cyclic-"
+                "grid mismatch and is paired with a checkpoint trained on every cyclic "
+                "start. It does not prove that the trained heads eliminated target-level "
+                "methyl-site concentration; candidate generation and final selection "
+                "enforce that separately."
+            )
         ),
         "validation_scope": (
             "Internal development safety audit only. The 151 records were reused "
@@ -1138,6 +1295,15 @@ def run(args: argparse.Namespace) -> None:
         "model_path": str(model_path),
         "model_sha256": sha256_file(model_path),
         "model_expert_qc_protocol": metadata.get("protocol"),
+        "model_architecture_protocol": metadata.get(
+            "model_architecture_protocol"
+        ),
+        "cyclic_relative_positions": bool(
+            metadata.get("cyclic_relative_positions")
+        ),
+        "maximum_equivariance_span_tolerance": (
+            V11_MAXIMUM_EQUIVARIANCE_SPAN if cyclic_native_v11 else None
+        ),
         "test_jsonl": str(test_path),
         "test_jsonl_sha256": sha256_file(test_path),
         "native_jsonl": str(native_path),
@@ -1179,7 +1345,11 @@ def run(args: argparse.Namespace) -> None:
         "structure_handoff_status": (
             "BLOCKED_PENDING_V7_RESULT_REVIEW"
             if serine_only
-            else "BLOCKED_PENDING_V6_RESULT_REVIEW"
+            else (
+                "BLOCKED_PENDING_V11_GENERATION_AND_STRUCTURE_REVIEW"
+                if cyclic_native_v11
+                else "BLOCKED_PENDING_V6_RESULT_REVIEW"
+            )
         ),
         "artifacts": {
             "heldout_position_probabilities": {
@@ -1230,7 +1400,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--required-expert-protocol",
         default=REQUIRED_EXPERT_PROTOCOL,
-        choices=(REQUIRED_EXPERT_PROTOCOL, SERINE_ONLY_EXPERT_PROTOCOL),
+        choices=(
+            REQUIRED_EXPERT_PROTOCOL,
+            SERINE_ONLY_EXPERT_PROTOCOL,
+            V11_EXPERT_PROTOCOL,
+        ),
     )
     parser.add_argument("--test-jsonl", default=str(DEFAULT_TEST))
     parser.add_argument("--native-jsonl", default=str(DEFAULT_NATIVE))

@@ -42,8 +42,15 @@ EXPERT_PROTOCOL = (
     "canonical_clean_v28_all_expert_heads_corrected_labels_"
     "cyclic_stability_worst_start_v9"
 )
+V11_EXPERT_PROTOCOL = (
+    "canonical_clean_v28_all_expert_heads_cyclic_native_relative_positions_v11"
+)
 AUDIT_PROTOCOL = "cyclic_stability_worst_start_heldout_gate_v9"
 AUDIT_AUTHORIZATION = "CYCLIC_STABILITY_V9_VALIDATED_FOR_UNIFORM_REGENERATION"
+V11_AUDIT_PROTOCOL = "cyclic_native_relative_positions_heldout_gate_v11"
+V11_AUDIT_AUTHORIZATION = (
+    "CYCLIC_NATIVE_V11_VALIDATED_FOR_RMSD_PRIORITY_REGENERATION"
+)
 ANNOTATION_MODE = (
     "peptide_only_all_cyclic_starts_and_decoder_orders_mapped_to_physical_residues"
 )
@@ -1039,10 +1046,17 @@ def validate_upstream(
         audit.get("cyclic_representation_ensemble_heldout", {})
         .get("representation_threshold_disagreement_positions", -1)
     )
+    observed_expert_protocol = str(
+        manifest.get("model_expert_qc_protocol", "")
+    )
+    model_is_v11 = observed_expert_protocol == V11_EXPERT_PROTOCOL
     checks = {
         "plan_is_v9_17_target_t05_threshold_06": (
             str(plan.get("protocol", "")).startswith(
-                "temperature_0.5_cyclic_stability_worst_start_v9_"
+                (
+                    "temperature_0.5_cyclic_stability_worst_start_v9_",
+                    "temperature_0.5_cyclic_native_relative_positions_v11_",
+                )
             )
             and float(plan.get("temperature", -1.0)) == TEMPERATURE
             and float(plan.get("methyl_threshold", -1.0)) == THRESHOLD
@@ -1067,16 +1081,23 @@ def validate_upstream(
         ),
         "generation_protocol_matches_plan": manifest.get("protocol") == plan.get("protocol"),
         "generation_checkpoint_is_v9_worst_start_model": (
-            manifest.get("model_expert_qc_protocol") == EXPERT_PROTOCOL
+            observed_expert_protocol in {EXPERT_PROTOCOL, V11_EXPERT_PROTOCOL}
         ),
         "generation_annotation_stability_passes": (
             manifest.get("annotation_stability_audit", {}).get("quality_gate") == "PASS"
         ),
         "heldout_audit_is_authorized_v9": (
             audit.get("quality_gate") == "PASS"
-            and audit.get("protocol") == AUDIT_PROTOCOL
-            and audit.get("release_authorization") == AUDIT_AUTHORIZATION
-            and audit.get("model_expert_qc_protocol") == EXPERT_PROTOCOL
+            and audit.get("protocol")
+            == (V11_AUDIT_PROTOCOL if model_is_v11 else AUDIT_PROTOCOL)
+            and audit.get("release_authorization")
+            == (
+                V11_AUDIT_AUTHORIZATION
+                if model_is_v11
+                else AUDIT_AUTHORIZATION
+            )
+            and audit.get("model_expert_qc_protocol")
+            == observed_expert_protocol
             and isinstance(audit_checks, Mapping)
             and bool(audit_checks)
             and all(bool(value) for value in audit_checks.values())

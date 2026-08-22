@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """Retrain clean-V28 expert heads on provenance-corrected labels.
 
-The shared ProteinMPNN trunk and the natural-amino-acid base head remain frozen.
-The historical V3/V6 mode optimizes all twenty residue experts together.  The
+The historical V3/V6/V9 modes keep the shared ProteinMPNN trunk and the
+natural-amino-acid base head frozen while optimizing residue experts.  The
 V7 ``serine-only`` mode is narrower: provenance correction changed only the
 ordinary-ATOM Ser label, so it optimizes only the Ser expert and requires every
 other tensor (including the other nineteen experts) to remain bitwise identical
@@ -20,6 +20,14 @@ within each start, maps those means back to physical residues, and optimizes the
 label-aware worst start plus a strictly positive consistency penalty.
 Validation, test promotion, and downstream annotation use that same complete
 grid at the frozen deployment temperature.
+
+V11 changes the model representation itself.  Same-chain designed-peptide
+relative positions analytically marginalize the learned linear positional
+embedding over every possible cyclic cut.  Training jointly adapts only that
+small positional projection and all twenty experts, adding a natural-amino-acid
+base reconstruction objective plus a parent-weight trust region.  Explicit
+base-logit non-inferiority and numerical equivariance gates prevent expert
+metrics from hiding damage to the sequence generator.
 
 The corrected 600-record training split is divided deterministically into a
 development-train and record-disjoint validation partition.  The original 151
@@ -62,6 +70,8 @@ from nmethyl.utils.nmethyl_config import (  # noqa: E402
 )
 from paper_clean_v28.clean_v28_common import (  # noqa: E402
     N_NATURAL,
+    V11_CYCLIC_OFFSET_POLICY,
+    V11_MODEL_ARCHITECTURE_PROTOCOL,
     X_INDEX,
     binary_metrics,
     cyclic_designed_decoding_order,
@@ -96,6 +106,13 @@ CYCLIC_REPRESENTATION_PROTOCOL = (
     "canonical_clean_v28_all_expert_heads_corrected_labels_"
     "cyclic_stability_worst_start_v9"
 )
+CYCLIC_NATIVE_V11_PROTOCOL = (
+    "canonical_clean_v28_all_expert_heads_cyclic_native_relative_positions_v11"
+)
+V11_TRAINING_REPRESENTATION_POLICY = (
+    "boundary_marginalized_cyclic_relative_positions_with_all_physical_starts_"
+    "retained_as_an_explicit_equivariance_verification_grid"
+)
 SERINE_ONLY_CYCLIC_PROTOCOL = (
     "canonical_clean_v28_serine_only_corrected_labels_"
     "cyclic_stability_worst_start_v9"
@@ -108,6 +125,16 @@ MINIMUM_ORDER_COVERAGE_EPOCHS = 30
 VALIDATION_INTERVAL_EPOCHS = 5
 DEFAULT_WORST_START_BCE_WEIGHT = 1.0
 DEFAULT_REPRESENTATION_CONSISTENCY_WEIGHT = 0.25
+DEFAULT_V11_POSITIONAL_LEARNING_RATE = 2e-5
+DEFAULT_V11_BASE_SEQUENCE_LOSS_WEIGHT = 0.25
+DEFAULT_V11_POSITIONAL_ANCHOR_WEIGHT = 0.01
+DEFAULT_V11_MAXIMUM_EQUIVARIANCE_SPAN = 1e-5
+DEFAULT_V11_MAXIMUM_BASE_CE_INCREASE = 0.05
+DEFAULT_V11_MAXIMUM_BASE_ACCURACY_DROP = 0.02
+V11_POSITIONAL_STATE_KEYS = {
+    "features.embeddings.linear.weight",
+    "features.embeddings.linear.bias",
+}
 
 
 def file_sha256(path: Path) -> str:
@@ -556,6 +583,59 @@ def trainable_expert_parameters(
     return parameters
 
 
+def enable_v11_cyclic_positional_parameters(
+    model: torch.nn.Module,
+) -> List[torch.nn.Parameter]:
+    """Enable only the small learned relative-position projection for V11.
+
+    The 600 corrected peptide records are too small to justify unfreezing the
+    encoder/decoder trunk.  V11 therefore adapts the 1,072-parameter positional
+    projection jointly with the expert heads while every other parent tensor
+    remains bitwise frozen.
+    """
+
+    try:
+        positional = model.features.embeddings.linear
+    except AttributeError as exc:
+        raise RuntimeError(
+            "V11 requires ProteinFeatures.embeddings.linear"
+        ) from exc
+    parameters = list(positional.parameters())
+    observed_keys = {
+        name
+        for name, parameter in model.named_parameters()
+        if any(parameter is candidate for candidate in parameters)
+    }
+    if observed_keys != V11_POSITIONAL_STATE_KEYS:
+        raise RuntimeError(
+            "V11 positional parameter scope changed: "
+            f"expected {sorted(V11_POSITIONAL_STATE_KEYS)}, "
+            f"observed {sorted(observed_keys)}"
+        )
+    for parameter in parameters:
+        parameter.requires_grad_(True)
+    return parameters
+
+
+def positional_anchor_loss(
+    model: torch.nn.Module,
+    anchor: Mapping[str, torch.Tensor],
+) -> torch.Tensor:
+    """Mean-square trust-region penalty around the canonical parent weights."""
+
+    named = dict(model.named_parameters())
+    losses: List[torch.Tensor] = []
+    for key in sorted(V11_POSITIONAL_STATE_KEYS):
+        if key not in named or key not in anchor:
+            raise RuntimeError(f"V11 positional anchor is missing {key}")
+        reference = anchor[key].to(
+            device=named[key].device,
+            dtype=named[key].dtype,
+        )
+        losses.append((named[key] - reference).square().mean())
+    return torch.stack(losses).mean()
+
+
 def positive_weights_by_base(
     records: Sequence[Mapping[str, Any]],
     active_base_indices: Sequence[int] | None = None,
@@ -724,7 +804,8 @@ def differentiable_full_decoder_order_mean_probabilities(
     valid: torch.Tensor,
     group_lengths: Sequence[int],
     temperature: float,
-) -> torch.Tensor:
+    return_base_sequence_loss: bool = False,
+) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
     """Differentiably average all L decoder orders for every expanded start.
 
     The expanded batch contains L rows for an original length-L peptide.  Each
@@ -772,13 +853,15 @@ def differentiable_full_decoder_order_mean_probabilities(
 
     probability_sum = torch.zeros_like(S_natural, dtype=torch.float32)
     probability_count = torch.zeros_like(S_natural, dtype=torch.float32)
+    base_sequence_loss_sum = torch.zeros((), device=S_natural.device)
+    base_sequence_position_count = 0
     for decoder_shift in range(max(row_lengths)):
         decoding_order = cyclic_designed_decoding_order(
             chain_M,
             mask,
             shift=decoder_shift,
         )
-        _base_logits, expert_logits = model(
+        base_logits, expert_logits = model(
             X,
             S_natural,
             mask,
@@ -792,6 +875,11 @@ def differentiable_full_decoder_order_mean_probabilities(
             or int(expert_logits.shape[-1]) != len(NATURAL_AA_ALPHABET)
         ):
             raise RuntimeError("Full-grid model returned malformed expert logits")
+        if (
+            base_logits.shape[:2] != S_natural.shape
+            or int(base_logits.shape[-1]) != len(NATURAL_AA_ALPHABET)
+        ):
+            raise RuntimeError("Full-grid model returned malformed base logits")
         selected_logits = torch.gather(
             expert_logits,
             -1,
@@ -809,6 +897,13 @@ def differentiable_full_decoder_order_mean_probabilities(
         contribution_float = contribution.to(dtype=probabilities.dtype)
         probability_sum = probability_sum + probabilities * contribution_float
         probability_count += contribution_float.to(dtype=probability_count.dtype)
+        if return_base_sequence_loss:
+            base_sequence_loss_sum = base_sequence_loss_sum + F.cross_entropy(
+                base_logits[contribution],
+                safe_base[contribution],
+                reduction="sum",
+            )
+            base_sequence_position_count += int(contribution.sum().item())
 
     expected_count = torch.tensor(
         row_lengths,
@@ -820,7 +915,15 @@ def differentiable_full_decoder_order_mean_probabilities(
             "Full-grid decoder-order coverage is incomplete or duplicated"
         )
     order_mean = probability_sum / probability_count.clamp_min(1.0)
-    return torch.where(valid, order_mean, torch.zeros_like(order_mean))
+    order_mean = torch.where(valid, order_mean, torch.zeros_like(order_mean))
+    if not return_base_sequence_loss:
+        return order_mean
+    if base_sequence_position_count <= 0:
+        raise RuntimeError("Full-grid base-sequence objective has no positions")
+    return (
+        order_mean,
+        base_sequence_loss_sum / float(base_sequence_position_count),
+    )
 
 
 def cyclic_worst_start_and_consistency_loss(
@@ -949,6 +1052,7 @@ def validation_balanced_bce(
     worst_start_bce_weight: float = DEFAULT_WORST_START_BCE_WEIGHT,
     representation_consistency_weight: float = DEFAULT_REPRESENTATION_CONSISTENCY_WEIGHT,
     ensemble_temperature: float = 0.5,
+    base_sequence_loss_weight: float = 0.0,
 ) -> float:
     if cyclic_representation_ensemble and (
         not math.isfinite(float(worst_start_bce_weight))
@@ -962,6 +1066,11 @@ def validation_balanced_bce(
         )
     if not math.isfinite(float(ensemble_temperature)) or ensemble_temperature <= 0.0:
         raise ValueError("Validation ensemble temperature must be positive")
+    if (
+        not math.isfinite(float(base_sequence_loss_weight))
+        or base_sequence_loss_weight < 0.0
+    ):
+        raise ValueError("Validation base-sequence loss weight cannot be negative")
     model.eval()
     losses: List[float] = []
     with torch.no_grad():
@@ -971,8 +1080,9 @@ def validation_balanced_bce(
                 continue
             tensors, _metas = packed
             X, S_label, mask, chain_M, residue_idx, chain_encoding_all, real_pos = tensors
+            cyclic_group_lengths: Tuple[int, ...] | None = None
             if cyclic_representation_ensemble:
-                require_complete_cyclic_training_mask(
+                cyclic_group_lengths = require_complete_cyclic_training_mask(
                     mask,
                     chain_M,
                     real_pos,
@@ -992,6 +1102,68 @@ def validation_balanced_bce(
             ):
                 continue
             S_forward = naturalize_tensor_for_input(S_label)
+            if cyclic_representation_ensemble and base_sequence_loss_weight > 0.0:
+                if cyclic_group_lengths is None:
+                    raise RuntimeError("Cyclic validation group lengths are missing")
+                (
+                    expanded_X,
+                    expanded_S_label,
+                    expanded_mask,
+                    expanded_chain_M,
+                    expanded_residue_idx,
+                    expanded_chain_encoding,
+                    expanded_real_pos,
+                ) = expand_all_cyclic_training_representations(
+                    X,
+                    S_label,
+                    mask,
+                    chain_M,
+                    residue_idx,
+                    chain_encoding_all,
+                    real_pos,
+                )
+                expanded_valid = (
+                    (expanded_mask > 0)
+                    & (expanded_chain_M > 0)
+                    & (expanded_real_pos > 0)
+                    & (expanded_S_label != X_INDEX)
+                )
+                full_grid = differentiable_full_decoder_order_mean_probabilities(
+                    model,
+                    expanded_X,
+                    naturalize_tensor_for_input(expanded_S_label),
+                    expanded_mask,
+                    expanded_chain_M,
+                    expanded_residue_idx,
+                    expanded_chain_encoding,
+                    expanded_valid,
+                    cyclic_group_lengths,
+                    temperature=ensemble_temperature,
+                    return_base_sequence_loss=True,
+                )
+                if not isinstance(full_grid, tuple):
+                    raise RuntimeError("V11 validation base objective was not returned")
+                order_mean_probability, base_sequence_loss = full_grid
+                (
+                    worst_start_loss,
+                    consistency_loss,
+                    _maximum_span,
+                    _coverage,
+                ) = cyclic_worst_start_and_consistency_loss(
+                    order_mean_probability,
+                    expanded_S_label,
+                    expanded_valid,
+                    cyclic_group_lengths,
+                    positive_weights,
+                    active_base_indices=active_base_indices,
+                )
+                loss = (
+                    float(worst_start_bce_weight) * worst_start_loss
+                    + float(representation_consistency_weight) * consistency_loss
+                    + float(base_sequence_loss_weight) * base_sequence_loss
+                )
+                losses.append(float(loss.item()))
+                continue
             if cyclic_representation_ensemble:
                 representation = (
                     cyclic_representation_known_sequence_methyl_probabilities(
@@ -1049,6 +1221,114 @@ def validation_balanced_bce(
     return float(sum(losses) / len(losses))
 
 
+def full_grid_base_sequence_metrics(
+    model: torch.nn.Module,
+    records: Sequence[Mapping[str, Any]],
+    device: torch.device,
+    batch_size: int,
+) -> Dict[str, float | int]:
+    """Evaluate natural-AA prediction over every physical start and order.
+
+    This is the V11 non-inferiority endpoint.  It does not reuse the methyl
+    heads: the twenty-way base logits are scored directly against the
+    naturalized peptide sequence for the complete L x L cyclic grid.
+    """
+
+    model.eval()
+    loss_sum = 0.0
+    correct = 0
+    count = 0
+    with torch.no_grad():
+        for batch in batches(records, batch_size):
+            packed = featurize_records(batch, device=device, eval_chains="masked")
+            if packed is None:
+                continue
+            tensors, _metas = packed
+            X, S_label, mask, chain_M, residue_idx, chain_encoding_all, real_pos = (
+                tensors
+            )
+            group_lengths = require_complete_cyclic_training_mask(
+                mask,
+                chain_M,
+                real_pos,
+                S_label,
+                "V11 base non-inferiority validation",
+            )
+            (
+                X,
+                S_label,
+                mask,
+                chain_M,
+                residue_idx,
+                chain_encoding_all,
+                real_pos,
+            ) = expand_all_cyclic_training_representations(
+                X,
+                S_label,
+                mask,
+                chain_M,
+                residue_idx,
+                chain_encoding_all,
+                real_pos,
+            )
+            valid = (
+                (mask > 0)
+                & (chain_M > 0)
+                & (real_pos > 0)
+                & (S_label != X_INDEX)
+            )
+            groups = expanded_cyclic_group_slices(valid, group_lengths)
+            row_lengths: List[int] = []
+            for _cursor, length, _positions in groups:
+                row_lengths.extend([length] * length)
+            S_natural = naturalize_tensor_for_input(S_label)
+            for decoder_shift in range(max(row_lengths)):
+                decoding_order = cyclic_designed_decoding_order(
+                    chain_M,
+                    mask,
+                    shift=decoder_shift,
+                )
+                base_logits, _expert_logits = model(
+                    X,
+                    S_natural,
+                    mask,
+                    chain_M,
+                    residue_idx,
+                    chain_encoding_all,
+                    decoding_order=decoding_order,
+                )
+                active_rows = torch.tensor(
+                    [decoder_shift < length for length in row_lengths],
+                    device=valid.device,
+                    dtype=torch.bool,
+                )
+                contribution = valid & active_rows.unsqueeze(-1)
+                if not bool(contribution.any()):
+                    continue
+                loss_sum += float(
+                    F.cross_entropy(
+                        base_logits[contribution],
+                        S_natural[contribution],
+                        reduction="sum",
+                    ).item()
+                )
+                predicted = torch.argmax(base_logits, dim=-1)
+                correct += int(
+                    (predicted[contribution] == S_natural[contribution])
+                    .sum()
+                    .item()
+                )
+                count += int(contribution.sum().item())
+    if count <= 0:
+        raise RuntimeError("V11 base non-inferiority evaluation has no positions")
+    return {
+        "grid_position_evaluations": count,
+        "cross_entropy": loss_sum / count,
+        "accuracy": correct / count,
+        "correct": correct,
+    }
+
+
 def train_all_expert_heads(
     model: torch.nn.Module,
     train_records: Sequence[Mapping[str, Any]],
@@ -1064,6 +1344,10 @@ def train_all_expert_heads(
     worst_start_bce_weight: float = DEFAULT_WORST_START_BCE_WEIGHT,
     representation_consistency_weight: float = DEFAULT_REPRESENTATION_CONSISTENCY_WEIGHT,
     ensemble_temperature: float = 0.5,
+    train_cyclic_positional_encoding: bool = False,
+    positional_learning_rate: float = DEFAULT_V11_POSITIONAL_LEARNING_RATE,
+    base_sequence_loss_weight: float = 0.0,
+    positional_anchor_weight: float = 0.0,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, torch.Tensor], Dict[str, Any]]:
     if cyclic_representation_augmentation and (
         not math.isfinite(float(worst_start_bce_weight))
@@ -1077,6 +1361,22 @@ def train_all_expert_heads(
         )
     if not math.isfinite(float(ensemble_temperature)) or ensemble_temperature <= 0.0:
         raise ValueError("Training ensemble temperature must be positive")
+    if train_cyclic_positional_encoding and not cyclic_representation_augmentation:
+        raise ValueError(
+            "V11 positional adaptation requires cyclic representation augmentation"
+        )
+    if train_cyclic_positional_encoding and (
+        not math.isfinite(float(positional_learning_rate))
+        or not math.isfinite(float(base_sequence_loss_weight))
+        or not math.isfinite(float(positional_anchor_weight))
+        or positional_learning_rate <= 0.0
+        or base_sequence_loss_weight <= 0.0
+        or positional_anchor_weight <= 0.0
+    ):
+        raise ValueError(
+            "V11 positional learning rate, base-sequence loss weight, and "
+            "positional-anchor weight must be positive and finite"
+        )
     active_indices = normalize_active_base_indices(active_base_indices)
     active_state_keys = {
         f"experts.{index}.{suffix}"
@@ -1084,10 +1384,34 @@ def train_all_expert_heads(
         for suffix in ("weight", "bias")
     }
     expert_parameters = trainable_expert_parameters(model, active_indices)
+    positional_parameters: List[torch.nn.Parameter] = []
+    positional_anchor: Dict[str, torch.Tensor] = {}
+    if train_cyclic_positional_encoding:
+        active_state_keys.update(V11_POSITIONAL_STATE_KEYS)
+        positional_parameters = enable_v11_cyclic_positional_parameters(model)
+        positional_anchor = {
+            key: value.detach().cpu().clone()
+            for key, value in model.named_parameters()
+            if key in V11_POSITIONAL_STATE_KEYS
+        }
     positive_weights = positive_weights_by_base(train_records, active_indices)
-    optimizer = torch.optim.AdamW(
-        expert_parameters, lr=learning_rate, weight_decay=1e-4
-    )
+    optimizer_groups: List[Dict[str, Any]] = [
+        {
+            "params": expert_parameters,
+            "lr": learning_rate,
+            "weight_decay": 1e-4,
+        }
+    ]
+    if positional_parameters:
+        optimizer_groups.append(
+            {
+                "params": positional_parameters,
+                "lr": positional_learning_rate,
+                "weight_decay": 0.0,
+            }
+        )
+    optimizer = torch.optim.AdamW(optimizer_groups)
+    trainable_parameters = expert_parameters + positional_parameters
     history: List[Dict[str, Any]] = []
     best_validation = math.inf
     best_epoch = 0
@@ -1107,6 +1431,8 @@ def train_all_expert_heads(
         batch_mean_bce_losses: List[float] = []
         batch_worst_start_losses: List[float] = []
         batch_consistency_losses: List[float] = []
+        batch_base_sequence_losses: List[float] = []
+        batch_positional_anchor_losses: List[float] = []
         epoch_maximum_representation_span = 0.0
         optimizer_update_batches = 0
         skipped_no_active_position_batches = 0
@@ -1164,20 +1490,28 @@ def train_all_expert_heads(
             if cyclic_representation_augmentation:
                 if cyclic_group_lengths is None:
                     raise RuntimeError("Cyclic group metadata was not preserved")
-                order_mean_probability = (
-                    differentiable_full_decoder_order_mean_probabilities(
-                        model,
-                        X,
-                        S_forward,
-                        mask,
-                        chain_M,
-                        residue_idx,
-                        chain_encoding_all,
-                        valid,
-                        cyclic_group_lengths,
-                        temperature=ensemble_temperature,
-                    )
+                full_grid = differentiable_full_decoder_order_mean_probabilities(
+                    model,
+                    X,
+                    S_forward,
+                    mask,
+                    chain_M,
+                    residue_idx,
+                    chain_encoding_all,
+                    valid,
+                    cyclic_group_lengths,
+                    temperature=ensemble_temperature,
+                    return_base_sequence_loss=train_cyclic_positional_encoding,
                 )
+                if train_cyclic_positional_encoding:
+                    if not isinstance(full_grid, tuple):
+                        raise RuntimeError("V11 base-sequence objective was not returned")
+                    order_mean_probability, base_sequence_loss = full_grid
+                else:
+                    if isinstance(full_grid, tuple):
+                        raise RuntimeError("Legacy full-grid objective changed type")
+                    order_mean_probability = full_grid
+                    base_sequence_loss = torch.zeros((), device=X.device)
                 (
                     worst_start_loss,
                     consistency_loss,
@@ -1195,6 +1529,17 @@ def train_all_expert_heads(
                     float(worst_start_bce_weight) * worst_start_loss
                     + float(representation_consistency_weight) * consistency_loss
                 )
+                if train_cyclic_positional_encoding:
+                    anchor_loss = positional_anchor_loss(model, positional_anchor)
+                    loss = (
+                        loss
+                        + float(base_sequence_loss_weight) * base_sequence_loss
+                        + float(positional_anchor_weight) * anchor_loss
+                    )
+                    batch_base_sequence_losses.append(
+                        float(base_sequence_loss.item())
+                    )
+                    batch_positional_anchor_losses.append(float(anchor_loss.item()))
                 # This is a detached diagnostic only.  It is deliberately not
                 # added to the exact deployment-aligned full-grid objective.
                 mean_bce_loss = expert_probability_loss(
@@ -1233,7 +1578,7 @@ def train_all_expert_heads(
                 )
                 loss = mean_bce_loss
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(expert_parameters, 5.0)
+            torch.nn.utils.clip_grad_norm_(trainable_parameters, 5.0)
             optimizer.step()
             batch_losses.append(float(loss.item()))
             batch_mean_bce_losses.append(float(mean_bce_loss.item()))
@@ -1279,6 +1624,11 @@ def train_all_expert_heads(
                 worst_start_bce_weight=worst_start_bce_weight,
                 representation_consistency_weight=representation_consistency_weight,
                 ensemble_temperature=ensemble_temperature,
+                base_sequence_loss_weight=(
+                    base_sequence_loss_weight
+                    if train_cyclic_positional_encoding
+                    else 0.0
+                ),
             )
             if should_validate
             else None
@@ -1313,6 +1663,17 @@ def train_all_expert_heads(
             "mean_representation_consistency_loss": (
                 sum(batch_consistency_losses) / len(batch_consistency_losses)
                 if batch_consistency_losses
+                else ""
+            ),
+            "mean_base_sequence_cross_entropy": (
+                sum(batch_base_sequence_losses) / len(batch_base_sequence_losses)
+                if batch_base_sequence_losses
+                else ""
+            ),
+            "mean_positional_anchor_loss": (
+                sum(batch_positional_anchor_losses)
+                / len(batch_positional_anchor_losses)
+                if batch_positional_anchor_losses
                 else ""
             ),
             "maximum_training_representation_span": (
@@ -1356,12 +1717,20 @@ def train_all_expert_heads(
 
     if best_state is None:
         raise RuntimeError("No validation-selected expert-head state was produced")
+    best_history = next(
+        row for row in history if int(row["epoch"]) == int(best_epoch)
+    )
     current_state = model.state_dict()
     for key, value in best_state.items():
         current_state[key].copy_(value.to(device=current_state[key].device))
     return history, best_state, {
         "best_epoch": best_epoch,
         "best_validation_balanced_bce": best_validation,
+        "best_epoch_maximum_training_representation_span": (
+            float(best_history["maximum_training_representation_span"])
+            if cyclic_representation_augmentation
+            else 0.0
+        ),
         "epochs_ran": len(history),
         "early_stopping_patience": patience,
         "validation_interval_epochs": VALIDATION_INTERVAL_EPOCHS,
@@ -1377,13 +1746,41 @@ def train_all_expert_heads(
             representation_consistency_weight
         ),
         "training_ensemble_temperature": float(ensemble_temperature),
+        "train_cyclic_positional_encoding": bool(
+            train_cyclic_positional_encoding
+        ),
+        "positional_learning_rate": (
+            float(positional_learning_rate)
+            if train_cyclic_positional_encoding
+            else 0.0
+        ),
+        "base_sequence_loss_weight": (
+            float(base_sequence_loss_weight)
+            if train_cyclic_positional_encoding
+            else 0.0
+        ),
+        "positional_anchor_weight": (
+            float(positional_anchor_weight)
+            if train_cyclic_positional_encoding
+            else 0.0
+        ),
         "full_physical_start_by_full_decoder_order_grid": bool(
             cyclic_representation_augmentation
         ),
         "training_objective": (
-            "full_physical_start_x_full_decoder_order_grid_differentiable_"
-            "order_mean_then_label_aware_worst_start_balanced_bce_plus_"
-            "all_label_all_start_probability_span_squared"
+            (
+                "boundary_marginalized_cyclic_relative_positions_plus_"
+                "full_physical_start_x_full_decoder_order_grid_differentiable_"
+                "order_mean_then_label_aware_worst_start_balanced_bce_plus_"
+                "all_label_all_start_probability_span_squared_plus_natural_"
+                "amino_acid_base_cross_entropy_plus_positional_parent_weight_"
+                "trust_region"
+                if train_cyclic_positional_encoding
+                else
+                "full_physical_start_x_full_decoder_order_grid_differentiable_"
+                "order_mean_then_label_aware_worst_start_balanced_bce_plus_"
+                "all_label_all_start_probability_span_squared"
+            )
             if cyclic_representation_augmentation
             else "standard_balanced_bce"
         ),
@@ -1702,6 +2099,44 @@ def parse_args() -> argparse.Namespace:
             "validation and test"
         ),
     )
+    parser.add_argument(
+        "--cyclic-native-model-v11",
+        action="store_true",
+        help=(
+            "activate boundary-marginalized cyclic relative positions and "
+            "jointly adapt only that projection plus the twenty expert heads"
+        ),
+    )
+    parser.add_argument(
+        "--positional-learning-rate",
+        type=float,
+        default=DEFAULT_V11_POSITIONAL_LEARNING_RATE,
+    )
+    parser.add_argument(
+        "--base-sequence-loss-weight",
+        type=float,
+        default=DEFAULT_V11_BASE_SEQUENCE_LOSS_WEIGHT,
+    )
+    parser.add_argument(
+        "--positional-anchor-weight",
+        type=float,
+        default=DEFAULT_V11_POSITIONAL_ANCHOR_WEIGHT,
+    )
+    parser.add_argument(
+        "--maximum-equivariance-span",
+        type=float,
+        default=DEFAULT_V11_MAXIMUM_EQUIVARIANCE_SPAN,
+    )
+    parser.add_argument(
+        "--maximum-base-ce-increase",
+        type=float,
+        default=DEFAULT_V11_MAXIMUM_BASE_CE_INCREASE,
+    )
+    parser.add_argument(
+        "--maximum-base-accuracy-drop",
+        type=float,
+        default=DEFAULT_V11_MAXIMUM_BASE_ACCURACY_DROP,
+    )
     parser.add_argument("--no-fail-on-quality-gate", action="store_true")
     return parser.parse_args()
 
@@ -1709,9 +2144,17 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     serine_only = args.expert_scope == "serine-only"
+    cyclic_native_v11 = bool(args.cyclic_native_model_v11)
     if serine_only and not args.cyclic_representation_augmentation:
         raise ValueError(
             "--expert-scope serine-only requires "
+            "--cyclic-representation-augmentation"
+        )
+    if cyclic_native_v11 and (
+        serine_only or not args.cyclic_representation_augmentation
+    ):
+        raise ValueError(
+            "--cyclic-native-model-v11 requires --expert-scope all and "
             "--cyclic-representation-augmentation"
         )
     active_indices = (
@@ -1719,9 +2162,11 @@ def main() -> None:
         if serine_only
         else tuple(range(len(NATURAL_AA_ALPHABET)))
     )
-    expected_changed_keys = (
+    expected_changed_keys = set(
         SERINE_EXPERT_STATE_KEYS if serine_only else ALL_EXPERT_STATE_KEYS
     )
+    if cyclic_native_v11:
+        expected_changed_keys.update(V11_POSITIONAL_STATE_KEYS)
     if (
         args.epochs < MINIMUM_ORDER_COVERAGE_EPOCHS
         or args.batch_size <= 0
@@ -1731,6 +2176,25 @@ def main() -> None:
         raise ValueError(
             f"epochs must be at least {MINIMUM_ORDER_COVERAGE_EPOCHS}; batch-size, "
             "learning-rate, and early-stopping-patience must be positive"
+        )
+    if cyclic_native_v11 and (
+        not math.isfinite(float(args.positional_learning_rate))
+        or not math.isfinite(float(args.base_sequence_loss_weight))
+        or not math.isfinite(float(args.positional_anchor_weight))
+        or not math.isfinite(float(args.maximum_equivariance_span))
+        or not math.isfinite(float(args.maximum_base_ce_increase))
+        or not math.isfinite(float(args.maximum_base_accuracy_drop))
+        or args.positional_learning_rate <= 0.0
+        or args.base_sequence_loss_weight <= 0.0
+        or args.positional_anchor_weight <= 0.0
+        or args.maximum_equivariance_span <= 0.0
+        or args.maximum_base_ce_increase < 0.0
+        or args.maximum_base_accuracy_drop < 0.0
+    ):
+        raise ValueError(
+            "V11 learning/objective controls and maximum equivariance span must "
+            "be positive and finite; base non-inferiority tolerances must be "
+            "non-negative and finite"
         )
     if (
         not math.isfinite(float(args.threshold))
@@ -1804,6 +2268,22 @@ def main() -> None:
 
     print(f"Loading canonical clean-V28 checkpoint: {model_path}", flush=True)
     model = load_v28_model(str(model_path), device)
+    legacy_parent_base_validation: Dict[str, float | int] | None = None
+    cyclic_native_parent_base_validation: Dict[str, float | int] | None = None
+    if cyclic_native_v11:
+        legacy_parent_base_validation = full_grid_base_sequence_metrics(
+            model,
+            validation_records,
+            device,
+            args.batch_size,
+        )
+        model.set_cyclic_relative_positions(True)
+        cyclic_native_parent_base_validation = full_grid_base_sequence_metrics(
+            model,
+            validation_records,
+            device,
+            args.batch_size,
+        )
     before_hashes = state_hashes(model.state_dict())
     parent_summary: Dict[str, Any] | None = None
     parent_positions: List[Dict[str, Any]] | None = None
@@ -1818,6 +2298,9 @@ def main() -> None:
         worst_start_bce_weight=args.worst_start_bce_weight,
         representation_consistency_weight=args.representation_consistency_weight,
         ensemble_temperature=args.deployment_temperature,
+        base_sequence_loss_weight=(
+            args.base_sequence_loss_weight if cyclic_native_v11 else 0.0
+        ),
     )
     history, _best_expert_state, training_selection = train_all_expert_heads(
         model,
@@ -1834,7 +2317,23 @@ def main() -> None:
         worst_start_bce_weight=args.worst_start_bce_weight,
         representation_consistency_weight=args.representation_consistency_weight,
         ensemble_temperature=args.deployment_temperature,
+        train_cyclic_positional_encoding=cyclic_native_v11,
+        positional_learning_rate=args.positional_learning_rate,
+        base_sequence_loss_weight=(
+            args.base_sequence_loss_weight if cyclic_native_v11 else 0.0
+        ),
+        positional_anchor_weight=(
+            args.positional_anchor_weight if cyclic_native_v11 else 0.0
+        ),
     )
+    selected_base_validation: Dict[str, float | int] | None = None
+    if cyclic_native_v11:
+        selected_base_validation = full_grid_base_sequence_metrics(
+            model,
+            validation_records,
+            device,
+            args.batch_size,
+        )
     # The internal 151-record audit is opened only after epoch selection and
     # the selected expert-head state have been frozen in memory.
     test_records = read_jsonl(str(test_path))
@@ -1847,10 +2346,21 @@ def main() -> None:
     changed_non_expert_keys = sorted(set(changed_keys) - ALL_EXPERT_STATE_KEYS)
     unexpected_changed_keys = sorted(set(changed_keys) - expected_changed_keys)
     unchanged_expected_keys = sorted(expected_changed_keys - set(changed_keys))
-    if not serine_only and set(changed_keys) != ALL_EXPERT_STATE_KEYS:
+    if (
+        not serine_only
+        and not cyclic_native_v11
+        and set(changed_keys) != ALL_EXPERT_STATE_KEYS
+    ):
         raise RuntimeError(
             "All-expert state isolation failed: expected exactly the 40 expert "
             f"tensors to change; missing={unchanged_expected_keys}, "
+            f"unexpected={unexpected_changed_keys}"
+        )
+    if cyclic_native_v11 and set(changed_keys) != expected_changed_keys:
+        raise RuntimeError(
+            "V11 state isolation failed: expected exactly the expert heads and "
+            "cyclic positional projection to change; "
+            f"missing={unchanged_expected_keys}, "
             f"unexpected={unexpected_changed_keys}"
         )
     if serine_only and set(changed_keys) != SERINE_EXPERT_STATE_KEYS:
@@ -1911,9 +2421,13 @@ def main() -> None:
         SERINE_ONLY_CYCLIC_PROTOCOL
         if serine_only
         else (
-            CYCLIC_REPRESENTATION_PROTOCOL
-            if args.cyclic_representation_augmentation
-            else ORDER_BALANCED_PROTOCOL
+            CYCLIC_NATIVE_V11_PROTOCOL
+            if cyclic_native_v11
+            else (
+                CYCLIC_REPRESENTATION_PROTOCOL
+                if args.cyclic_representation_augmentation
+                else ORDER_BALANCED_PROTOCOL
+            )
         )
     )
     training_order_policy = (
@@ -1931,6 +2445,25 @@ def main() -> None:
     checkpoint_payload = {
         "model_state_dict": {
             key: value.detach().cpu().clone() for key, value in model.state_dict().items()
+        },
+        "model_architecture_metadata": {
+            "protocol": (
+                V11_MODEL_ARCHITECTURE_PROTOCOL
+                if cyclic_native_v11
+                else "legacy_linear_relative_positions"
+            ),
+            "cyclic_relative_positions": cyclic_native_v11,
+            "cyclic_offset_policy": (
+                V11_CYCLIC_OFFSET_POLICY
+                if cyclic_native_v11
+                else "linear_residue_index_difference"
+            ),
+            "cyclic_chain_mask_policy": (
+                "designed_chain_mask_times_valid_residue_mask"
+                if cyclic_native_v11
+                else "disabled"
+            ),
+            "new_checkpoint_tensor_shapes": [],
         },
         "expert_head_qc_metadata": {
             "protocol": selected_protocol,
@@ -1956,10 +2489,14 @@ def main() -> None:
             "minimum_order_coverage_epochs": MINIMUM_ORDER_COVERAGE_EPOCHS,
             "training_decoding_order_policy": training_order_policy,
             "training_cyclic_representation_policy": (
-                "all_physical_cyclic_starts_jointly_rotate_sequence_labels_and_"
-                "backbone_coordinates_with_residue_index_reset"
-                if args.cyclic_representation_augmentation
-                else "serialized_cyclic_start_fixed"
+                V11_TRAINING_REPRESENTATION_POLICY
+                if cyclic_native_v11
+                else (
+                    "all_physical_cyclic_starts_jointly_rotate_sequence_labels_and_"
+                    "backbone_coordinates_with_residue_index_reset"
+                    if args.cyclic_representation_augmentation
+                    else "serialized_cyclic_start_fixed"
+                )
             ),
             "deployment_annotation_policy": deployment_policy,
             "worst_start_bce_weight": float(args.worst_start_bce_weight),
@@ -1971,6 +2508,64 @@ def main() -> None:
                 args.cyclic_representation_augmentation
             ),
             "training_objective": training_selection["training_objective"],
+            "model_architecture_protocol": (
+                V11_MODEL_ARCHITECTURE_PROTOCOL
+                if cyclic_native_v11
+                else "legacy_linear_relative_positions"
+            ),
+            "cyclic_relative_positions": cyclic_native_v11,
+            "cyclic_offset_policy": (
+                V11_CYCLIC_OFFSET_POLICY
+                if cyclic_native_v11
+                else "linear_residue_index_difference"
+            ),
+            "trained_cyclic_positional_state_keys": (
+                sorted(V11_POSITIONAL_STATE_KEYS) if cyclic_native_v11 else []
+            ),
+            "positional_learning_rate": (
+                float(args.positional_learning_rate)
+                if cyclic_native_v11
+                else 0.0
+            ),
+            "base_sequence_loss_weight": (
+                float(args.base_sequence_loss_weight)
+                if cyclic_native_v11
+                else 0.0
+            ),
+            "positional_anchor_weight": (
+                float(args.positional_anchor_weight)
+                if cyclic_native_v11
+                else 0.0
+            ),
+            "maximum_equivariance_span_tolerance": (
+                float(args.maximum_equivariance_span)
+                if cyclic_native_v11
+                else None
+            ),
+            "best_epoch_maximum_training_representation_span": (
+                float(
+                    training_selection[
+                        "best_epoch_maximum_training_representation_span"
+                    ]
+                )
+                if cyclic_native_v11
+                else None
+            ),
+            "maximum_base_cross_entropy_increase": (
+                float(args.maximum_base_ce_increase)
+                if cyclic_native_v11
+                else None
+            ),
+            "maximum_base_accuracy_drop": (
+                float(args.maximum_base_accuracy_drop)
+                if cyclic_native_v11
+                else None
+            ),
+            "legacy_parent_base_validation": legacy_parent_base_validation,
+            "cyclic_native_parent_base_validation": (
+                cyclic_native_parent_base_validation
+            ),
+            "selected_base_validation": selected_base_validation,
             "expert_training_context_policy": (
                 "peptide_chain_only_no_visible_receptor_chains"
             ),
@@ -1998,6 +2593,8 @@ def main() -> None:
     reload_hashes = state_hashes(reloaded.state_dict())
     if reload_hashes != after_hashes:
         raise RuntimeError("Saved checkpoint failed strict state round-trip")
+    if bool(reloaded.cyclic_relative_positions) != cyclic_native_v11:
+        raise RuntimeError("Saved checkpoint failed V11 architecture-mode round-trip")
 
     serine = corrected_summary["serine"]
     proline = corrected_summary["proline"]
@@ -2077,10 +2674,84 @@ def main() -> None:
             not args.cyclic_representation_augmentation
             or (
                 selected_protocol
-                in {CYCLIC_REPRESENTATION_PROTOCOL, SERINE_ONLY_CYCLIC_PROTOCOL}
+                in {
+                    CYCLIC_REPRESENTATION_PROTOCOL,
+                    SERINE_ONLY_CYCLIC_PROTOCOL,
+                    CYCLIC_NATIVE_V11_PROTOCOL,
+                }
                 and bool(
                     training_selection.get("cyclic_representation_augmentation")
                 )
+            )
+        ),
+        "v11_cyclic_native_architecture_and_multitask_training_are_active": (
+            not cyclic_native_v11
+            or (
+                bool(model.cyclic_relative_positions)
+                and bool(reloaded.cyclic_relative_positions)
+                and bool(
+                    training_selection.get("train_cyclic_positional_encoding")
+                )
+                and float(
+                    training_selection.get("base_sequence_loss_weight", 0.0)
+                )
+                > 0.0
+                and float(
+                    training_selection.get("positional_anchor_weight", 0.0)
+                )
+                > 0.0
+                and set(changed_keys)
+                == (ALL_EXPERT_STATE_KEYS | V11_POSITIONAL_STATE_KEYS)
+            )
+        ),
+        "v11_best_epoch_training_equivariance_span_le_tolerance": (
+            not cyclic_native_v11
+            or float(
+                training_selection.get(
+                    "best_epoch_maximum_training_representation_span",
+                    math.inf,
+                )
+            )
+            <= float(args.maximum_equivariance_span)
+        ),
+        "v11_base_cross_entropy_is_noninferior_to_legacy_parent": (
+            not cyclic_native_v11
+            or (
+                legacy_parent_base_validation is not None
+                and selected_base_validation is not None
+                and float(selected_base_validation["cross_entropy"])
+                <= float(legacy_parent_base_validation["cross_entropy"])
+                + float(args.maximum_base_ce_increase)
+            )
+        ),
+        "v11_base_accuracy_is_noninferior_to_legacy_parent": (
+            not cyclic_native_v11
+            or (
+                legacy_parent_base_validation is not None
+                and selected_base_validation is not None
+                and float(selected_base_validation["accuracy"])
+                + float(args.maximum_base_accuracy_drop)
+                >= float(legacy_parent_base_validation["accuracy"])
+            )
+        ),
+        "v11_positional_adaptation_does_not_degrade_cyclic_parent_base_ce": (
+            not cyclic_native_v11
+            or (
+                cyclic_native_parent_base_validation is not None
+                and selected_base_validation is not None
+                and float(selected_base_validation["cross_entropy"])
+                <= float(cyclic_native_parent_base_validation["cross_entropy"])
+                + float(args.maximum_base_ce_increase)
+            )
+        ),
+        "v11_positional_adaptation_does_not_degrade_cyclic_parent_base_accuracy": (
+            not cyclic_native_v11
+            or (
+                cyclic_native_parent_base_validation is not None
+                and selected_base_validation is not None
+                and float(selected_base_validation["accuracy"])
+                + float(args.maximum_base_accuracy_drop)
+                >= float(cyclic_native_parent_base_validation["accuracy"])
             )
         ),
         "cyclic_training_uses_worst_start_bce_and_consistency_loss": (
@@ -2269,6 +2940,39 @@ def main() -> None:
         "full_physical_start_by_full_decoder_order_grid": bool(
             args.cyclic_representation_augmentation
         ),
+        "model_architecture_protocol": (
+            V11_MODEL_ARCHITECTURE_PROTOCOL
+            if cyclic_native_v11
+            else "legacy_linear_relative_positions"
+        ),
+        "cyclic_relative_positions": cyclic_native_v11,
+        "cyclic_offset_policy": (
+            V11_CYCLIC_OFFSET_POLICY
+            if cyclic_native_v11
+            else "linear_residue_index_difference"
+        ),
+        "maximum_equivariance_span_tolerance": (
+            float(args.maximum_equivariance_span)
+            if cyclic_native_v11
+            else None
+        ),
+        "maximum_base_cross_entropy_increase": (
+            float(args.maximum_base_ce_increase)
+            if cyclic_native_v11
+            else None
+        ),
+        "maximum_base_accuracy_drop": (
+            float(args.maximum_base_accuracy_drop)
+            if cyclic_native_v11
+            else None
+        ),
+        "base_sequence_noninferiority_validation": {
+            "legacy_parent": legacy_parent_base_validation,
+            "cyclic_native_parent_before_adaptation": (
+                cyclic_native_parent_base_validation
+            ),
+            "selected_v11": selected_base_validation,
+        },
         "expected_changed_state_keys": sorted(expected_changed_keys),
         "changed_state_keys": changed_keys,
         "unchanged_state_key_count": len(before_hashes) - len(changed_keys),
@@ -2280,11 +2984,18 @@ def main() -> None:
             "generation contains no P-to-p mapping"
         ),
         "parameter_policy": (
-            "shared trunk, sequence embedding, decoder, base head, and nineteen "
-            "non-Ser experts are bitwise frozen; only the Ser expert is retrained"
-            if serine_only
-            else "shared trunk, sequence embedding, decoder, and base head are "
-            "bitwise frozen; all 20 expert linear heads are retrained"
+            "encoder/decoder trunk, sequence embedding, and base head are bitwise "
+            "frozen; the boundary-marginalized relative-position projection is "
+            "adapted at a low learning rate under natural-AA reconstruction and "
+            "parent-weight trust-region losses; all 20 expert heads are retrained"
+            if cyclic_native_v11
+            else (
+                "shared trunk, sequence embedding, decoder, base head, and nineteen "
+                "non-Ser experts are bitwise frozen; only the Ser expert is retrained"
+                if serine_only
+                else "shared trunk, sequence embedding, decoder, and base head are "
+                "bitwise frozen; all 20 expert linear heads are retrained"
+            )
         ),
         "label_input_policy": (
             "all methyl target tokens are converted to their natural parent before "
@@ -2325,6 +3036,15 @@ def main() -> None:
             "best_epoch": training_selection["best_epoch"],
             "batch_size": args.batch_size,
             "learning_rate": args.learning_rate,
+            "positional_learning_rate": (
+                args.positional_learning_rate if cyclic_native_v11 else 0.0
+            ),
+            "base_sequence_loss_weight": (
+                args.base_sequence_loss_weight if cyclic_native_v11 else 0.0
+            ),
+            "positional_anchor_weight": (
+                args.positional_anchor_weight if cyclic_native_v11 else 0.0
+            ),
             "validation_fraction": args.validation_fraction,
             "early_stopping_patience": args.early_stopping_patience,
             "seed": args.seed,
@@ -2398,6 +3118,20 @@ def main() -> None:
         ),
         flush=True,
     )
+    if cyclic_native_v11:
+        print(
+            "V11 full-grid base non-inferiority: "
+            + json.dumps(
+                {
+                    "legacy_parent": legacy_parent_base_validation,
+                    "cyclic_native_parent": cyclic_native_parent_base_validation,
+                    "selected_v11": selected_base_validation,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
     print(
         "Ser deployment test (T={:.2f}): AUC={:.4f}, recall={:.4f}, "
         "FPR={:.4f}".format(
