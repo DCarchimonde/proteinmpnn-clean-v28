@@ -88,12 +88,17 @@ REQUIRED_EXPERT_PROTOCOL = (
 V11_EXPERT_PROTOCOL = (
     "canonical_clean_v28_all_expert_heads_cyclic_native_relative_positions_v11"
 )
+V13_EXPERT_PROTOCOL = (
+    "canonical_clean_v28_all_expert_heads_cyclic_native_"
+    "short_length_balanced_v13"
+)
 SERINE_ONLY_EXPERT_PROTOCOL = (
     "canonical_clean_v28_serine_only_corrected_labels_"
     "cyclic_stability_worst_start_v9"
 )
 V6_AUDIT_PROTOCOL = "cyclic_stability_worst_start_heldout_gate_v9"
 V11_AUDIT_PROTOCOL = "cyclic_native_relative_positions_heldout_gate_v11"
+V13_AUDIT_PROTOCOL = "cyclic_native_short_length_balanced_heldout_gate_v13"
 V7_AUDIT_PROTOCOL = (
     "cyclic_stability_worst_start_heldout_gate_v9_serine_only"
 )
@@ -102,6 +107,9 @@ V6_AUTHORIZATION = (
 )
 V11_AUTHORIZATION = (
     "CYCLIC_NATIVE_V11_VALIDATED_FOR_RMSD_PRIORITY_REGENERATION"
+)
+V13_AUTHORIZATION = (
+    "CYCLIC_NATIVE_V13_VALIDATED_FOR_FIXED_BUDGET_METHYL_YIELD_EVALUATION"
 )
 V7_AUTHORIZATION = (
     "SERINE_ONLY_CYCLIC_STABILITY_V9_VALIDATED_FOR_REANNOTATION"
@@ -904,6 +912,8 @@ def checkpoint_metadata(
     )
     del payload
     is_v11 = required_protocol == V11_EXPERT_PROTOCOL
+    is_v13 = required_protocol == V13_EXPERT_PROTOCOL
+    is_cyclic_native = is_v11 or is_v13
     v11_base_noninferiority = True
     if is_v11:
         legacy_base = metadata.get("legacy_parent_base_validation", {})
@@ -943,7 +953,7 @@ def checkpoint_metadata(
         and str(metadata.get("training_cyclic_representation_policy", ""))
         == (
             V11_TRAINING_REPRESENTATION_POLICY
-            if is_v11
+            if is_cyclic_native
             else REQUIRED_TRAINING_REPRESENTATION_POLICY
         )
         and str(metadata.get("training_decoding_order_policy", ""))
@@ -957,15 +967,13 @@ def checkpoint_metadata(
         and "full_physical_start_x_full_decoder_order_grid"
         in str(metadata.get("training_objective", ""))
         and (
-            not is_v11
+            not is_cyclic_native
             or (
                 bool(metadata.get("cyclic_relative_positions"))
                 and str(metadata.get("model_architecture_protocol", ""))
                 == V11_MODEL_ARCHITECTURE_PROTOCOL
                 and str(metadata.get("cyclic_offset_policy", ""))
                 == V11_CYCLIC_OFFSET_POLICY
-                and float(metadata.get("base_sequence_loss_weight", 0.0)) > 0.0
-                and float(metadata.get("positional_anchor_weight", 0.0)) > 0.0
                 and float(
                     metadata.get("maximum_equivariance_span_tolerance", -1.0)
                 )
@@ -981,17 +989,55 @@ def checkpoint_metadata(
                     )
                 )
                 <= V11_MAXIMUM_EQUIVARIANCE_SPAN
-                and set(metadata.get("trained_cyclic_positional_state_keys", []))
-                == {
-                    "features.embeddings.linear.weight",
-                    "features.embeddings.linear.bias",
-                }
                 and bool(architecture.get("cyclic_relative_positions"))
                 and str(architecture.get("protocol", ""))
                 == V11_MODEL_ARCHITECTURE_PROTOCOL
                 and str(architecture.get("cyclic_offset_policy", ""))
                 == V11_CYCLIC_OFFSET_POLICY
-                and v11_base_noninferiority
+                and (
+                    (
+                        is_v11
+                        and float(metadata.get("base_sequence_loss_weight", 0.0))
+                        > 0.0
+                        and float(metadata.get("positional_anchor_weight", 0.0))
+                        > 0.0
+                        and set(
+                            metadata.get("trained_cyclic_positional_state_keys", [])
+                        )
+                        == {
+                            "features.embeddings.linear.weight",
+                            "features.embeddings.linear.bias",
+                        }
+                        and v11_base_noninferiority
+                    )
+                    or (
+                        is_v13
+                        and metadata.get("parent_expert_protocol")
+                        == V11_EXPERT_PROTOCOL
+                        and bool(
+                            metadata.get(
+                                "v11_base_noninferiority_inherited_bitwise"
+                            )
+                        )
+                        and not metadata.get(
+                            "trained_cyclic_positional_state_keys", []
+                        )
+                        and set(
+                            metadata.get(
+                                "inherited_cyclic_positional_state_keys", []
+                            )
+                        )
+                        == {
+                            "features.embeddings.linear.weight",
+                            "features.embeddings.linear.bias",
+                        }
+                        and metadata.get("split_protocol")
+                        == (
+                            "record_disjoint_length_stratified_"
+                            "per_expert_class_supported_v13"
+                        )
+                    )
+                )
             )
         )
     ):
@@ -1058,10 +1104,15 @@ def run(args: argparse.Namespace) -> None:
         REQUIRED_EXPERT_PROTOCOL,
         SERINE_ONLY_EXPERT_PROTOCOL,
         V11_EXPERT_PROTOCOL,
+        V13_EXPERT_PROTOCOL,
     }:
         raise ValueError("Unsupported expert protocol for representation audit")
     serine_only = required_protocol == SERINE_ONLY_EXPERT_PROTOCOL
-    cyclic_native_v11 = required_protocol == V11_EXPERT_PROTOCOL
+    cyclic_native_v11 = required_protocol in {
+        V11_EXPERT_PROTOCOL,
+        V13_EXPERT_PROTOCOL,
+    }
+    short_length_v13 = required_protocol == V13_EXPERT_PROTOCOL
     metadata = checkpoint_metadata(model_path, required_protocol)
     plan = read_json(plan_path)
     targets = [str(row["target_name"]).upper() for row in plan["targets"]]
@@ -1230,7 +1281,11 @@ def run(args: argparse.Namespace) -> None:
         (
             V7_AUTHORIZATION
             if serine_only
-            else (V11_AUTHORIZATION if cyclic_native_v11 else V6_AUTHORIZATION)
+            else (
+                V13_AUTHORIZATION
+                if short_length_v13
+                else (V11_AUTHORIZATION if cyclic_native_v11 else V6_AUTHORIZATION)
+            )
         )
         if quality_gate == "PASS"
         else "BLOCKED_DO_NOT_REANNOTATE_OR_RELEASE"
@@ -1257,17 +1312,32 @@ def run(args: argparse.Namespace) -> None:
         "protocol": (
             V7_AUDIT_PROTOCOL
             if serine_only
-            else (V11_AUDIT_PROTOCOL if cyclic_native_v11 else V6_AUDIT_PROTOCOL)
+            else (
+                V13_AUDIT_PROTOCOL
+                if short_length_v13
+                else (V11_AUDIT_PROTOCOL if cyclic_native_v11 else V6_AUDIT_PROTOCOL)
+            )
         ),
         "scientific_scope": (
             (
-                "V11 removes the artificial peptide cut inside the model by analytically "
-                "marginalizing learned relative-position embeddings over every cyclic "
-                "start. The outer all-start x all-order grid remains an independent "
-                "numerical proof: both known-sequence and end-to-end probability spans "
-                "must be <=1e-5 on 1,505 held-out positions and all 17 native targets. "
-                "This does not prove post-structure RMSD; later generation, exact base, "
-                "RMSD-priority, and returned-structure audits remain mandatory."
+                (
+                    "V13 inherits V11's boundary-marginalized cyclic architecture "
+                    "bitwise outside the twenty expert heads, then repairs the inner "
+                    "split's short-peptide blind spot with declared real-record length "
+                    "weights. This audit independently rechecks all-start x all-order "
+                    "numerical invariance and held-out classification gates. Target-level "
+                    "quality still requires the separate fixed-250-draw yield gate; RMSD "
+                    "remains unavailable until Shangge returns structures."
+                    if short_length_v13
+                    else
+                    "V11 removes the artificial peptide cut inside the model by analytically "
+                    "marginalizing learned relative-position embeddings over every cyclic "
+                    "start. The outer all-start x all-order grid remains an independent "
+                    "numerical proof: both known-sequence and end-to-end probability spans "
+                    "must be <=1e-5 on 1,505 held-out positions and all 17 native targets. "
+                    "This does not prove post-structure RMSD; later generation and returned-"
+                    "structure audits remain mandatory."
+                )
                 if cyclic_native_v11
                 else
                 "Outer ensemble jointly rotates sequence and N/CA/C/O coordinates, "
@@ -1346,7 +1416,11 @@ def run(args: argparse.Namespace) -> None:
             "BLOCKED_PENDING_V7_RESULT_REVIEW"
             if serine_only
             else (
-                "BLOCKED_PENDING_V11_GENERATION_AND_STRUCTURE_REVIEW"
+                (
+                    "BLOCKED_PENDING_V13_FIXED_BUDGET_YIELD_AND_BATCH_ONE_REPLAY"
+                    if short_length_v13
+                    else "BLOCKED_PENDING_V11_GENERATION_AND_STRUCTURE_REVIEW"
+                )
                 if cyclic_native_v11
                 else "BLOCKED_PENDING_V6_RESULT_REVIEW"
             )
@@ -1404,6 +1478,7 @@ def parse_args() -> argparse.Namespace:
             REQUIRED_EXPERT_PROTOCOL,
             SERINE_ONLY_EXPERT_PROTOCOL,
             V11_EXPERT_PROTOCOL,
+            V13_EXPERT_PROTOCOL,
         ),
     )
     parser.add_argument("--test-jsonl", default=str(DEFAULT_TEST))

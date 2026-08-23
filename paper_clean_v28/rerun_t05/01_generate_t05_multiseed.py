@@ -726,6 +726,7 @@ def generate_batch(
     methyl_guidance_strength: float = 0.0,
     methyl_guidance_forbidden_parent_tokens: Sequence[str] | None = None,
     methyl_guidance_context_policy: str = "sampling_complex",
+    methyl_guidance_mode: str = "fixed_position",
 ) -> List[Dict[str, Any]]:
     X, S_true, mask, chain_M, residue_idx, chain_encoding_all = features[:6]
     X = repeat_batch(X, batch_size)
@@ -756,6 +757,19 @@ def generate_batch(
         int(position.item()): relative for relative, position in enumerate(masked_positions)
     }
     peptide_length = int(masked_positions.numel())
+    if methyl_guidance_mode not in {"fixed_position", "until_provisional_hit"}:
+        raise ValueError(
+            "methyl guidance mode must be fixed_position or "
+            "until_provisional_hit"
+        )
+    if (
+        methyl_guidance_mode == "until_provisional_hit"
+        and methyl_guidance_positions_1based is not None
+    ):
+        raise ValueError(
+            "until_provisional_hit guidance chooses sites adaptively and must not "
+            "receive fixed guidance positions"
+        )
     if methyl_guidance_positions_1based is None:
         guidance_relative = torch_module.full(
             (batch_size,), -1, device=X.device, dtype=torch_module.long
@@ -780,8 +794,11 @@ def generate_batch(
     ) < 0.0:
         raise ValueError("methyl guidance strength must be finite and non-negative")
     methyl_guidance_enabled = bool(
-        methyl_guidance_positions_1based is not None
-        and float(methyl_guidance_strength) > 0.0
+        float(methyl_guidance_strength) > 0.0
+        and (
+            methyl_guidance_mode == "until_provisional_hit"
+            or methyl_guidance_positions_1based is not None
+        )
     )
     if methyl_guidance_context_policy not in {
         "sampling_complex",
@@ -815,6 +832,9 @@ def generate_batch(
     sampled_log_prob = torch_module.zeros((batch_size, peptide_length), device=X.device)
     sampling_path_methyl_probability = torch_module.zeros(
         (batch_size, peptide_length), device=X.device
+    )
+    provisional_methyl_hit = torch_module.zeros(
+        (batch_size,), device=X.device, dtype=torch_module.bool
     )
     full_orders = complete_order_fn(chain_M, mask, orders)
     absolute_to_relative = torch_module.full(
@@ -850,14 +870,18 @@ def generate_batch(
                 device=X.device,
                 dtype=torch_module.long,
             )
-            guidance_active = guidance_relative.eq(relative_positions)
+            if methyl_guidance_mode == "until_provisional_hit":
+                guidance_active = ~provisional_methyl_hit
+            else:
+                guidance_active = guidance_relative.eq(relative_positions)
+            proposal_expert_logits = logits_experts[row_indices, positions]
             if methyl_guidance_enabled and bool(guidance_active.any()):
                 # Product-of-experts proposal used only during deficit recovery:
                 # the frozen T=0.5 base distribution retains authority while the
                 # matching expert head biases the designated physical site toward
                 # sequences worth exact full-cyclic annotation.  Final release is
                 # still decided exclusively after the complete chain is rescored.
-                guidance_expert_logits = logits_experts[row_indices, positions]
+                guidance_expert_logits = proposal_expert_logits
                 if methyl_guidance_context_policy == "release_peptide_only":
                     (
                         guidance_X,
@@ -915,6 +939,7 @@ def generate_batch(
                     guided_log_probs,
                     scaled_log_probs,
                 )
+                proposal_expert_logits = guidance_expert_logits
             sampled_base = torch_module.multinomial(
                 scaled_log_probs.exp(), num_samples=1
             ).squeeze(-1)
@@ -923,6 +948,26 @@ def generate_batch(
             current_methyl_probability = torch_module.sigmoid(
                 expert_logits / temperature
             )
+            proposal_methyl_probability = torch_module.sigmoid(
+                proposal_expert_logits.gather(
+                    1, sampled_base.unsqueeze(-1)
+                ).squeeze(-1)
+                / temperature
+            )
+
+            if methyl_guidance_mode == "until_provisional_hit":
+                sampled_parent_is_methylatable = torch_module.zeros(
+                    (batch_size,), device=X.device, dtype=torch_module.bool
+                )
+                for natural_index in methylatable_natural_indices:
+                    sampled_parent_is_methylatable |= sampled_base.eq(
+                        int(natural_index)
+                    )
+                provisional_methyl_hit |= (
+                    guidance_active
+                    & sampled_parent_is_methylatable
+                    & proposal_methyl_probability.gt(float(methyl_threshold))
+                )
 
             S_context[row_indices, positions] = sampled_base
 
@@ -1156,10 +1201,21 @@ def generate_batch(
                     "representation_min_strict_gt_threshold_zero_disagreement"
                 ),
                 "sampling_proposal_policy": (
-                    "t05_receptor_base_x_release_context_expert_product_guided_"
-                    "single_physical_site_with_full_cyclic_release_replay"
+                    (
+                        "t05_receptor_base_x_release_context_expert_product_guided_"
+                        "adaptive_until_provisional_hit_with_full_cyclic_release_replay"
+                        if methyl_guidance_mode == "until_provisional_hit"
+                        else
+                        "t05_receptor_base_x_release_context_expert_product_guided_"
+                        "single_physical_site_with_full_cyclic_release_replay"
+                    )
                     if methyl_guidance_enabled
                     else "frozen_t05_base_only"
+                ),
+                "methyl_guidance_mode": (
+                    methyl_guidance_mode
+                    if methyl_guidance_enabled
+                    else "not_applicable"
                 ),
                 "methyl_guidance_context_policy": (
                     methyl_guidance_context_policy
@@ -1169,7 +1225,11 @@ def generate_batch(
                 "methyl_guidance_position_1based": (
                     int(guidance_relative[index].item()) + 1
                     if methyl_guidance_enabled
+                    and methyl_guidance_mode == "fixed_position"
                     else ""
+                ),
+                "sampling_path_provisional_methyl_hit": int(
+                    provisional_methyl_hit[index].item()
                 ),
                 "methyl_guidance_strength": (
                     float(methyl_guidance_strength)
