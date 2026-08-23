@@ -253,6 +253,37 @@ def topup_numerical_contract(
     }
 
 
+def numerical_runtime_contract(runtime_contract: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return only fields that can affect generated numerical values.
+
+    ``torch.cuda.get_device_properties().uuid`` identifies one physical GPU, not
+    its numerical implementation. AutoDL can attach a different card of the
+    same exact model after an instance restart. The GPU name, compute
+    capability, multiprocessor count, memory size, software versions, and every
+    deterministic backend flag remain pinned below; only the opaque UUID is
+    intentionally excluded.
+    """
+
+    normalized = dict(runtime_contract)
+    gpu = normalized.get("gpu")
+    if isinstance(gpu, Mapping):
+        normalized["gpu"] = {
+            str(key): value for key, value in gpu.items() if str(key) != "uuid"
+        }
+    return normalized
+
+
+def physical_gpu_uuid_changed(
+    recorded_runtime: Mapping[str, Any],
+    current_runtime: Mapping[str, Any],
+) -> bool:
+    recorded_gpu = recorded_runtime.get("gpu")
+    current_gpu = current_runtime.get("gpu")
+    if not isinstance(recorded_gpu, Mapping) or not isinstance(current_gpu, Mapping):
+        return False
+    return str(recorded_gpu.get("uuid", "")) != str(current_gpu.get("uuid", ""))
+
+
 def validate_initial_generation_contract(
     source_manifest: Mapping[str, Any],
     current_runtime_contract: Mapping[str, Any],
@@ -270,7 +301,9 @@ def validate_initial_generation_contract(
             "initial generation lacks a pinned runtime/numerical contract; "
             "rerun generation in a new output root"
         )
-    if dict(recorded_runtime) != dict(current_runtime_contract):
+    if numerical_runtime_contract(recorded_runtime) != numerical_runtime_contract(
+        current_runtime_contract
+    ):
         raise RuntimeError(
             "initial generation runtime differs from the top-up runtime; "
             "rerun in one environment"
@@ -320,7 +353,9 @@ def validate_existing_topup_resume_contract(
             "existing adaptive top-up rows lack a pinned runtime/numerical contract; "
             "use a new output root"
         )
-    if dict(recorded_runtime) != dict(current_runtime_contract):
+    if numerical_runtime_contract(recorded_runtime) != numerical_runtime_contract(
+        current_runtime_contract
+    ):
         raise RuntimeError(
             "adaptive top-up runtime changed before continuing existing rows; "
             "use a new output root"
@@ -863,6 +898,18 @@ def run(args: argparse.Namespace) -> None:
         current_topup_runtime_contract,
         current_topup_numerical_contract,
     )
+    initial_runtime_contract = source_manifest["initial_generation_runtime_contract"]
+    accepted_gpu_uuid_change = physical_gpu_uuid_changed(
+        initial_runtime_contract,
+        current_topup_runtime_contract,
+    )
+    if accepted_gpu_uuid_change:
+        print(
+            "Runtime compatibility: physical GPU UUID changed, while every "
+            "numerically relevant runtime field remains exact; continuation "
+            "is authorized.",
+            flush=True,
+        )
     validate_existing_topup_resume_contract(
         source_manifest,
         existing_topup_rows,
@@ -1536,6 +1583,20 @@ def run(args: argparse.Namespace) -> None:
             "numpy_version": str(np.__version__),
             "topup_runtime_contract": current_topup_runtime_contract,
             "topup_numerical_contract": current_topup_numerical_contract,
+            "accepted_nonnumerical_runtime_differences": (
+                [
+                    {
+                        "field": "gpu.uuid",
+                        "reason": (
+                            "physical device identity changed; exact GPU model, "
+                            "compute capability, hardware properties, software "
+                            "versions, and deterministic backend settings match"
+                        ),
+                    }
+                ]
+                if accepted_gpu_uuid_change
+                else []
+            ),
             "source_v6_generation_manifest_sha256_before_resume": previous_manifest_sha256,
             "source_v6_all_candidates_sha256_before_resume": previous_all_sha256,
             "source_v6_backup_dir": str(backup_dir),

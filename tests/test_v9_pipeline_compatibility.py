@@ -258,7 +258,8 @@ class V9PipelineCompatibilityTests(unittest.TestCase):
             "python_version": "3.10.0",
             "torch_version": "2.1.0",
             "device": "cuda",
-            "gpu": {"name": "GPU-A"},
+            "gpu": {"name": "GPU-A", "uuid": "physical-gpu-1"},
+            "deterministic": {"cublas_workspace_config": ":4096:8"},
         }
         numerical = {
             "batch_size": 16,
@@ -272,11 +273,25 @@ class V9PipelineCompatibilityTests(unittest.TestCase):
         topup_engine.validate_existing_topup_resume_contract(
             manifest, rows, runtime, numerical
         )
+        uuid_only_change = json.loads(json.dumps(runtime))
+        uuid_only_change["gpu"]["uuid"] = "physical-gpu-2"
+        topup_engine.validate_existing_topup_resume_contract(
+            manifest, rows, uuid_only_change, numerical
+        )
         with self.assertRaisesRegex(RuntimeError, "runtime changed"):
             topup_engine.validate_existing_topup_resume_contract(
                 manifest,
                 rows,
                 dict(runtime, torch_version="2.2.0"),
+                numerical,
+            )
+        cublas_change = json.loads(json.dumps(runtime))
+        cublas_change["deterministic"]["cublas_workspace_config"] = None
+        with self.assertRaisesRegex(RuntimeError, "runtime changed"):
+            topup_engine.validate_existing_topup_resume_contract(
+                manifest,
+                rows,
+                cublas_change,
                 numerical,
             )
         with self.assertRaisesRegex(RuntimeError, "batch or numerical"):
@@ -296,7 +311,8 @@ class V9PipelineCompatibilityTests(unittest.TestCase):
             "python_version": "3.10.0",
             "torch_version": "2.1.0",
             "device": "cuda",
-            "gpu": {"name": "GPU-A"},
+            "gpu": {"name": "GPU-A", "uuid": "physical-gpu-1"},
+            "deterministic": {"cublas_workspace_config": ":4096:8"},
         }
         current = {
             "protocol": "v9-test",
@@ -331,10 +347,23 @@ class V9PipelineCompatibilityTests(unittest.TestCase):
             "initial_generation_numerical_contract": initial,
         }
         topup_engine.validate_initial_generation_contract(manifest, runtime, current)
+        uuid_only_change = json.loads(json.dumps(runtime))
+        uuid_only_change["gpu"]["uuid"] = "physical-gpu-2"
+        topup_engine.validate_initial_generation_contract(
+            manifest, uuid_only_change, current
+        )
         with self.assertRaisesRegex(RuntimeError, "runtime differs"):
             topup_engine.validate_initial_generation_contract(
                 manifest,
                 dict(runtime, torch_version="2.2.0"),
+                current,
+            )
+        cublas_change = json.loads(json.dumps(runtime))
+        cublas_change["deterministic"]["cublas_workspace_config"] = None
+        with self.assertRaisesRegex(RuntimeError, "runtime differs"):
+            topup_engine.validate_initial_generation_contract(
+                manifest,
+                cublas_change,
                 current,
             )
         with self.assertRaisesRegex(RuntimeError, "batch or numerical"):
