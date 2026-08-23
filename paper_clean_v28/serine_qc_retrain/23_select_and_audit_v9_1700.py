@@ -66,6 +66,7 @@ CYCLIC_BASE_FLOOR_POLICY = (
 RMSD_RANKER_PROTOCOL = "rmsd_priority_ranker_v10_six_target_loto_v1"
 RMSD_SELECTION_OVERLAY = "rmsd_priority_first_with_evidence_aware_position_gate_v10"
 RMSD_VALIDATED_TOP_FRACTION = 0.25
+SERIALIZED_PROBABILITY_RECOMPUTE_ATOL = 1e-6
 RMSD_DEVELOPMENT_SHA256 = (
     "d754c905e00d03c18ce0610b740c9bd6da09ee0a9e9d5d7ce953dc73d86aad05"
 )
@@ -334,7 +335,8 @@ def validate_candidate(
         return None, errors
 
     if any(
-        minimum > mean + 1e-7 or mean > maximum + 1e-7
+        minimum > mean + SERIALIZED_PROBABILITY_RECOMPUTE_ATOL
+        or mean > maximum + SERIALIZED_PROBABILITY_RECOMPUTE_ATOL
         for mean, minimum, maximum in zip(means, minima, maxima)
     ):
         errors.append("representation_min_mean_max_order_violation")
@@ -363,10 +365,12 @@ def validate_candidate(
                 / len(values)
             )
             if (
-                round(means[position], 8) != round(recomputed_mean, 8)
+                abs(means[position] - recomputed_mean)
+                > SERIALIZED_PROBABILITY_RECOMPUTE_ATOL
                 or round(minima[position], 8) != round(recomputed_min, 8)
                 or round(maxima[position], 8) != round(recomputed_max, 8)
-                or abs(representation_std[position] - recomputed_std) > 1e-6
+                or abs(representation_std[position] - recomputed_std)
+                > SERIALIZED_PROBABILITY_RECOMPUTE_ATOL
             ):
                 errors.append("representation_by_start_summary_recompute_mismatch")
                 break

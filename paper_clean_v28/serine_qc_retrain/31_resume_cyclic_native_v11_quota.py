@@ -65,11 +65,26 @@ def main() -> None:
     )
     engine.ANNOTATION_CONTEXT = "peptide_chain_only_no_visible_receptor_chains"
     engine.RECOVERY_MODE = (
-        "RETAIN_COMPLETE_V11_RUN_AND_ADAPTIVELY_SAMPLE_ONLY_STABLE_QUOTA_"
-        "SHORTFALL_TARGETS"
+        "RETAIN_COMPLETE_V11_RUN_AND_METHYLATION_FIRST_GUIDED_SAMPLE_ONLY_"
+        "POOL_OR_FINAL_DIVERSITY_SHORTFALL_TARGETS"
     )
     engine.INITIAL_STAGE = "V11_INITIAL_FULL_REGENERATION"
-    engine.TOPUP_STAGE = "V11_ADAPTIVE_STABLE_QUOTA_TOPUP"
+    engine.TOPUP_STAGE = "V11_METHYLATION_FIRST_GUIDED_DEFICIT_TOPUP"
+    engine.TOPUP_CANDIDATE_PREFIX = "t05v11guided"
+    engine.RECOVERY_LABEL = "V11"
+    # Cycle several fixed product-of-experts strengths instead of blindly
+    # repeating the base-only sampler.  Every proposal is still independently
+    # annotated over the complete cyclic grid and must pass the unchanged
+    # representation-min >0.6 release gate.
+    engine.METHYL_GUIDANCE_STRENGTHS = (1.0, 2.0, 4.0, 8.0)
+    # Twenty rows are the mathematical minimum needed to keep a 100-row final
+    # release at or below the 80% concentration ceiling.  Five extra rows give
+    # the exact-base/global-dedup stages a bounded safety margin.
+    engine.FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET = 25
+    engine.ALLOWED_SOURCE_FAILED_CHECKS = {
+        "every_target_meets_pre_structure_candidate_quota",
+        "every_target_meets_final_release_diversity_reserve",
+    }
     original_checkpoint_metadata = engine.checkpoint_metadata
     original_validate_representation_audit = engine.validate_representation_audit
 

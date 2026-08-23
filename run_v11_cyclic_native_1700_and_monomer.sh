@@ -21,6 +21,7 @@ TRAINER="$REPO_ROOT/paper_clean_v28/serine_qc_retrain/02_retrain_canonical_exper
 AUDITOR="$REPO_ROOT/paper_clean_v28/serine_qc_retrain/07_audit_cyclic_representation_equivariance.py"
 GENERATOR="$REPO_ROOT/paper_clean_v28/rerun_t05/01_generate_t05_multiseed.py"
 TOPUP="$REPO_ROOT/paper_clean_v28/serine_qc_retrain/31_resume_cyclic_native_v11_quota.py"
+GATE_REAUDITOR="$REPO_ROOT/paper_clean_v28/serine_qc_retrain/32_reaudit_v11_serialized_gate.py"
 BASE_SCORER="$REPO_ROOT/paper_clean_v28/serine_qc_retrain/24_score_uniform_cyclic_base_v9.py"
 SELECTOR="$REPO_ROOT/paper_clean_v28/serine_qc_retrain/23_select_and_audit_v9_1700.py"
 REPLAYER="$REPO_ROOT/paper_clean_v28/serine_qc_retrain/26_independent_replay_and_package_v9_1700.py"
@@ -178,6 +179,12 @@ PY
 
 ensure_v10_regression_dependencies() {
   if "$PYTHON_BIN" -c 'import pandas' >/dev/null 2>&1; then
+    return
+  fi
+
+  if [[ "${V11_INSTALL_OPTIONAL_PANDAS:-0}" != "1" ]]; then
+    echo "V11 dependency bootstrap: pandas is absent and optional network install is disabled"
+    echo "V11 dependency bootstrap: GPU training/generation continues; pandas-only Windows postprocessing tests self-skip"
     return
   fi
 
@@ -346,7 +353,7 @@ for required in \
   "$PLAN" "$PARENT_MODEL" "$TRAIN_JSONL" "$TEST_JSONL" "$NATIVE_JSONL" \
   "$BEST_CSV" "$HISTORICAL_CSV" "$PRIOR_CSV" "$RMSD_DEVELOPMENT_CSV" \
   "$ORIGINAL_MONOMER_CORRECTED_CSV" "$POSITION_CONCENTRATION_POLICY" "$TRAINER" "$AUDITOR" \
-  "$GENERATOR" "$TOPUP" "$BASE_SCORER" "$SELECTOR" "$REPLAYER" \
+  "$GENERATOR" "$TOPUP" "$GATE_REAUDITOR" "$BASE_SCORER" "$SELECTOR" "$REPLAYER" \
   "$RMSD_RANKER" "$MONOMER_FINALIZER" "$RMSD_REPLAYER" \
   "$REPORT_BUILDER" "$MONOMER_EVALUATOR"; do
   [[ -s "$required" ]] || {
@@ -518,8 +525,18 @@ if [[ ! -f "$GENERATION_MANIFEST" ]]; then
     --defer-permeability-until-structure
   generation_exit=$?
   set -e
-  echo "Initial generation exit code: $generation_exit (quota-only failure may be resumed)"
+  echo "Initial generation exit code: $generation_exit (bounded pool/diversity shortfall may be resumed)"
 fi
+
+echo "[5/10] Re-auditing persisted V11 probabilities without repeating any completed draw"
+"$PYTHON_BIN" "$GATE_REAUDITOR" \
+  --run-dir "$GENERATION_DIR" \
+  --plan "$PLAN" \
+  --model "$MODEL" \
+  --representation-audit "$AUDIT_JSON" \
+  --historical-csv "$HISTORICAL_CSV" \
+  --prior-csv "$PRIOR_CSV" \
+  --position-concentration-policy "$POSITION_CONCENTRATION_POLICY"
 
 set +e
 "$PYTHON_BIN" - "$GENERATION_MANIFEST" <<'PY'
@@ -535,8 +552,12 @@ checks = payload.get("quality_checks", {})
 failed = sorted(name for name, passed in checks.items() if not bool(passed))
 if payload.get("quality_gate") == "PASS" and not failed:
     raise SystemExit(0)
-if failed == ["every_target_meets_pre_structure_candidate_quota"]:
-    print("quota-only generation shortfall: adaptive top-up authorized")
+recoverable = {
+    "every_target_meets_pre_structure_candidate_quota",
+    "every_target_meets_final_release_diversity_reserve",
+}
+if failed and set(failed) <= recoverable:
+    print("bounded pool/diversity shortfall: guided top-up authorized")
     raise SystemExit(10)
 print("non-quota generation failures: " + ", ".join(failed), file=sys.stderr)
 raise SystemExit(20)
@@ -544,7 +565,7 @@ PY
 generation_status=$?
 set -e
 if [[ "$generation_status" == "10" ]]; then
-  echo "[5/10] Stable-candidate quota shortfall: resuming only deficient targets"
+  echo "[5/10] Methylation-first guided recovery for deficient targets only"
   "$PYTHON_BIN" "$TOPUP" \
     --plan "$PLAN" \
     --model-path "$MODEL" \
@@ -556,8 +577,8 @@ if [[ "$generation_status" == "10" ]]; then
     --prior-designs-csv "$PRIOR_CSV" \
     --position-concentration-policy "$POSITION_CONCENTRATION_POLICY" \
     --batch-size "${V11_GENERATION_BATCH_SIZE:-16}" \
-    --draws-per-reserve-seed "${V11_TOPUP_DRAWS_PER_SEED:-1000}" \
-    --max-topup-draws-per-target "${V11_MAX_TOPUP_DRAWS_PER_TARGET:-12000}" \
+    --draws-per-reserve-seed "${V11_TOPUP_DRAWS_PER_SEED:-2500}" \
+    --max-topup-draws-per-target "${V11_MAX_TOPUP_DRAWS_PER_TARGET:-60000}" \
     --quota-margin "${V11_TOPUP_MARGIN:-10}" \
     --device cuda
 elif [[ "$generation_status" != "0" ]]; then

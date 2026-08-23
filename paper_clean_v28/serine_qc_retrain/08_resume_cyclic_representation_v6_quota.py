@@ -86,7 +86,14 @@ RECOVERY_MODE = (
 )
 INITIAL_STAGE = "V6_INITIAL_FULL_REGENERATION"
 TOPUP_STAGE = "V6_ADAPTIVE_QUOTA_TOPUP"
+TOPUP_CANDIDATE_PREFIX = "t05v6topup"
+RECOVERY_LABEL = "V6"
 ALLOWED_SOURCE_FAILED_CHECKS = {"every_target_meets_pre_structure_candidate_quota"}
+# V11 overrides these hooks in its thin entry point.  Older protocols retain
+# the exact unbiased sampler because an empty strength tuple disables every
+# new branch.
+METHYL_GUIDANCE_STRENGTHS: Tuple[float, ...] = ()
+FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET = 0
 DEFAULT_RESERVE_SEEDS = (
     606,
     707,
@@ -230,6 +237,12 @@ def topup_numerical_contract(
         "max_topup_draws_per_target": int(args.max_topup_draws_per_target),
         "check_interval_draws": int(args.check_interval_draws),
         "quota_margin": int(args.quota_margin),
+        "methyl_guidance_strengths": [
+            float(value) for value in METHYL_GUIDANCE_STRENGTHS
+        ],
+        "final_release_diversity_reserve_per_target": int(
+            FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET
+        ),
         "reserve_seeds": [int(value) for value in args.reserve_seeds],
         "initial_generation_seeds": [int(value) for value in plan["seeds"]],
         "device_argument": str(args.device),
@@ -355,6 +368,109 @@ def eligible_pool(
 
 def eligible_count_by_target(rows: Sequence[Mapping[str, Any]]) -> Counter[str]:
     return Counter(str(row["target_name"]).upper() for row in rows)
+
+
+def target_methyl_profile(
+    rows: Sequence[Mapping[str, Any]], target: str
+) -> Tuple[Counter[int], Counter[str]]:
+    positions: Counter[int] = Counter()
+    residues: Counter[str] = Counter()
+    for row in rows:
+        if str(row.get("target_name", "")).upper() != target:
+            continue
+        sequence = str(row.get("design_seq", ""))
+        for position, token in enumerate(sequence, start=1):
+            if token.islower():
+                positions[position] += 1
+                residues[token.upper()] += 1
+    return positions, residues
+
+
+def dominant_values(counter: Counter[Any]) -> set[Any]:
+    maximum = max(counter.values(), default=0)
+    return {key for key, value in counter.items() if value == maximum} if maximum else set()
+
+
+def target_diversity_reserve(
+    rows: Sequence[Mapping[str, Any]],
+    target: str,
+    dominant_positions: set[int],
+    dominant_residues: set[str],
+) -> Dict[str, int]:
+    alternate_position_rows = 0
+    alternate_residue_rows = 0
+    for row in rows:
+        if str(row.get("target_name", "")).upper() != target:
+            continue
+        sequence = str(row.get("design_seq", ""))
+        sites = [
+            (position, token.upper())
+            for position, token in enumerate(sequence, start=1)
+            if token.islower()
+        ]
+        if not dominant_positions or any(
+            position not in dominant_positions for position, _residue in sites
+        ):
+            alternate_position_rows += 1
+        if not dominant_residues or any(
+            residue not in dominant_residues for _position, residue in sites
+        ):
+            alternate_residue_rows += 1
+    return {
+        "alternate_position_rows": alternate_position_rows,
+        "alternate_residue_rows": alternate_residue_rows,
+    }
+
+
+def target_release_diversity_state(
+    rows: Sequence[Mapping[str, Any]],
+    target: str,
+    reserve_goal: int,
+    supported_positions: Sequence[int] = (),
+) -> Dict[str, Any]:
+    positions, residues = target_methyl_profile(rows, target)
+    dominant_positions = {int(value) for value in dominant_values(positions)}
+    dominant_residues = {str(value) for value in dominant_values(residues)}
+    reserve = target_diversity_reserve(
+        rows, target, dominant_positions, dominant_residues
+    )
+    position_sites = sum(positions.values())
+    residue_sites = sum(residues.values())
+    maximum_position_share = (
+        max(positions.values(), default=0) / position_sites
+        if position_sites
+        else 0.0
+    )
+    maximum_residue_share = (
+        max(residues.values(), default=0) / residue_sites
+        if residue_sites
+        else 0.0
+    )
+    supported = {int(value) for value in supported_positions}
+    position_exempt = bool(dominant_positions & supported)
+    result: Dict[str, Any] = {
+        **reserve,
+        "dominant_positions_1based": sorted(dominant_positions),
+        "dominant_residues": sorted(dominant_residues),
+        "maximum_single_position_share": maximum_position_share,
+        "maximum_single_residue_share": maximum_residue_share,
+        "position_historical_support_exemption": position_exempt,
+    }
+    result["position_reserve_ready"] = bool(
+        maximum_position_share <= 0.80
+        or position_exempt
+        or reserve_goal <= 0
+        or reserve["alternate_position_rows"] >= reserve_goal
+    )
+    result["residue_reserve_ready"] = bool(
+        maximum_residue_share <= 0.80
+        or reserve_goal <= 0
+        or reserve["alternate_residue_rows"] >= reserve_goal
+    )
+    result["release_diversity_reserve_ready"] = bool(
+        result["position_reserve_ready"] and result["residue_reserve_ready"]
+    )
+    return result
 
 
 def checkpoint_metadata(torch_module: Any, model_path: Path) -> Dict[str, Any]:
@@ -825,16 +941,52 @@ def run(args: argparse.Namespace) -> None:
         prior_natural,
     )
     initial_counts = eligible_count_by_target(eligible_rows)
-    shortfalls = [
+    quota_shortfalls = [
         target
         for target in validated["target_names"]
         if initial_counts[target] < int(plan_by_target[target]["structure_quota"])
+    ]
+    supported_positions_by_target = {
+        str(target).upper(): [int(value) for value in values]
+        for target, values in dict(
+            (concentration_policy or {}).get(
+                "supported_positions_1based_by_target", {}
+            )
+        ).items()
+    }
+    initial_dominant_positions: Dict[str, set[int]] = {}
+    initial_dominant_residues: Dict[str, set[str]] = {}
+    initial_diversity: Dict[str, Dict[str, Any]] = {}
+    for target in validated["target_names"]:
+        initial_diversity[target] = target_release_diversity_state(
+            eligible_rows,
+            target,
+            int(FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET),
+            supported_positions_by_target.get(target, []),
+        )
+        initial_dominant_positions[target] = {
+            int(value)
+            for value in initial_diversity[target]["dominant_positions_1based"]
+        }
+        initial_dominant_residues[target] = {
+            str(value) for value in initial_diversity[target]["dominant_residues"]
+        }
+    diversity_shortfalls = [
+        target
+        for target in validated["target_names"]
+        if int(FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET) > 0
+        and not bool(initial_diversity[target]["release_diversity_reserve_ready"])
+    ]
+    recovery_targets = [
+        target
+        for target in validated["target_names"]
+        if target in set(quota_shortfalls) | set(diversity_shortfalls)
     ]
     recorded_shortfalls = {
         str(value).upper()
         for value in source_manifest.get("targets_below_pre_permeability_quota", [])
     }
-    if recorded_shortfalls != set(shortfalls):
+    if recorded_shortfalls != set(quota_shortfalls):
         raise RuntimeError(
             "V6 source manifest shortfall list does not match recomputed candidates"
         )
@@ -842,12 +994,16 @@ def run(args: argparse.Namespace) -> None:
         "every_target_meets_pre_structure_candidate_quota"
         in source_validation["source_false_checks"]
     )
-    if recorded_quota_failure != bool(shortfalls):
+    if recorded_quota_failure != bool(quota_shortfalls):
         raise RuntimeError(
             "V6 source quota check does not match recomputed candidate shortfalls"
         )
-    if not shortfalls:
-        print("V6 already meets every target quota; no top-up was performed.", flush=True)
+    if not recovery_targets:
+        print(
+            f"{RECOVERY_LABEL} already meets every target pool and final-release diversity reserve; "
+            "no top-up was performed.",
+            flush=True,
+        )
         return
 
     print(
@@ -855,10 +1011,21 @@ def run(args: argparse.Namespace) -> None:
         + ", ".join(
             f"{target} ({initial_counts[target]}/"
             f"{int(plan_by_target[target]['structure_quota'])})"
-            for target in shortfalls
+            for target in quota_shortfalls
         ),
         flush=True,
     )
+    if diversity_shortfalls:
+        print(
+            "Final-release diversity-reserve targets: "
+            + ", ".join(
+                f"{target} (position={initial_diversity[target]['alternate_position_rows']}, "
+                f"residue={initial_diversity[target]['alternate_residue_rows']}/"
+                f"{int(FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET)})"
+                for target in diversity_shortfalls
+            ),
+            flush=True,
+        )
 
     reserve_seeds = [int(value) for value in args.reserve_seeds]
     if (
@@ -869,7 +1036,7 @@ def run(args: argparse.Namespace) -> None:
     ):
         raise ValueError("Reserve seeds must be unique, positive, and disjoint from V6 seeds")
 
-    print(f"Loading promoted V6 checkpoint: {model_path}", flush=True)
+    print(f"Loading promoted {RECOVERY_LABEL} checkpoint: {model_path}", flush=True)
     model = load_v28_model(str(model_path), device)
     model.eval()
     topup_rows_by_target: Counter[str] = Counter(
@@ -885,15 +1052,17 @@ def run(args: argparse.Namespace) -> None:
         source_manifest.get("adaptive_topup_checkpoints", [])
     )
     all_initial_shortfalls = list(
-        source_manifest.get("adaptive_topup_initial_shortfall_targets", shortfalls)
+        source_manifest.get(
+            "adaptive_topup_initial_shortfall_targets", recovery_targets
+        )
     )
-    for target in shortfalls:
+    for target in recovery_targets:
         if target not in all_initial_shortfalls:
             all_initial_shortfalls.append(target)
 
     temperature = float(plan["temperature"])
     threshold = float(plan["methyl_threshold"])
-    for target in shortfalls:
+    for target in recovery_targets:
         target_config = plan_by_target[target]
         quota = int(target_config["structure_quota"])
         goal = quota + int(args.quota_margin)
@@ -913,6 +1082,25 @@ def run(args: argparse.Namespace) -> None:
             raise RuntimeError(f"Peptide coordinate/sequence mismatch for {target}")
 
         current_count = initial_counts[target]
+        current_diversity = target_release_diversity_state(
+            eligible_rows,
+            target,
+            int(FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET),
+            supported_positions_by_target.get(target, []),
+        )
+        diversity_reserve = int(FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET)
+
+        def recovery_ready() -> bool:
+            return (
+                current_count >= goal
+                and (
+                    diversity_reserve <= 0
+                    or bool(
+                        current_diversity["release_diversity_reserve_ready"]
+                    )
+                )
+            )
+
         target_draws_this_run = 0
         remaining_target_budget = max(
             0,
@@ -922,11 +1110,13 @@ def run(args: argparse.Namespace) -> None:
         used_seeds = set(topup_seeds_by_target[target])
         print(
             f"[{target}] existing eligible={current_count}, quota={quota}, goal={goal}, "
+            f"alternate-position={current_diversity['alternate_position_rows']}, "
+            f"alternate-residue={current_diversity['alternate_residue_rows']}, "
             f"remaining fixed budget={remaining_target_budget}",
             flush=True,
         )
         for reserve_seed in reserve_seeds:
-            if current_count >= goal or target_draws_this_run >= remaining_target_budget:
+            if recovery_ready() or target_draws_this_run >= remaining_target_budget:
                 break
             if reserve_seed in used_seeds:
                 continue
@@ -938,7 +1128,7 @@ def run(args: argparse.Namespace) -> None:
             while (
                 produced_for_seed < int(args.draws_per_reserve_seed)
                 and target_draws_this_run < remaining_target_budget
-                and current_count < goal
+                and not recovery_ready()
             ):
                 checkpoint_draws = min(
                     int(args.check_interval_draws),
@@ -949,6 +1139,52 @@ def run(args: argparse.Namespace) -> None:
                 while checkpoint_produced < checkpoint_draws:
                     current_batch = min(
                         int(args.batch_size), checkpoint_draws - checkpoint_produced
+                    )
+                    peptide_length = int(metadata_row["native_peptide_length"])
+                    needs_alternate_position = (
+                        diversity_reserve > 0
+                        and not bool(current_diversity["position_reserve_ready"])
+                    )
+                    guidance_position_pool = [
+                        position
+                        for position in range(1, peptide_length + 1)
+                        if not needs_alternate_position
+                        or position
+                        not in {
+                            int(value)
+                            for value in current_diversity[
+                                "dominant_positions_1based"
+                            ]
+                        }
+                    ]
+                    if not guidance_position_pool:
+                        guidance_position_pool = list(range(1, peptide_length + 1))
+                    guidance_offset = int(topup_rows_by_target[target])
+                    guidance_positions = [
+                        guidance_position_pool[
+                            (guidance_offset + index) % len(guidance_position_pool)
+                        ]
+                        for index in range(current_batch)
+                    ]
+                    guidance_strength = (
+                        float(
+                            METHYL_GUIDANCE_STRENGTHS[
+                                (guidance_offset // max(1, int(args.batch_size)))
+                                % len(METHYL_GUIDANCE_STRENGTHS)
+                            ]
+                        )
+                        if METHYL_GUIDANCE_STRENGTHS
+                        else 0.0
+                    )
+                    needs_alternate_residue = (
+                        diversity_reserve > 0
+                        and not bool(current_diversity["residue_reserve_ready"])
+                    )
+                    dominant_residue = (
+                        str(current_diversity["dominant_residues"][0])
+                        if needs_alternate_residue
+                        and current_diversity["dominant_residues"]
+                        else ""
                     )
                     generated = generator.generate_batch(
                         model=model,
@@ -966,6 +1202,17 @@ def run(args: argparse.Namespace) -> None:
                             cyclic_representation_known_sequence_methyl_probabilities
                         ),
                         peptide_only_tensors_fn=peptide_only_annotation_tensors,
+                        methyl_guidance_positions_1based=(
+                            guidance_positions
+                            if METHYL_GUIDANCE_STRENGTHS
+                            else None
+                        ),
+                        methyl_guidance_strength=guidance_strength,
+                        methyl_guidance_forbidden_parent_tokens=(
+                            [dominant_residue] * current_batch
+                            if METHYL_GUIDANCE_STRENGTHS
+                            else None
+                        ),
                     )
                     for batch_offset, generated_row in enumerate(generated):
                         draw_index = produced_for_seed + batch_offset + 1
@@ -973,7 +1220,7 @@ def run(args: argparse.Namespace) -> None:
                         methyl_positions = generator.methyl_positions_1based(sequence)
                         row: Dict[str, Any] = {
                             "candidate_id": (
-                                f"t05v6topup_{target.lower()}_s{reserve_seed}_"
+                                f"{TOPUP_CANDIDATE_PREFIX}_{target.lower()}_s{reserve_seed}_"
                                 f"{draw_index:04d}"
                             ),
                             "target_name": target,
@@ -1009,6 +1256,10 @@ def run(args: argparse.Namespace) -> None:
                             "methyl_positions_1based": json.dumps(methyl_positions),
                             "current_problem": target_config["current_problem"],
                             "planned_structure_quota": quota,
+                            "planned_preselection_candidate_quota": quota,
+                            "planned_final_structure_handoff_quota": int(
+                                plan.get("final_release_quota_per_target", quota)
+                            ),
                             "source_recovery_stage": TOPUP_STAGE,
                             **generated_row,
                         }
@@ -1030,6 +1281,12 @@ def run(args: argparse.Namespace) -> None:
                     prior_natural,
                 )
                 current_count = eligible_count_by_target(eligible_rows)[target]
+                current_diversity = target_release_diversity_state(
+                    eligible_rows,
+                    target,
+                    int(FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET),
+                    supported_positions_by_target.get(target, []),
+                )
                 topup_checkpoints.append(
                     {
                         "target_name": target,
@@ -1039,11 +1296,16 @@ def run(args: argparse.Namespace) -> None:
                         "total_topup_rows_for_target": topup_rows_by_target[target],
                         "eligible_candidates": current_count,
                         "goal": goal,
+                        **current_diversity,
+                        "diversity_reserve_goal": diversity_reserve,
                     }
                 )
                 print(
                     f"[{target}] reserve seed={reserve_seed}, "
-                    f"new draws={target_draws_this_run}, eligible={current_count}/{goal}",
+                    f"new draws={target_draws_this_run}, eligible={current_count}/{goal}, "
+                    f"alternate-position={current_diversity['alternate_position_rows']}/"
+                    f"{diversity_reserve}, alternate-residue="
+                    f"{current_diversity['alternate_residue_rows']}/{diversity_reserve}",
                     flush=True,
                 )
 
@@ -1059,6 +1321,23 @@ def run(args: argparse.Namespace) -> None:
         prior_natural,
     )
     final_counts = eligible_count_by_target(eligible_rows)
+    final_diversity_by_target = {
+        target: target_release_diversity_state(
+            eligible_rows,
+            target,
+            int(FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET),
+            supported_positions_by_target.get(target, []),
+        )
+        for target in validated["target_names"]
+    }
+    targets_below_diversity_reserve = [
+        target
+        for target in validated["target_names"]
+        if int(FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET) > 0
+        and not bool(
+            final_diversity_by_target[target]["release_diversity_reserve_ready"]
+        )
+    ]
     candidate_ids = [str(row.get("candidate_id", "")) for row in raw_rows]
     invalid_rows = [
         row
@@ -1136,7 +1415,19 @@ def run(args: argparse.Namespace) -> None:
                     int(row["seen_in_prior_1333"]) for row in target_unique
                 ),
                 "new_methylated_for_permeability": final_counts[target],
-                "planned_structure_quota": quota,
+                "planned_preselection_candidate_quota": quota,
+                "planned_final_structure_handoff_quota": int(
+                    plan.get("final_release_quota_per_target", quota)
+                ),
+                "alternate_position_candidate_rows": final_diversity_by_target[
+                    target
+                ]["alternate_position_rows"],
+                "alternate_residue_candidate_rows": final_diversity_by_target[
+                    target
+                ]["alternate_residue_rows"],
+                "final_release_diversity_reserve_goal": int(
+                    FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET
+                ),
                 "enough_candidates_before_permeability": int(final_counts[target] >= quota),
             }
         )
@@ -1181,6 +1472,9 @@ def run(args: argparse.Namespace) -> None:
             for row in raw_rows
             if str(row.get("source_recovery_stage", "")) == TOPUP_STAGE
         ),
+        "every_target_meets_final_release_diversity_reserve": (
+            not targets_below_diversity_reserve
+        ),
         "every_target_meets_pre_structure_candidate_quota": not targets_below_quota,
     }
     quality_gate = "PASS" if all(quality_checks.values()) else "FAIL"
@@ -1216,6 +1510,15 @@ def run(args: argparse.Namespace) -> None:
         )
 
     manifest = dict(source_manifest)
+    serialized_gate_reaudit = manifest.get("serialized_gate_reaudit")
+    if isinstance(serialized_gate_reaudit, Mapping):
+        serialized_gate_reaudit = dict(serialized_gate_reaudit)
+        immutable_source = backup_dir / "all_candidates.csv"
+        serialized_gate_reaudit["immutable_all_candidates"] = {
+            "path": str(immutable_source),
+            "sha256": sha256_file(immutable_source),
+        }
+        manifest["serialized_gate_reaudit"] = serialized_gate_reaudit
     manifest.update(
         {
             "quality_gate": quality_gate,
@@ -1251,6 +1554,24 @@ def run(args: argparse.Namespace) -> None:
             "source_v6_raw_candidates_retained": initial_full_rows,
             "adaptive_topup_raw_candidates": len(raw_rows) - initial_full_rows,
             "adaptive_topup_initial_shortfall_targets": all_initial_shortfalls,
+            "adaptive_topup_initial_quota_shortfall_targets": quota_shortfalls,
+            "adaptive_topup_initial_diversity_shortfall_targets": (
+                diversity_shortfalls
+            ),
+            "adaptive_topup_final_diversity_shortfall_targets": (
+                targets_below_diversity_reserve
+            ),
+            "adaptive_topup_initial_dominant_positions_1based": {
+                target: sorted(values)
+                for target, values in sorted(initial_dominant_positions.items())
+            },
+            "adaptive_topup_initial_dominant_residues": {
+                target: sorted(values)
+                for target, values in sorted(initial_dominant_residues.items())
+            },
+            "adaptive_topup_final_diversity_by_target": (
+                final_diversity_by_target
+            ),
             "adaptive_topup_rows_by_target": dict(sorted(topup_rows_by_target.items())),
             "adaptive_topup_seeds_by_target": {
                 target: values
@@ -1358,15 +1679,15 @@ def run(args: argparse.Namespace) -> None:
     }
     generator.atomic_write_json(out_dir / "generation_manifest.json", manifest)
 
-    print("\n===== V6 QUOTA RESUME COMPLETE =====", flush=True)
-    print(f"Original V6 rows retained: {initial_full_rows}", flush=True)
+    print(f"\n===== {RECOVERY_LABEL} GUIDED DEFICIT RESUME COMPLETE =====", flush=True)
+    print(f"Original {RECOVERY_LABEL} rows retained: {initial_full_rows}", flush=True)
     print(f"Adaptive top-up rows: {len(raw_rows) - initial_full_rows}", flush=True)
     print(f"Final new methylated candidates: {len(eligible_rows)}", flush=True)
     print(f"Targets below quota: {targets_below_quota}", flush=True)
     print(f"Quality gate: {quality_gate}", flush=True)
     if quality_gate != "PASS":
         raise RuntimeError(
-            "V6 adaptive quota recovery failed; all outputs were preserved: "
+            f"{RECOVERY_LABEL} adaptive deficit recovery stopped; all outputs were preserved: "
             + ", ".join(false_checks(quality_checks))
         )
 

@@ -229,6 +229,22 @@ class CandidateValidationTests(unittest.TestCase):
         self.assertIsNone(candidate)
         self.assertIn("representation_by_start_summary_recompute_mismatch", errors)
 
+    def test_bounded_serialized_mean_noise_is_accepted_but_corruption_is_not(self):
+        row = valid_candidate()
+        means = json.loads(row["methyl_probabilities"])
+        means[1] += 2.2e-7
+        row["methyl_probabilities"] = json.dumps(means)
+        candidate, errors = selector.validate_candidate(row, {"1SFI"})
+        self.assertEqual(errors, [])
+        self.assertIsNotNone(candidate)
+
+        corrupted = dict(row)
+        means[1] += 2.0e-6
+        corrupted["methyl_probabilities"] = json.dumps(means)
+        candidate, errors = selector.validate_candidate(corrupted, {"1SFI"})
+        self.assertIsNone(candidate)
+        self.assertIn("representation_by_start_summary_recompute_mismatch", errors)
+
     def test_missing_duplicate_exclusion_evidence_fails_closed(self):
         row = valid_candidate()
         del row["seen_in_prior_1333_naturalized"]

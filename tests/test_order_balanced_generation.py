@@ -140,7 +140,7 @@ class ResultAnomalyGateTests(unittest.TestCase):
             target["historically_supported_dominant_positions_1based"], [2]
         )
 
-    def test_v10_policy_does_not_exempt_unlabelled_3av_collapse(self):
+    def test_v10_pool_records_unlabelled_3av_collapse_for_final_selection(self):
         residues = "ACDEFGHIKLMNQRSTVWY"
         concentrated = []
         for index in range(120):
@@ -155,7 +155,10 @@ class ResultAnomalyGateTests(unittest.TestCase):
             row for row in report["per_target_concentration"]
             if row["target_name"] == "3AV9"
         )
-        self.assertEqual(report["quality_gate"], "FAIL")
+        self.assertEqual(report["quality_gate"], "PASS")
+        self.assertTrue(
+            report["target_local_concentration_is_final_selection_gate_not_pool_gate"]
+        )
         self.assertFalse(target["position_concentration_exemption_applied"])
         self.assertFalse(target["position_gate_pass"])
 
@@ -175,7 +178,7 @@ class ResultAnomalyGateTests(unittest.TestCase):
             ]
         )
         self.assertFalse(
-            report["quality_checks"]
+            report["concentration_diagnostics"]
             ["no_target_has_single_position_above_80_percent_when_n_ge_30"]
         )
         self.assertIn("HARD_BLOCK", report["concentration_gate_policy"])
@@ -203,6 +206,39 @@ class ResultAnomalyGateTests(unittest.TestCase):
             ["every_eligible_candidate_is_stable_across_all_cyclic_starts"]
         )
 
+    def test_serialized_reduction_noise_does_not_reject_stable_candidate(self):
+        row = audit_row("T1", "ACDE", 2, "C", probability=0.62030825)
+        by_start = [
+            [0.1, 0.62030824, 0.1, 0.1],
+            [0.1, 0.62030831, 0.1, 0.1],
+            [0.1, 0.62030862, 0.1, 0.1],
+            [0.1, 0.62030872, 0.1, 0.1],
+        ]
+        row.update(
+            {
+                "methyl_probability_representation_min": json.dumps(
+                    [0.1, 0.62030824, 0.1, 0.1]
+                ),
+                "methyl_probability_representation_max": json.dumps(
+                    [0.1, 0.62030872, 0.1, 0.1]
+                ),
+                "methyl_probability_representation_span": json.dumps(
+                    [0.0, 0.00000048, 0.0, 0.0]
+                ),
+                "methyl_probability_representation_by_start": json.dumps(by_start),
+                "annotation_mode": generator.CYCLIC_REPRESENTATION_ANNOTATION_MODE,
+                "annotation_representation_ensemble_size": 4,
+                "annotation_decoder_order_ensemble_size": 4,
+                "annotation_total_probability_ensemble_size": 16,
+            }
+        )
+        self.assertTrue(generator.stable_cyclic_release_gate(row))
+        corrupted = dict(row)
+        corrupted["methyl_probabilities"] = json.dumps(
+            [0.1, 0.620305, 0.1, 0.1]
+        )
+        self.assertFalse(generator.stable_cyclic_release_gate(corrupted))
+
     def test_old_global_all_serine_signature_remains_blocked(self):
         rows = []
         for index in range(120):
@@ -216,28 +252,35 @@ class ResultAnomalyGateTests(unittest.TestCase):
             ]
         )
 
-    def test_one_all_serine_target_cannot_be_hidden_by_global_residue_mix(self):
+    def test_one_all_serine_target_is_preserved_as_final_selection_diagnostic(self):
         rows = []
         for index in range(40):
             position = index % 8 + 1
-            rows.append(audit_row("BAD", "SSSSSSSS", position, "S"))
+            digest = hashlib.sha256(f"BAD:{index}".encode("ascii")).digest()
+            natural = [
+                "ACDEFGHIKLMNQRSTVWY"[value % 19] for value in digest[:8]
+            ]
+            natural[position - 1] = "S"
+            rows.append(audit_row("BAD", "".join(natural), position, "S"))
         residues = "ACDEFGHIKLMNQRSTVWY"
         for index in range(120):
             position = index % 8 + 1
             residue = residues[index % len(residues)]
             natural = list("ACDEFGHI")
             natural[position - 1] = residue
-            rows.append(audit_row("MIXED", "".join(natural), position, residue))
+            rows.append(
+                audit_row(f"MIXED{index:03d}", "".join(natural), position, residue)
+            )
         report = generator.audit_annotation_stability(rows, rows)
         self.assertTrue(
             report["quality_checks"]["no_single_residue_exceeds_80_percent_of_sites"]
         )
         self.assertFalse(
-            report["quality_checks"][
+            report["concentration_diagnostics"][
                 "no_target_has_single_residue_above_80_percent_when_n_ge_30"
             ]
         )
-        self.assertEqual(report["quality_gate"], "FAIL")
+        self.assertEqual(report["quality_gate"], "PASS")
 
     def test_same_natural_sequence_with_different_annotation_is_blocked(self):
         first = audit_row("3AVA", "ACDEFGHI", 2, "C")
