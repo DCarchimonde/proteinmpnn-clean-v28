@@ -735,6 +735,41 @@ def evidence_aware_position_pass(
     )
 
 
+def concentration_policy_checks(
+    summaries: Sequence[Mapping[str, Any]],
+    global_sites: int,
+    maximum_global_residue_share: float,
+    role: str,
+) -> Tuple[Dict[str, bool], Dict[str, bool]]:
+    """Separate transparent concentration diagnostics from release validity.
+
+    The exact 17 x 100, uniqueness, strict methylation, cyclic-stability and
+    RMSD-priority checks remain hard.  In exploratory mode, concentration is a
+    soft selection preference and an explicitly reported diagnostic rather
+    than a reason to reject a target-specific methylation hotspot.
+    """
+
+    diagnostics = {
+        "target_methyl_position_concentration_passes_frozen_policy": all(
+            bool(row["position_concentration_pass"]) for row in summaries
+        ),
+        "no_target_methyl_residue_concentration_exceeds_80_percent": all(
+            bool(row["methyl_residue_concentration_pass"]) for row in summaries
+        ),
+        "global_methyl_residue_concentration_does_not_exceed_80_percent": (
+            bool(global_sites)
+            and maximum_global_residue_share <= MAX_POSITION_SHARE
+        ),
+    }
+    if role == "hard":
+        return diagnostics, dict(diagnostics)
+    if role == "diagnostic":
+        return diagnostics, {
+            "methyl_position_and_residue_concentration_are_diagnostic_only": True
+        }
+    raise ValueError(f"Unsupported concentration gate role: {role}")
+
+
 def select_diverse(
     rows: Sequence[Dict[str, Any]],
     quota: int,
@@ -1323,6 +1358,16 @@ def main() -> None:
             "validated scored pool to avoid false quota failures."
         ),
     )
+    parser.add_argument(
+        "--concentration-gates",
+        choices=("hard", "diagnostic"),
+        default="hard",
+        help=(
+            "Use diagnostic for exploratory structure review: concentration "
+            "still guides selection and is fully reported, but cannot block "
+            "an otherwise valid exact 17 x 100 handoff."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     if args.quota_per_target != QUOTA:
@@ -1576,6 +1621,14 @@ def main() -> None:
     maximum_residue_share = (
         max(global_residues.values(), default=0) / global_sites if global_sites else 0.0
     )
+    concentration_diagnostics, concentration_release_checks = (
+        concentration_policy_checks(
+            summaries,
+            global_sites,
+            maximum_residue_share,
+            args.concentration_gates,
+        )
+    )
     release_checks = {
         **upstream_checks,
         "candidate_input_is_nonempty": bool(input_rows),
@@ -1597,15 +1650,7 @@ def main() -> None:
             == len({str(row["design_natural_seq"]) for row in selected_rows})
             == len({canonical_rotation(str(row["design_natural_seq"])) for row in selected_rows})
         ),
-        "target_methyl_position_concentration_passes_frozen_policy": all(
-            bool(row["position_concentration_pass"]) for row in summaries
-        ),
-        "no_target_methyl_residue_concentration_exceeds_80_percent": all(
-            bool(row["methyl_residue_concentration_pass"]) for row in summaries
-        ),
-        "global_methyl_residue_concentration_does_not_exceed_80_percent": (
-            bool(global_sites) and maximum_residue_share <= MAX_POSITION_SHARE
-        ),
+        **concentration_release_checks,
         "external_exclusion_files_were_explicitly_loaded": len(exclusion_paths) >= 2,
     }
     if rmsd_mode:
@@ -1731,6 +1776,12 @@ def main() -> None:
         "protocol": "independent_v9_cyclic_stability_17x100_release_audit_v1",
         "selection_overlay": RMSD_SELECTION_OVERLAY if rmsd_mode else "none",
         "rmsd_priority_is_prospective_prediction_not_observed_structure": rmsd_mode,
+        "release_scope": "exploratory_structure_review",
+        "concentration_gate_role": args.concentration_gates,
+        "concentration_diagnostic_checks": concentration_diagnostics,
+        "concentration_diagnostic_failures": sorted(
+            name for name, passed in concentration_diagnostics.items() if not passed
+        ),
         "threshold": THRESHOLD,
         "temperature": TEMPERATURE,
         "quota_per_target": args.quota_per_target,

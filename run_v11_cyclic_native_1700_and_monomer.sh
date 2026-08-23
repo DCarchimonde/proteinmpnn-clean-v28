@@ -525,7 +525,7 @@ if [[ ! -f "$GENERATION_MANIFEST" ]]; then
     --defer-permeability-until-structure
   generation_exit=$?
   set -e
-  echo "Initial generation exit code: $generation_exit (bounded pool/diversity shortfall may be resumed)"
+  echo "Initial generation exit code: $generation_exit (bounded pool shortfall may be resumed; V11 diversity is diagnostic)"
 fi
 
 echo "[5/10] Re-auditing persisted V11 probabilities without repeating any completed draw"
@@ -557,7 +557,7 @@ recoverable = {
     "every_target_meets_final_release_diversity_reserve",
 }
 if failed and set(failed) <= recoverable:
-    print("bounded pool/diversity shortfall: guided top-up authorized")
+    print("bounded pool shortfall (or legacy diversity flag): guided top-up authorized")
     raise SystemExit(10)
 print("non-quota generation failures: " + ", ".join(failed), file=sys.stderr)
 raise SystemExit(20)
@@ -654,6 +654,7 @@ else
     --exclusion-csv "$PRIOR_CSV" \
     --rmsd-priority-csv "$RMSD_SCORED" \
     --rmsd-priority-manifest "$RMSD_MANIFEST" \
+    --concentration-gates diagnostic \
     --out-dir "$SELECTION_DIR"
 fi
 

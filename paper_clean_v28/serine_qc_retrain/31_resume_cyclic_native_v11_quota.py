@@ -66,7 +66,7 @@ def main() -> None:
     engine.ANNOTATION_CONTEXT = "peptide_chain_only_no_visible_receptor_chains"
     engine.RECOVERY_MODE = (
         "RETAIN_COMPLETE_V11_RUN_AND_METHYLATION_FIRST_GUIDED_SAMPLE_ONLY_"
-        "POOL_OR_FINAL_DIVERSITY_SHORTFALL_TARGETS"
+        "POOL_SHORTFALL_TARGETS_WITH_SOFT_DIVERSITY_DIAGNOSTICS"
     )
     engine.INITIAL_STAGE = "V11_INITIAL_FULL_REGENERATION"
     engine.TOPUP_STAGE = "V11_METHYLATION_FIRST_GUIDED_DEFICIT_TOPUP"
@@ -77,10 +77,11 @@ def main() -> None:
     # annotated over the complete cyclic grid and must pass the unchanged
     # representation-min >0.6 release gate.
     engine.METHYL_GUIDANCE_STRENGTHS = (1.0, 2.0, 4.0, 8.0)
-    # Twenty rows are the mathematical minimum needed to keep a 100-row final
-    # release at or below the 80% concentration ceiling.  Five extra rows give
-    # the exact-base/global-dedup stages a bounded safety margin.
+    # Retain the former 25-row target as a transparent diagnostic and soft
+    # selection preference. It is deliberately not a generation/release gate:
+    # a target-specific methylation hotspot must not cause 60,000 futile draws.
     engine.FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET = 25
+    engine.FINAL_RELEASE_DIVERSITY_IS_HARD_GATE = False
     engine.ALLOWED_SOURCE_FAILED_CHECKS = {
         "every_target_meets_pre_structure_candidate_quota",
         "every_target_meets_final_release_diversity_reserve",

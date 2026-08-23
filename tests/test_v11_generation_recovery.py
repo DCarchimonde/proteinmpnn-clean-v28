@@ -120,6 +120,8 @@ class V11QuotaNamingTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("METHYL_GUIDANCE_STRENGTHS", wrapper)
         self.assertIn("FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET = 25", wrapper)
+        self.assertIn("FINAL_RELEASE_DIVERSITY_IS_HARD_GATE = False", wrapper)
+        self.assertIn("--concentration-gates diagnostic", source)
 
     def test_diversity_reserve_counts_candidate_rows_not_raw_site_fraction(self):
         rows = [
@@ -145,6 +147,18 @@ class V11QuotaNamingTests(unittest.TestCase):
         self.assertEqual(report["dominant_positions_1based"], [1, 2])
         self.assertEqual(report["alternate_position_rows"], 0)
         self.assertTrue(report["position_reserve_ready"])
+
+    def test_v11_soft_diversity_stops_as_soon_as_candidate_goal_is_met(self):
+        diversity = {"release_diversity_reserve_ready": False}
+        self.assertTrue(
+            topup.target_recovery_ready(510, 510, diversity, 25, False)
+        )
+        self.assertFalse(
+            topup.target_recovery_ready(510, 510, diversity, 25, True)
+        )
+        self.assertFalse(
+            topup.target_recovery_ready(509, 510, diversity, 25, False)
+        )
 
 
 class V11SerializedGateReauditTests(unittest.TestCase):

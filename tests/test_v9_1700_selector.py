@@ -426,6 +426,43 @@ class MethylResidueConcentrationTests(unittest.TestCase):
         self.assertTrue(summary["position_concentration_pass"])
         self.assertTrue(summary["methyl_residue_concentration_pass"])
 
+    def test_exploratory_concentration_is_reported_but_not_release_blocking(self):
+        summaries = [
+            {
+                "position_concentration_pass": False,
+                "methyl_residue_concentration_pass": False,
+            }
+        ]
+        diagnostics, release = selector.concentration_policy_checks(
+            summaries,
+            global_sites=100,
+            maximum_global_residue_share=1.0,
+            role="diagnostic",
+        )
+        self.assertFalse(all(diagnostics.values()))
+        self.assertEqual(
+            release,
+            {
+                "methyl_position_and_residue_concentration_are_diagnostic_only": True
+            },
+        )
+
+    def test_hard_concentration_policy_remains_available_for_nonexploratory_runs(self):
+        summaries = [
+            {
+                "position_concentration_pass": False,
+                "methyl_residue_concentration_pass": True,
+            }
+        ]
+        diagnostics, release = selector.concentration_policy_checks(
+            summaries,
+            global_sites=100,
+            maximum_global_residue_share=0.5,
+            role="hard",
+        )
+        self.assertEqual(release, diagnostics)
+        self.assertFalse(release["target_methyl_position_concentration_passes_frozen_policy"])
+
 
 class UpstreamPlanTests(unittest.TestCase):
     def test_repository_plan_has_exact_frozen_unique_17_targets(self):

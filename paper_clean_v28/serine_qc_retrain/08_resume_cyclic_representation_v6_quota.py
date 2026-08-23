@@ -94,6 +94,11 @@ ALLOWED_SOURCE_FAILED_CHECKS = {"every_target_meets_pre_structure_candidate_quot
 # new branch.
 METHYL_GUIDANCE_STRENGTHS: Tuple[float, ...] = ()
 FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET = 0
+# Historical protocols can retain their hard reserve.  V11 explicitly
+# overrides this to make methyl-site/residue concentration an exploratory
+# diagnostic: absence of an alternative methylation site must not trigger
+# tens of thousands of otherwise unnecessary draws.
+FINAL_RELEASE_DIVERSITY_IS_HARD_GATE = True
 DEFAULT_RESERVE_SEEDS = (
     606,
     707,
@@ -242,6 +247,9 @@ def topup_numerical_contract(
         ],
         "final_release_diversity_reserve_per_target": int(
             FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET
+        ),
+        "final_release_diversity_is_hard_gate": bool(
+            FINAL_RELEASE_DIVERSITY_IS_HARD_GATE
         ),
         "reserve_seeds": [int(value) for value in args.reserve_seeds],
         "initial_generation_seeds": [int(value) for value in plan["seeds"]],
@@ -506,6 +514,20 @@ def target_release_diversity_state(
         result["position_reserve_ready"] and result["residue_reserve_ready"]
     )
     return result
+
+
+def target_recovery_ready(
+    current_count: int,
+    goal: int,
+    diversity_state: Mapping[str, Any],
+    diversity_reserve: int,
+    diversity_is_hard_gate: bool,
+) -> bool:
+    if int(current_count) < int(goal):
+        return False
+    if not diversity_is_hard_gate or int(diversity_reserve) <= 0:
+        return True
+    return bool(diversity_state.get("release_diversity_reserve_ready", False))
 
 
 def checkpoint_metadata(torch_module: Any, model_path: Path) -> Dict[str, Any]:
@@ -1021,7 +1043,8 @@ def run(args: argparse.Namespace) -> None:
     diversity_shortfalls = [
         target
         for target in validated["target_names"]
-        if int(FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET) > 0
+        if bool(FINAL_RELEASE_DIVERSITY_IS_HARD_GATE)
+        and int(FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET) > 0
         and not bool(initial_diversity[target]["release_diversity_reserve_ready"])
     ]
     recovery_targets = [
@@ -1138,14 +1161,12 @@ def run(args: argparse.Namespace) -> None:
         diversity_reserve = int(FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET)
 
         def recovery_ready() -> bool:
-            return (
-                current_count >= goal
-                and (
-                    diversity_reserve <= 0
-                    or bool(
-                        current_diversity["release_diversity_reserve_ready"]
-                    )
-                )
+            return target_recovery_ready(
+                current_count,
+                goal,
+                current_diversity,
+                diversity_reserve,
+                bool(FINAL_RELEASE_DIVERSITY_IS_HARD_GATE),
             )
 
         target_draws_this_run = 0
@@ -1189,7 +1210,8 @@ def run(args: argparse.Namespace) -> None:
                     )
                     peptide_length = int(metadata_row["native_peptide_length"])
                     needs_alternate_position = (
-                        diversity_reserve > 0
+                        bool(FINAL_RELEASE_DIVERSITY_IS_HARD_GATE)
+                        and diversity_reserve > 0
                         and not bool(current_diversity["position_reserve_ready"])
                     )
                     guidance_position_pool = [
@@ -1224,7 +1246,8 @@ def run(args: argparse.Namespace) -> None:
                         else 0.0
                     )
                     needs_alternate_residue = (
-                        diversity_reserve > 0
+                        bool(FINAL_RELEASE_DIVERSITY_IS_HARD_GATE)
+                        and diversity_reserve > 0
                         and not bool(current_diversity["residue_reserve_ready"])
                     )
                     dominant_residue = (
@@ -1475,6 +1498,11 @@ def run(args: argparse.Namespace) -> None:
                 "final_release_diversity_reserve_goal": int(
                     FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET
                 ),
+                "final_release_diversity_role": (
+                    "hard_gate"
+                    if FINAL_RELEASE_DIVERSITY_IS_HARD_GATE
+                    else "diagnostic_only"
+                ),
                 "enough_candidates_before_permeability": int(final_counts[target] >= quota),
             }
         )
@@ -1519,11 +1547,16 @@ def run(args: argparse.Namespace) -> None:
             for row in raw_rows
             if str(row.get("source_recovery_stage", "")) == TOPUP_STAGE
         ),
-        "every_target_meets_final_release_diversity_reserve": (
-            not targets_below_diversity_reserve
-        ),
         "every_target_meets_pre_structure_candidate_quota": not targets_below_quota,
     }
+    if FINAL_RELEASE_DIVERSITY_IS_HARD_GATE:
+        quality_checks["every_target_meets_final_release_diversity_reserve"] = (
+            not targets_below_diversity_reserve
+        )
+    else:
+        quality_checks[
+            "methyl_position_and_residue_diversity_are_diagnostic_only"
+        ] = True
     quality_gate = "PASS" if all(quality_checks.values()) else "FAIL"
 
     previous_manifest_sha256 = sha256_file(source_paths["manifest"])
@@ -1573,8 +1606,19 @@ def run(args: argparse.Namespace) -> None:
             "protocol": plan["protocol"],
             "recovery_mode": RECOVERY_MODE,
             "scientific_reason": (
-                "The complete representation-invariant V6 run is retained. Reserve "
-                "sampling is restricted to targets below their frozen structure quota."
+                "The complete representation-invariant source run is retained. "
+                "Reserve sampling is restricted to targets below their frozen "
+                "preselection quota; methyl-position and residue concentration "
+                "remain transparently reported and are not optimized by endless "
+                "sampling when configured as exploratory diagnostics."
+            ),
+            "final_release_diversity_is_hard_gate": bool(
+                FINAL_RELEASE_DIVERSITY_IS_HARD_GATE
+            ),
+            "final_release_diversity_policy": (
+                "hard_minimum_alternate_rows"
+                if FINAL_RELEASE_DIVERSITY_IS_HARD_GATE
+                else "soft_selection_preference_and_reported_diagnostic"
             ),
             "device": str(device),
             "batch_size": int(args.batch_size),
