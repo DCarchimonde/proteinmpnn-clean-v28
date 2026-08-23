@@ -1,0 +1,33 @@
+{
+  "protocol": "v12_prestructure_methylation_only_exact_17_target_1700_release",
+  "temperature": 0.5,
+  "methyl_threshold": 0.6,
+  "strict_threshold_operator": ">",
+  "expected_target_count": 17,
+  "final_release_quota_per_target": 100,
+  "annotation_context_policy": "peptide_chain_only_no_visible_receptor_chains",
+  "annotation_release_probability_policy": "representation_min_strict_gt_threshold_zero_disagreement",
+  "selection_ranking_policy": "release_floor_probability_desc_then_representation_mean_desc_then_span_asc",
+  "prestructure_base_score_policy": "not_a_release_gate_and_not_used_for_selection",
+  "prestructure_rmsd_policy": "not_available_and_not_predicted_before_shangge_returns_structures",
+  "poststructure_rmsd_policy": "compute_observed_receptor_aligned_complex_and_cyclic_peptide_rmsd_only_after_structures_return",
+  "targets": [
+    "1SFI",
+    "3AV9",
+    "3AVA",
+    "3AVB",
+    "3AVF",
+    "3AVG",
+    "3AVH",
+    "3AVI",
+    "3AVJ",
+    "3AVK",
+    "3AVM",
+    "3AVN",
+    "3P8F",
+    "3WNE",
+    "3ZGC",
+    "4K1E",
+    "4KEL"
+  ]
+}
