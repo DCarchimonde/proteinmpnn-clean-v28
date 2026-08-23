@@ -160,6 +160,50 @@ class V11QuotaNamingTests(unittest.TestCase):
             topup.target_recovery_ready(509, 510, diversity, 25, False)
         )
 
+    def test_exploratory_zero_hit_pilot_stops_without_relaxing_threshold(self):
+        self.assertFalse(
+            topup.zero_hit_futility_reached(0, 0, 4_999, 5_000, True)
+        )
+        self.assertTrue(
+            topup.zero_hit_futility_reached(0, 0, 5_000, 5_000, True)
+        )
+        self.assertFalse(
+            topup.zero_hit_futility_reached(0, 1, 5_000, 5_000, True)
+        )
+        self.assertFalse(
+            topup.zero_hit_futility_reached(0, 0, 60_000, 5_000, False)
+        )
+        self.assertEqual(
+            topup.authorized_recovery_targets(
+                ["3AV9", "3ZGC"],
+                ["3AV9", "3ZGC"],
+                [],
+                {"3ZGC": {"action": "MODEL_ABSTAINS_FOR_THIS_TARGET"}},
+                True,
+            ),
+            ["3AV9"],
+        )
+
+    def test_v11_guidance_uses_the_same_peptide_only_context_as_release(self):
+        wrapper = (
+            ROOT
+            / "paper_clean_v28"
+            / "serine_qc_retrain"
+            / "31_resume_cyclic_native_v11_quota.py"
+        ).read_text(encoding="utf-8")
+        generator_source = GENERATOR_PATH.read_text(encoding="utf-8")
+        runner_source = RUNNER.read_text(encoding="utf-8")
+        self.assertIn(
+            'METHYL_GUIDANCE_CONTEXT_POLICY = "release_peptide_only"', wrapper
+        )
+        self.assertIn("ZERO_HIT_FUTILITY_STOP_IS_ENABLED = True", wrapper)
+        self.assertIn(
+            'methyl_guidance_context_policy == "release_peptide_only"',
+            generator_source,
+        )
+        self.assertIn("peptide_only_tensors_fn(X, S_context, mask, chain_M)", generator_source)
+        self.assertIn("V11_ZERO_HIT_FUTILITY_DRAWS:-5000", runner_source)
+
 
 class V11SerializedGateReauditTests(unittest.TestCase):
     def test_reaudit_reuses_raw_rows_and_rebuilds_only_derived_views(self):

@@ -580,6 +580,7 @@ if [[ "$generation_status" == "10" ]]; then
     --draws-per-reserve-seed "${V11_TOPUP_DRAWS_PER_SEED:-2500}" \
     --max-topup-draws-per-target "${V11_MAX_TOPUP_DRAWS_PER_TARGET:-60000}" \
     --quota-margin "${V11_TOPUP_MARGIN:-10}" \
+    --zero-hit-futility-draws "${V11_ZERO_HIT_FUTILITY_DRAWS:-5000}" \
     --device cuda
 elif [[ "$generation_status" != "0" ]]; then
   echo "ERROR: generation failed a scientific gate; top-up is forbidden" >&2

@@ -93,12 +93,14 @@ ALLOWED_SOURCE_FAILED_CHECKS = {"every_target_meets_pre_structure_candidate_quot
 # the exact unbiased sampler because an empty strength tuple disables every
 # new branch.
 METHYL_GUIDANCE_STRENGTHS: Tuple[float, ...] = ()
+METHYL_GUIDANCE_CONTEXT_POLICY = "sampling_complex"
 FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET = 0
 # Historical protocols can retain their hard reserve.  V11 explicitly
 # overrides this to make methyl-site/residue concentration an exploratory
 # diagnostic: absence of an alternative methylation site must not trigger
 # tens of thousands of otherwise unnecessary draws.
 FINAL_RELEASE_DIVERSITY_IS_HARD_GATE = True
+ZERO_HIT_FUTILITY_STOP_IS_ENABLED = False
 DEFAULT_RESERVE_SEEDS = (
     606,
     707,
@@ -251,6 +253,11 @@ def topup_numerical_contract(
         "final_release_diversity_is_hard_gate": bool(
             FINAL_RELEASE_DIVERSITY_IS_HARD_GATE
         ),
+        "methyl_guidance_context_policy": METHYL_GUIDANCE_CONTEXT_POLICY,
+        "zero_hit_futility_stop_is_enabled": bool(
+            ZERO_HIT_FUTILITY_STOP_IS_ENABLED
+        ),
+        "zero_hit_futility_draws": int(args.zero_hit_futility_draws),
         "reserve_seeds": [int(value) for value in args.reserve_seeds],
         "initial_generation_seeds": [int(value) for value in plan["seeds"]],
         "device_argument": str(args.device),
@@ -528,6 +535,44 @@ def target_recovery_ready(
     if not diversity_is_hard_gate or int(diversity_reserve) <= 0:
         return True
     return bool(diversity_state.get("release_diversity_reserve_ready", False))
+
+
+def zero_hit_futility_reached(
+    initial_count: int,
+    current_count: int,
+    draws_this_run: int,
+    pilot_draws: int,
+    enabled: bool,
+) -> bool:
+    """Stop an exploratory target whose guided pilot produced no valid hit.
+
+    This never changes the methylation threshold or labels a failed proposal as
+    eligible.  It only prevents a zero-yield target from consuming the full
+    fixed budget after every configured guidance strength has been exercised.
+    """
+
+    return bool(
+        enabled
+        and int(initial_count) == 0
+        and int(current_count) == 0
+        and int(draws_this_run) >= int(pilot_draws)
+    )
+
+
+def authorized_recovery_targets(
+    target_names: Sequence[str],
+    quota_shortfalls: Sequence[str],
+    diversity_shortfalls: Sequence[str],
+    recorded_futility_stops: Mapping[str, Mapping[str, Any]],
+    futility_stop_is_enabled: bool,
+) -> List[str]:
+    shortfalls = set(quota_shortfalls) | set(diversity_shortfalls)
+    stopped = set(recorded_futility_stops) if futility_stop_is_enabled else set()
+    return [
+        str(target)
+        for target in target_names
+        if str(target) in shortfalls and str(target) not in stopped
+    ]
 
 
 def checkpoint_metadata(torch_module: Any, model_path: Path) -> Dict[str, Any]:
@@ -1015,6 +1060,14 @@ def run(args: argparse.Namespace) -> None:
         for target in validated["target_names"]
         if initial_counts[target] < int(plan_by_target[target]["structure_quota"])
     ]
+    recorded_futility_stops = {
+        str(target).upper(): dict(payload)
+        for target, payload in dict(
+            source_manifest.get("adaptive_topup_futility_stops_by_target", {})
+        ).items()
+        if str(target).upper() in set(validated["target_names"])
+        and isinstance(payload, Mapping)
+    }
     supported_positions_by_target = {
         str(target).upper(): [int(value) for value in values]
         for target, values in dict(
@@ -1047,11 +1100,13 @@ def run(args: argparse.Namespace) -> None:
         and int(FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET) > 0
         and not bool(initial_diversity[target]["release_diversity_reserve_ready"])
     ]
-    recovery_targets = [
-        target
-        for target in validated["target_names"]
-        if target in set(quota_shortfalls) | set(diversity_shortfalls)
-    ]
+    recovery_targets = authorized_recovery_targets(
+        validated["target_names"],
+        quota_shortfalls,
+        diversity_shortfalls,
+        recorded_futility_stops,
+        bool(ZERO_HIT_FUTILITY_STOP_IS_ENABLED),
+    )
     recorded_shortfalls = {
         str(value).upper()
         for value in source_manifest.get("targets_below_pre_permeability_quota", [])
@@ -1069,11 +1124,19 @@ def run(args: argparse.Namespace) -> None:
             "V6 source quota check does not match recomputed candidate shortfalls"
         )
     if not recovery_targets:
-        print(
-            f"{RECOVERY_LABEL} already meets every target pool and final-release diversity reserve; "
-            "no top-up was performed.",
-            flush=True,
-        )
+        if recorded_futility_stops:
+            print(
+                f"{RECOVERY_LABEL} has no remaining authorized recovery target; "
+                "persisted exploratory model abstentions: "
+                + ", ".join(sorted(recorded_futility_stops)),
+                flush=True,
+            )
+        else:
+            print(
+                f"{RECOVERY_LABEL} already meets every target pool and "
+                "final-release diversity reserve; no top-up was performed.",
+                flush=True,
+            )
         return
 
     print(
@@ -1121,6 +1184,9 @@ def run(args: argparse.Namespace) -> None:
     topup_checkpoints: List[Dict[str, Any]] = list(
         source_manifest.get("adaptive_topup_checkpoints", [])
     )
+    futility_stops_by_target: Dict[str, Dict[str, Any]] = dict(
+        recorded_futility_stops
+    )
     all_initial_shortfalls = list(
         source_manifest.get(
             "adaptive_topup_initial_shortfall_targets", recovery_targets
@@ -1152,6 +1218,7 @@ def run(args: argparse.Namespace) -> None:
             raise RuntimeError(f"Peptide coordinate/sequence mismatch for {target}")
 
         current_count = initial_counts[target]
+        initial_target_count = current_count
         current_diversity = target_release_diversity_state(
             eligible_rows,
             target,
@@ -1170,6 +1237,7 @@ def run(args: argparse.Namespace) -> None:
             )
 
         target_draws_this_run = 0
+        futility_stop_reason = ""
         remaining_target_budget = max(
             0,
             int(args.max_topup_draws_per_target)
@@ -1184,7 +1252,11 @@ def run(args: argparse.Namespace) -> None:
             flush=True,
         )
         for reserve_seed in reserve_seeds:
-            if recovery_ready() or target_draws_this_run >= remaining_target_budget:
+            if (
+                recovery_ready()
+                or futility_stop_reason
+                or target_draws_this_run >= remaining_target_budget
+            ):
                 break
             if reserve_seed in used_seeds:
                 continue
@@ -1197,6 +1269,7 @@ def run(args: argparse.Namespace) -> None:
                 produced_for_seed < int(args.draws_per_reserve_seed)
                 and target_draws_this_run < remaining_target_budget
                 and not recovery_ready()
+                and not futility_stop_reason
             ):
                 checkpoint_draws = min(
                     int(args.check_interval_draws),
@@ -1283,6 +1356,9 @@ def run(args: argparse.Namespace) -> None:
                             if METHYL_GUIDANCE_STRENGTHS
                             else None
                         ),
+                        methyl_guidance_context_policy=(
+                            METHYL_GUIDANCE_CONTEXT_POLICY
+                        ),
                     )
                     for batch_offset, generated_row in enumerate(generated):
                         draw_index = produced_for_seed + batch_offset + 1
@@ -1357,6 +1433,24 @@ def run(args: argparse.Namespace) -> None:
                     int(FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET),
                     supported_positions_by_target.get(target, []),
                 )
+                if zero_hit_futility_reached(
+                    initial_target_count,
+                    current_count,
+                    target_draws_this_run,
+                    int(args.zero_hit_futility_draws),
+                    bool(ZERO_HIT_FUTILITY_STOP_IS_ENABLED),
+                ):
+                    futility_stop_reason = (
+                        "zero_strict_methylation_hits_after_guided_pilot"
+                    )
+                    futility_stops_by_target[target] = {
+                        "reason": futility_stop_reason,
+                        "initial_eligible_candidates": int(initial_target_count),
+                        "final_eligible_candidates": int(current_count),
+                        "guided_pilot_draws": int(target_draws_this_run),
+                        "methyl_threshold_unchanged": float(threshold),
+                        "action": "MODEL_ABSTAINS_FOR_THIS_TARGET",
+                    }
                 topup_checkpoints.append(
                     {
                         "target_name": target,
@@ -1368,6 +1462,8 @@ def run(args: argparse.Namespace) -> None:
                         "goal": goal,
                         **current_diversity,
                         "diversity_reserve_goal": diversity_reserve,
+                        "exploratory_futility_stop": bool(futility_stop_reason),
+                        "exploratory_futility_stop_reason": futility_stop_reason,
                     }
                 )
                 print(
@@ -1378,6 +1474,13 @@ def run(args: argparse.Namespace) -> None:
                     f"{current_diversity['alternate_residue_rows']}/{diversity_reserve}",
                     flush=True,
                 )
+                if futility_stop_reason:
+                    print(
+                        f"[{target}] exploratory early abstention: zero strict "
+                        f"methylation hits after {target_draws_this_run} guided "
+                        f"draws at unchanged threshold {threshold}",
+                        flush=True,
+                    )
 
     canonicalization = generator.canonicalize_repeated_natural_annotations(
         raw_rows, preferred_candidate_ids=source_ids
@@ -1451,6 +1554,10 @@ def run(args: argparse.Namespace) -> None:
         row["v6_topup_seeds"] = ";".join(
             str(value) for value in topup_seeds_by_target[target]
         )
+        row["exploratory_futility_stop"] = int(target in futility_stops_by_target)
+        row["exploratory_futility_stop_reason"] = str(
+            futility_stops_by_target.get(target, {}).get("reason", "")
+        )
     final_target_manifest = [
         target_manifest_index[target] for target in validated["target_names"]
     ]
@@ -1504,6 +1611,10 @@ def run(args: argparse.Namespace) -> None:
                     else "diagnostic_only"
                 ),
                 "enough_candidates_before_permeability": int(final_counts[target] >= quota),
+                "exploratory_futility_stop": int(target in futility_stops_by_target),
+                "exploratory_futility_stop_reason": str(
+                    futility_stops_by_target.get(target, {}).get("reason", "")
+                ),
             }
         )
 
@@ -1683,6 +1794,7 @@ def run(args: argparse.Namespace) -> None:
                 for target, values in sorted(topup_seeds_by_target.items())
             },
             "adaptive_topup_checkpoints": topup_checkpoints,
+            "adaptive_topup_futility_stops_by_target": futility_stops_by_target,
             "adaptive_topup_budget": {
                 "reserve_seeds": reserve_seeds,
                 "draws_per_reserve_seed": int(args.draws_per_reserve_seed),
@@ -1694,6 +1806,13 @@ def run(args: argparse.Namespace) -> None:
                 ),
                 "check_interval_draws": int(args.check_interval_draws),
                 "quota_margin": int(args.quota_margin),
+                "zero_hit_futility_stop_is_enabled": bool(
+                    ZERO_HIT_FUTILITY_STOP_IS_ENABLED
+                ),
+                "zero_hit_futility_draws": int(args.zero_hit_futility_draws),
+                "methyl_guidance_context_policy": (
+                    METHYL_GUIDANCE_CONTEXT_POLICY
+                ),
             },
             "model_path": str(model_path),
             "model_sha256": model_sha256,
@@ -1815,6 +1934,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-topup-draws-per-target", type=int, default=12_000)
     parser.add_argument("--check-interval-draws", type=int, default=200)
     parser.add_argument("--quota-margin", type=int, default=5)
+    parser.add_argument("--zero-hit-futility-draws", type=int, default=5_000)
     parser.add_argument(
         "--reserve-seeds", type=int, nargs="+", default=list(DEFAULT_RESERVE_SEEDS)
     )
@@ -1831,6 +1951,7 @@ def main() -> None:
         or args.max_topup_draws_per_target <= 0
         or args.check_interval_draws <= 0
         or args.quota_margin < 0
+        or args.zero_hit_futility_draws <= 0
     ):
         raise ValueError(
             "Batch and top-up budgets must be positive; quota margin cannot be negative"

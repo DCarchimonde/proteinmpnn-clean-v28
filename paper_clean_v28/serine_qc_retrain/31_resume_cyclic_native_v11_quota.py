@@ -77,11 +77,18 @@ def main() -> None:
     # annotated over the complete cyclic grid and must pass the unchanged
     # representation-min >0.6 release gate.
     engine.METHYL_GUIDANCE_STRENGTHS = (1.0, 2.0, 4.0, 8.0)
+    # The final expert decision is peptide-only, so the product-of-experts
+    # proposal must query the expert in that same domain.  The base sampler
+    # remains receptor-conditioned.
+    engine.METHYL_GUIDANCE_CONTEXT_POLICY = "release_peptide_only"
     # Retain the former 25-row target as a transparent diagnostic and soft
     # selection preference. It is deliberately not a generation/release gate:
     # a target-specific methylation hotspot must not cause 60,000 futile draws.
     engine.FINAL_RELEASE_DIVERSITY_RESERVE_PER_TARGET = 25
     engine.FINAL_RELEASE_DIVERSITY_IS_HARD_GATE = False
+    # A zero-yield guided pilot is evidence of target-level model abstention,
+    # not a reason to burn the remaining 60k exploratory budget.
+    engine.ZERO_HIT_FUTILITY_STOP_IS_ENABLED = True
     engine.ALLOWED_SOURCE_FAILED_CHECKS = {
         "every_target_meets_pre_structure_candidate_quota",
         "every_target_meets_final_release_diversity_reserve",

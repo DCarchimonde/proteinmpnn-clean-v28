@@ -725,6 +725,7 @@ def generate_batch(
     methyl_guidance_positions_1based: Sequence[int] | None = None,
     methyl_guidance_strength: float = 0.0,
     methyl_guidance_forbidden_parent_tokens: Sequence[str] | None = None,
+    methyl_guidance_context_policy: str = "sampling_complex",
 ) -> List[Dict[str, Any]]:
     X, S_true, mask, chain_M, residue_idx, chain_encoding_all = features[:6]
     X = repeat_batch(X, batch_size)
@@ -782,6 +783,14 @@ def generate_batch(
         methyl_guidance_positions_1based is not None
         and float(methyl_guidance_strength) > 0.0
     )
+    if methyl_guidance_context_policy not in {
+        "sampling_complex",
+        "release_peptide_only",
+    }:
+        raise ValueError(
+            "methyl guidance context must be sampling_complex or "
+            "release_peptide_only"
+        )
     methylatable_natural_indices = sorted(int(value) for value in natural_to_methyl)
     if methyl_guidance_forbidden_parent_tokens is None:
         forbidden_parent_indices = [-1] * batch_size
@@ -808,6 +817,13 @@ def generate_batch(
         (batch_size, peptide_length), device=X.device
     )
     full_orders = complete_order_fn(chain_M, mask, orders)
+    absolute_to_relative = torch_module.full(
+        (S_context.shape[1],), -1, device=X.device, dtype=torch_module.long
+    )
+    absolute_to_relative[masked_positions] = torch_module.arange(
+        peptide_length, device=X.device, dtype=torch_module.long
+    )
+    relative_orders = absolute_to_relative[orders]
 
     # clean_v28_common still uses torch.utils.checkpoint in forward. no_grad is
     # compatible with that implementation and matches the historical sampler;
@@ -841,8 +857,35 @@ def generate_batch(
                 # matching expert head biases the designated physical site toward
                 # sequences worth exact full-cyclic annotation.  Final release is
                 # still decided exclusively after the complete chain is rescored.
+                guidance_expert_logits = logits_experts[row_indices, positions]
+                if methyl_guidance_context_policy == "release_peptide_only":
+                    (
+                        guidance_X,
+                        guidance_S,
+                        guidance_mask,
+                        guidance_chain_M,
+                        guidance_residue_idx,
+                        guidance_chain_encoding,
+                    ) = peptide_only_tensors_fn(X, S_context, mask, chain_M)
+                    guidance_full_orders = complete_order_fn(
+                        guidance_chain_M,
+                        guidance_mask,
+                        relative_orders,
+                    )
+                    _, peptide_only_experts = model(
+                        guidance_X,
+                        guidance_S,
+                        guidance_mask,
+                        guidance_chain_M,
+                        guidance_residue_idx,
+                        guidance_chain_encoding,
+                        decoding_order=guidance_full_orders,
+                    )
+                    guidance_expert_logits = peptide_only_experts[
+                        row_indices, relative_positions
+                    ]
                 expert_log_probability = functional.logsigmoid(
-                    logits_experts[row_indices, positions] / temperature
+                    guidance_expert_logits / temperature
                 )
                 invalid_parent = torch_module.ones(
                     expert_log_probability.shape[-1],
@@ -1113,10 +1156,15 @@ def generate_batch(
                     "representation_min_strict_gt_threshold_zero_disagreement"
                 ),
                 "sampling_proposal_policy": (
-                    "t05_base_x_expert_product_guided_single_physical_site_"
-                    "with_full_cyclic_release_replay"
+                    "t05_receptor_base_x_release_context_expert_product_guided_"
+                    "single_physical_site_with_full_cyclic_release_replay"
                     if methyl_guidance_enabled
                     else "frozen_t05_base_only"
+                ),
+                "methyl_guidance_context_policy": (
+                    methyl_guidance_context_policy
+                    if methyl_guidance_enabled
+                    else "not_applicable"
                 ),
                 "methyl_guidance_position_1based": (
                     int(guidance_relative[index].item()) + 1
